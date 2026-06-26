@@ -1,0 +1,10 @@
+test.*
+__pycache__
+cache.json
+resume.md
+resume-lock.md
+data/
+.agents/
+.codex/
+.venv/
+.trae/
