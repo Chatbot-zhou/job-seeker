@@ -226,6 +226,7 @@ data/config.json
 | `think_model` | `qwen3:1.7b` | 模型名称；`qwen3:4b` 可作为可选更大模型 |
 | `score_threshold` | `70` | 达到多少分才打招呼 |
 | `session_greet_limit` | `50` | 单轮最多打招呼数量 |
+| `daily_greet_safe_limit` | `120` | 每日自动打招呼安全上限；BOSS 约 120 次后可能出现剩余次数提醒，默认提前停止 |
 | `max_contacts_per_company` | `1` | 同一公司最多联系次数 |
 | `skip_contacted_companies` | `true` | 跳过已联系公司 |
 | `job_detail_max_chars` | `1600` | 传给模型的岗位描述最大字符数 |
@@ -370,6 +371,12 @@ taskkill /PID <PID> /F
 - BOSS 页面出现异常、验证码或登录过期。
 
 建议先 `stop`，关闭多余 BOSS 搜索页，重新安装脚本并刷新搜索页，再从 CLI 输入 `start`。
+
+### BOSS 提示今天剩余次数还有 30 次
+
+BOSS 每日总沟通额度约 150 次，但在约 120 次后可能弹出“剩余次数”提醒。该弹窗会改变聊天页 DOM，继续自动查找发送按钮容易变成连续报错。
+
+当前版本默认 `daily_greet_safe_limit=120`，脚本当天自动打招呼达到 120 次会主动停止。如果你当天手动沟通过，平台提醒可能提前出现；脚本检测到“今天剩余”“剩余次数”“今日还可”等额度提醒后，也会立即停止自动化并记录日志，不会刷新页面反复重试。
 
 ### 本轮刚开始就提示达到上限
 

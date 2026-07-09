@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "think_model": "qwen3:1.7b",
     "score_threshold": 70,
     "session_greet_limit": 50,
+    "daily_greet_safe_limit": 120,
     "max_contacts_per_company": 1,
     "skip_contacted_companies": True,
     "job_detail_max_chars": 1600,
@@ -48,6 +49,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_presence_penalty": 0.1,
     "job_score_num_predict_think_off": -1,
     "job_score_num_predict_think_on": -1,
+    "auto_start_enabled": False,
+    "auto_start_time": "09:00",
 }
 
 
@@ -91,6 +94,21 @@ def _as_token_budget(value: Any, default: int, minimum: int, maximum: int) -> in
     return max(minimum, min(maximum, parsed))
 
 
+def _as_hhmm(value: Any, default: str = "09:00") -> str:
+    text = str(value or "").strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        return default
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return default
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return default
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _detect_external_model_profile(data: dict[str, Any]) -> str:
     profile = str(data.get("external_model_profile") or "generic").strip().lower()
     if profile and profile != "generic":
@@ -128,6 +146,7 @@ class Config:
     think_model = DEFAULT_CONFIG["think_model"]
     score_threshold = DEFAULT_CONFIG["score_threshold"]
     session_greet_limit = DEFAULT_CONFIG["session_greet_limit"]
+    daily_greet_safe_limit = DEFAULT_CONFIG["daily_greet_safe_limit"]
     max_contacts_per_company = DEFAULT_CONFIG["max_contacts_per_company"]
     skip_contacted_companies = DEFAULT_CONFIG["skip_contacted_companies"]
     job_detail_max_chars = DEFAULT_CONFIG["job_detail_max_chars"]
@@ -143,6 +162,8 @@ class Config:
     model_presence_penalty = DEFAULT_CONFIG["model_presence_penalty"]
     job_score_num_predict_think_off = DEFAULT_CONFIG["job_score_num_predict_think_off"]
     job_score_num_predict_think_on = DEFAULT_CONFIG["job_score_num_predict_think_on"]
+    auto_start_enabled = DEFAULT_CONFIG["auto_start_enabled"]
+    auto_start_time = DEFAULT_CONFIG["auto_start_time"]
 
     @classmethod
     def load(cls) -> dict[str, Any]:
@@ -188,6 +209,9 @@ class Config:
             data["external_model_profile"] = DEFAULT_CONFIG["external_model_profile"]
         data["disable_model_thinking"] = _as_bool(data.get("disable_model_thinking"))
         data["show_model_reasoning"] = _as_bool(data.get("show_model_reasoning"))
+        data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
+        data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
+        data["daily_greet_safe_limit"] = _as_int(data.get("daily_greet_safe_limit"), 120, 1, 150)
         data["model_temperature"] = _as_float(data.get("model_temperature"), 0.2, 0.0, 2.0)
         data["model_top_p"] = _as_float(data.get("model_top_p"), 0.8, 0.05, 1.0)
         data["model_repeat_penalty"] = _as_float(data.get("model_repeat_penalty"), 1.18, 0.8, 2.0)

@@ -359,7 +359,17 @@ class RuntimeState:
             },
             "resume": resume_status,
             "cache": cache_status,
+            "limits": {
+                "score_threshold": Config.score_threshold,
+                "session_greet_limit": Config.session_greet_limit,
+                "daily_greet_safe_limit": Config.daily_greet_safe_limit,
+            },
             "script": self.script_snapshot(),
+            "autorun_schedule": {
+                "enabled": bool(getattr(Config, "auto_start_enabled", False)),
+                "time": str(getattr(Config, "auto_start_time", "09:00")),
+                "waiting": current_task == "waiting_schedule",
+            },
             "autorun": autorun,
         }
         return status

@@ -9,6 +9,7 @@ import re
 import shutil
 import time
 import webbrowser
+from datetime import datetime
 from getpass import getpass
 from pathlib import Path
 from typing import Any, Callable
@@ -240,6 +241,38 @@ def ask_int(prompt: str, current: int) -> int:
             print("[配置] 请输入整数。")
 
 
+def parse_hhmm(value: str) -> tuple[int, int] | None:
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def normalize_hhmm(value: str) -> str | None:
+    parsed = parse_hhmm(value)
+    if parsed is None:
+        return None
+    hour, minute = parsed
+    return f"{hour:02d}:{minute:02d}"
+
+
+def ask_hhmm(prompt: str, current: str) -> str:
+    default = normalize_hhmm(current) or "09:00"
+    while True:
+        value = ask(prompt, default)
+        normalized = normalize_hhmm(value)
+        if normalized is not None:
+            return normalized
+        print("[配置] 时间格式无效，请输入 00:00 到 23:59 之间的 HH:MM，例如 09:30。")
+
+
 def ask_list(prompt: str, current: list[str]) -> list[str]:
     value = ask(prompt + "，多个用逗号分隔", ", ".join(current))
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -286,12 +319,24 @@ def configure_base() -> None:
         "server_port": ask_int("本地服务端口", int(current["server_port"])),
         "score_threshold": ask_int("最低匹配度阈值", int(current["score_threshold"])),
         "session_greet_limit": ask_int("本次最多打招呼数量", int(current["session_greet_limit"])),
+        "daily_greet_safe_limit": ask_int("每日自动打招呼安全上限", int(current.get("daily_greet_safe_limit", 120))),
         "job_detail_max_chars": ask_int("职位描述传给模型的最大字数", int(current["job_detail_max_chars"])),
         "log_verbosity": ask("日志模式 compact/normal/debug", str(current.get("log_verbosity", "compact"))),
         "disable_model_thinking": _ask_thinking(current),
         "show_model_reasoning": ask_bool("是否显示模型思考过程", bool(current.get("show_model_reasoning", False))),
         "external_model_profile": ask("OpenAI 模型类型 generic/qwen/deepseek/doubao", str(current.get("external_model_profile", "generic"))),
     }
+    updates["auto_start_enabled"] = ask_bool(
+        "是否启用自动模式定时启动",
+        bool(current.get("auto_start_enabled", False)),
+    )
+    if updates["auto_start_enabled"]:
+        updates["auto_start_time"] = ask_hhmm(
+            "自动模式启动时间 HH:MM",
+            str(current.get("auto_start_time", "09:00")),
+        )
+    else:
+        updates["auto_start_time"] = normalize_hhmm(str(current.get("auto_start_time", "09:00"))) or "09:00"
     if ask_bool("是否配置高级模型参数", False):
         updates.update({
             "model_temperature": ask_float("temperature", float(current.get("model_temperature", 0.2))),
@@ -368,9 +413,11 @@ def edit_session_settings() -> None:
     print("[轮次设置] 当前配置:")
     print(f"  岗位标签: {'、'.join(cache.tags) if cache.tags else '(空)'}")
     print(f"  打招呼上限: {Config.session_greet_limit}")
+    print(f"  每日安全上限: {Config.daily_greet_safe_limit}")
     print()
     print("[1] 修改岗位搜索标签")
     print("[2] 修改本次打招呼上限")
+    print("[3] 修改每日安全上限")
     choice = input("  选择 [Enter 取消]: ").strip()
 
     if choice == "1":
@@ -394,6 +441,23 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 本次最多打招呼数量已更新为: {limit}")
+    elif choice == "3":
+        while True:
+            limit = ask_int("每日自动打招呼安全上限", int(Config.daily_greet_safe_limit))
+            if limit <= 0:
+                print("[配置] 每日安全上限必须大于 0。")
+                continue
+            if limit > 150:
+                print("[配置] BOSS 平台每日总额度约 150，建议不要超过 120；如需修改请重新输入 1-150。")
+                continue
+            break
+        Config.save({"daily_greet_safe_limit": limit})
+        runtime_state.emit(
+            "daily_safe_limit_updated",
+            f"每日安全上限调整为 {limit}",
+            source="config",
+        )
+        print(f"[配置] 每日自动打招呼安全上限已更新为: {limit}")
     elif choice:
         print("[配置] 无效选择，已取消。")
 
@@ -568,11 +632,20 @@ def print_status_panel() -> None:
     greeting_ok = greeting.get("confirmed", False)
     script = runtime_state.script_snapshot()
     script_ok = script.get("connected", False)
+    script_detail = script.get("detail") or {}
     control = runtime_state.control
 
     scoring_think = "开启" if not Config.disable_model_thinking else "关闭"
     greeting_think = "开启" if not Config.disable_model_thinking else "关闭"
     model_label = f"{Config.think_model} ({Config.model_provider})"
+    schedule = auto_start_schedule_status()
+    schedule_label = (
+        f"开启 {schedule['time']}"
+        if schedule.get("enabled")
+        else "关闭"
+    )
+    if schedule.get("waiting"):
+        schedule_label += f" / 等待中 {_format_wait_seconds(int(schedule.get('seconds_until_start', 0)))}"
 
     def _icon(ok: bool) -> str:
         return "✓" if ok else "○"
@@ -588,6 +661,8 @@ def print_status_panel() -> None:
 ║  模型状态    {model_status:<48}║
 ║  思考模式    评分: {scoring_think:<6} │ 画像/标签: {scoring_think:<6} │ 打招呼: {greeting_think:<6}{' ' * 8}║
 ║  评分阈值    {Config.score_threshold}分 / 本次上限 {Config.session_greet_limit}{' ' * 30}║
+║  今日安全    {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}{' ' * 42}║
+║  定时启动    {schedule_label:<48}║
 ║  评分令牌    关思考 {Config.job_score_num_predict_think_off} / 开思考 {Config.job_score_num_predict_think_on}{' ' * 18}║
 ║  温度/top_p  {Config.model_temperature} / {Config.model_top_p}{' ' * 38}║
 ╠══════════════════════════════════════════════════════════════╣
@@ -605,6 +680,7 @@ def print_status_panel() -> None:
 ┌──────────────────────────────────────────────────────────────┐
 │  Job Seeker  v2026.07                                        │
 │  {model_label} │ 评分思考: {scoring_think} │ 画像/标签: {scoring_think} │ 打招呼: {greeting_think} │ 阈值: {Config.score_threshold}分 │ 上限: {Config.session_greet_limit}  │
+│  今日安全: {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} │ 定时启动: {schedule_label[:38]:<38} │
 │  模型: {model_status[:50]} │ 评分令牌: {Config.job_score_num_predict_think_off}/{Config.job_score_num_predict_think_on} │
 │  简历: {_icon(resume_ok)} 画像: {_icon(profile_ok)} 话术: {_icon(greeting_ok)} │ 脚本: {_icon(script_ok)} │ {control} │
 └──────────────────────────────────────────────────────────────┘"""
@@ -625,7 +701,11 @@ def print_summary() -> None:
     print(f"- 模型: {Config.think_model}")
     if Config.model_provider == "openai":
         print(f"- OpenAI 模型类型: {Config.external_model_profile}")
-    print(f"- 阈值/本次上限: {Config.score_threshold} / {Config.session_greet_limit}")
+    print(f"- 阈值/本次上限/每日安全上限: {Config.score_threshold} / {Config.session_greet_limit} / {Config.daily_greet_safe_limit}")
+    print(
+        f"- 自动模式定时启动: {'开启' if Config.auto_start_enabled else '关闭'}"
+        f"{' / ' + Config.auto_start_time if Config.auto_start_enabled else ''}"
+    )
     print(
         f"- 日志模式: {Config.log_verbosity} / "
         f"模型思考: {'关闭' if Config.disable_model_thinking else '允许'} / "
@@ -692,6 +772,86 @@ def show_autorun_next_steps() -> None:
     print(f"  1. 已尝试打开油猴脚本安装/更新页: {script_install_url()}")
     print("  2. 已尝试打开 BOSS 搜索页")
     print("  3. 等待油猴脚本心跳，脚本在线后自动开始运行")
+
+
+def auto_start_schedule_status(now: datetime | None = None) -> dict[str, Any]:
+    enabled = bool(getattr(Config, "auto_start_enabled", False))
+    start_time = normalize_hhmm(str(getattr(Config, "auto_start_time", "09:00"))) or "09:00"
+    status: dict[str, Any] = {
+        "enabled": enabled,
+        "time": start_time,
+        "waiting": False,
+        "seconds_until_start": 0,
+        "target_at": "",
+    }
+    if not enabled:
+        return status
+    parsed = parse_hhmm(start_time)
+    if parsed is None:
+        return status
+    now = now or datetime.now()
+    hour, minute = parsed
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    status["target_at"] = target.isoformat(timespec="seconds")
+    if now < target:
+        status["waiting"] = True
+        status["seconds_until_start"] = max(0, int((target - now).total_seconds()))
+    return status
+
+
+def _format_wait_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}小时{minutes:02d}分{secs:02d}秒"
+    if minutes:
+        return f"{minutes}分{secs:02d}秒"
+    return f"{secs}秒"
+
+
+def wait_for_auto_start_schedule() -> bool:
+    schedule = auto_start_schedule_status()
+    if not schedule["enabled"]:
+        return True
+    if not schedule["waiting"]:
+        print(f"[定时] 自动模式定时启动已启用: {schedule['time']}。当前已过该时间，立即启动。")
+        runtime_state.emit(
+            "autorun_schedule_immediate",
+            f"定时启动时间 {schedule['time']} 已过，自动模式立即启动",
+            source="startup",
+            detail=schedule,
+        )
+        return True
+
+    runtime_state.set_task("waiting_schedule")
+    runtime_state.emit(
+        "autorun_schedule_wait",
+        f"自动模式等待到 {schedule['time']} 启动",
+        source="startup",
+        detail=schedule,
+    )
+    print(f"[定时] 自动模式定时启动已启用: {schedule['time']}。")
+    print("[定时] 到点前不会打开浏览器页面；按 Ctrl+C 可退出。")
+    last_printed_bucket: int | None = None
+    while True:
+        current = auto_start_schedule_status()
+        remaining = int(current.get("seconds_until_start", 0))
+        if not current.get("waiting") or remaining <= 0:
+            break
+        bucket = remaining // 60 if remaining > 60 else remaining
+        if bucket != last_printed_bucket:
+            print(f"[定时] 距离自动启动还有 {_format_wait_seconds(remaining)}。")
+            last_printed_bucket = bucket
+        time.sleep(1 if remaining <= 10 else min(30, remaining))
+    runtime_state.set_task("idle")
+    runtime_state.emit(
+        "autorun_schedule_reached",
+        f"已到达定时启动时间 {schedule['time']}，继续自动模式流程",
+        source="startup",
+    )
+    print("[定时] 已到达自动启动时间，继续启动流程。")
+    return True
 
 
 def maybe_open_startup_pages(*, always_open_userscript: bool = False) -> None:
@@ -909,6 +1069,11 @@ def show_doctor() -> None:
             f"  本轮计数: {detail.get('sessionGreetCount', 0)} / "
             f"{detail.get('sessionGreetLimit') or Config.session_greet_limit} / "
             f"ended={detail.get('sessionEnded')}"
+        )
+        print(
+            f"  今日计数: {detail.get('dailyGreetCount', 0)} / "
+            f"{detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} / "
+            f"date={detail.get('dailyGreetDate') or '-'}"
         )
     if script.get("stale"):
         print("- 建议: 刷新 BOSS 搜索页，等待 CLI 出现新的脚本心跳后再输入 start。")
@@ -1157,6 +1322,12 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
             shutdown_callback()
 
     wait_for_api_ready()
+    try:
+        wait_for_auto_start_schedule()
+    except KeyboardInterrupt:
+        print("\n[退出] 定时等待已取消，正在关闭服务...")
+        shutdown_autorun()
+        return 130
     maybe_open_startup_pages(always_open_userscript=True)
     show_autorun_next_steps()
     if not auto_prepare_saved_configuration():
