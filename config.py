@@ -34,6 +34,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "score_threshold": 70,
     "session_greet_limit": 50,
     "daily_greet_safe_limit": 120,
+    "search_round_cooldown_minutes": 30,
+    "tag_search_delay_seconds": 10,
+    "search_result_scroll_rounds": 1,
     "max_contacts_per_company": 1,
     "skip_contacted_companies": True,
     "job_detail_max_chars": 1600,
@@ -147,6 +150,9 @@ class Config:
     score_threshold = DEFAULT_CONFIG["score_threshold"]
     session_greet_limit = DEFAULT_CONFIG["session_greet_limit"]
     daily_greet_safe_limit = DEFAULT_CONFIG["daily_greet_safe_limit"]
+    search_round_cooldown_minutes = DEFAULT_CONFIG["search_round_cooldown_minutes"]
+    tag_search_delay_seconds = DEFAULT_CONFIG["tag_search_delay_seconds"]
+    search_result_scroll_rounds = DEFAULT_CONFIG["search_result_scroll_rounds"]
     max_contacts_per_company = DEFAULT_CONFIG["max_contacts_per_company"]
     skip_contacted_companies = DEFAULT_CONFIG["skip_contacted_companies"]
     job_detail_max_chars = DEFAULT_CONFIG["job_detail_max_chars"]
@@ -212,6 +218,24 @@ class Config:
         data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
         data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
         data["daily_greet_safe_limit"] = _as_int(data.get("daily_greet_safe_limit"), 120, 1, 150)
+        data["search_round_cooldown_minutes"] = _as_int(
+            data.get("search_round_cooldown_minutes"),
+            DEFAULT_CONFIG["search_round_cooldown_minutes"],
+            1,
+            240,
+        )
+        data["tag_search_delay_seconds"] = _as_int(
+            data.get("tag_search_delay_seconds"),
+            DEFAULT_CONFIG["tag_search_delay_seconds"],
+            3,
+            60,
+        )
+        data["search_result_scroll_rounds"] = _as_int(
+            data.get("search_result_scroll_rounds"),
+            DEFAULT_CONFIG["search_result_scroll_rounds"],
+            0,
+            2,
+        )
         data["model_temperature"] = _as_float(data.get("model_temperature"), 0.2, 0.0, 2.0)
         data["model_top_p"] = _as_float(data.get("model_top_p"), 0.8, 0.05, 1.0)
         data["model_repeat_penalty"] = _as_float(data.get("model_repeat_penalty"), 1.18, 0.8, 2.0)

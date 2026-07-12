@@ -153,7 +153,12 @@ if (Test-Path -LiteralPath $venvPython) {
 }
 
 Write-Info "Checking Python dependencies..."
-$dependencyOutput = & $pythonExe -c "import fastapi, uvicorn, pydantic, ollama, pypdf, multipart" 2>&1
+$dependencyCheckPath = Join-Path $ProjectRoot "scripts\check_deps.py"
+if (-not (Test-Path -LiteralPath $dependencyCheckPath)) {
+    Write-Fail "Dependency check script was not found: $dependencyCheckPath"
+    Pause-And-Exit 1
+}
+$dependencyOutput = & $pythonExe $dependencyCheckPath 2>&1
 if ($LASTEXITCODE -ne 0) {
     if ($dependencyOutput) {
         $dependencyOutput | ForEach-Object { Write-Fail "$_" }

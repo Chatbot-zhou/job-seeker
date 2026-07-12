@@ -320,6 +320,18 @@ def configure_base() -> None:
         "score_threshold": ask_int("最低匹配度阈值", int(current["score_threshold"])),
         "session_greet_limit": ask_int("本次最多打招呼数量", int(current["session_greet_limit"])),
         "daily_greet_safe_limit": ask_int("每日自动打招呼安全上限", int(current.get("daily_greet_safe_limit", 120))),
+        "search_round_cooldown_minutes": ask_int(
+            "所有标签无新岗位后的搜索冷却分钟数",
+            int(current.get("search_round_cooldown_minutes", 30)),
+        ),
+        "tag_search_delay_seconds": ask_int(
+            "标签之间的搜索间隔秒数",
+            int(current.get("tag_search_delay_seconds", 10)),
+        ),
+        "search_result_scroll_rounds": ask_int(
+            "每个标签最多低频滚动读取次数 0-2",
+            int(current.get("search_result_scroll_rounds", 1)),
+        ),
         "job_detail_max_chars": ask_int("职位描述传给模型的最大字数", int(current["job_detail_max_chars"])),
         "log_verbosity": ask("日志模式 compact/normal/debug", str(current.get("log_verbosity", "compact"))),
         "disable_model_thinking": _ask_thinking(current),
@@ -414,10 +426,16 @@ def edit_session_settings() -> None:
     print(f"  岗位标签: {'、'.join(cache.tags) if cache.tags else '(空)'}")
     print(f"  打招呼上限: {Config.session_greet_limit}")
     print(f"  每日安全上限: {Config.daily_greet_safe_limit}")
+    print(f"  搜索冷却: {Config.search_round_cooldown_minutes} 分钟")
+    print(f"  标签间隔: {Config.tag_search_delay_seconds} 秒")
+    print(f"  滚动扩展: {Config.search_result_scroll_rounds} 次")
     print()
     print("[1] 修改岗位搜索标签")
     print("[2] 修改本次打招呼上限")
     print("[3] 修改每日安全上限")
+    print("[4] 修改搜索冷却时间")
+    print("[5] 修改标签搜索间隔")
+    print("[6] 修改滚动扩展次数")
     choice = input("  选择 [Enter 取消]: ").strip()
 
     if choice == "1":
@@ -458,6 +476,48 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 每日自动打招呼安全上限已更新为: {limit}")
+    elif choice == "4":
+        while True:
+            minutes = ask_int("所有标签无新岗位后的搜索冷却分钟数", int(Config.search_round_cooldown_minutes))
+            if not 1 <= minutes <= 240:
+                print("[配置] 搜索冷却建议设置为 1-240 分钟。")
+                continue
+            break
+        Config.save({"search_round_cooldown_minutes": minutes})
+        runtime_state.emit(
+            "search_cooldown_updated",
+            f"搜索冷却调整为 {minutes} 分钟",
+            source="config",
+        )
+        print(f"[配置] 搜索冷却已更新为: {minutes} 分钟")
+    elif choice == "5":
+        while True:
+            seconds = ask_int("标签之间的搜索间隔秒数", int(Config.tag_search_delay_seconds))
+            if not 3 <= seconds <= 60:
+                print("[配置] 标签搜索间隔建议设置为 3-60 秒。")
+                continue
+            break
+        Config.save({"tag_search_delay_seconds": seconds})
+        runtime_state.emit(
+            "tag_search_delay_updated",
+            f"标签搜索间隔调整为 {seconds} 秒",
+            source="config",
+        )
+        print(f"[配置] 标签搜索间隔已更新为: {seconds} 秒")
+    elif choice == "6":
+        while True:
+            rounds = ask_int("每个标签最多低频滚动读取次数 0-2", int(Config.search_result_scroll_rounds))
+            if not 0 <= rounds <= 2:
+                print("[配置] 滚动扩展次数只能设置为 0-2。")
+                continue
+            break
+        Config.save({"search_result_scroll_rounds": rounds})
+        runtime_state.emit(
+            "search_scroll_rounds_updated",
+            f"搜索滚动扩展调整为 {rounds} 次",
+            source="config",
+        )
+        print(f"[配置] 搜索滚动扩展次数已更新为: {rounds}")
     elif choice:
         print("[配置] 无效选择，已取消。")
 
@@ -646,6 +706,13 @@ def print_status_panel() -> None:
     )
     if schedule.get("waiting"):
         schedule_label += f" / 等待中 {_format_wait_seconds(int(schedule.get('seconds_until_start', 0)))}"
+    search_strategy_label = (
+        f"冷却 {Config.search_round_cooldown_minutes}分 / "
+        f"间隔 {Config.tag_search_delay_seconds}秒 / "
+        f"滚动 {Config.search_result_scroll_rounds}次"
+    )
+    if script_detail.get("cooldownUntil"):
+        search_strategy_label = _format_script_cooldown(script_detail)
 
     def _icon(ok: bool) -> str:
         return "✓" if ok else "○"
@@ -662,6 +729,7 @@ def print_status_panel() -> None:
 ║  思考模式    评分: {scoring_think:<6} │ 画像/标签: {scoring_think:<6} │ 打招呼: {greeting_think:<6}{' ' * 8}║
 ║  评分阈值    {Config.score_threshold}分 / 本次上限 {Config.session_greet_limit}{' ' * 30}║
 ║  今日安全    {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}{' ' * 42}║
+║  搜索策略    {search_strategy_label[:48]:<48}║
 ║  定时启动    {schedule_label:<48}║
 ║  评分令牌    关思考 {Config.job_score_num_predict_think_off} / 开思考 {Config.job_score_num_predict_think_on}{' ' * 18}║
 ║  温度/top_p  {Config.model_temperature} / {Config.model_top_p}{' ' * 38}║
@@ -681,6 +749,7 @@ def print_status_panel() -> None:
 │  Job Seeker  v2026.07                                        │
 │  {model_label} │ 评分思考: {scoring_think} │ 画像/标签: {scoring_think} │ 打招呼: {greeting_think} │ 阈值: {Config.score_threshold}分 │ 上限: {Config.session_greet_limit}  │
 │  今日安全: {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} │ 定时启动: {schedule_label[:38]:<38} │
+│  搜索: {search_strategy_label[:54]:<54} │
 │  模型: {model_status[:50]} │ 评分令牌: {Config.job_score_num_predict_think_off}/{Config.job_score_num_predict_think_on} │
 │  简历: {_icon(resume_ok)} 画像: {_icon(profile_ok)} 话术: {_icon(greeting_ok)} │ 脚本: {_icon(script_ok)} │ {control} │
 └──────────────────────────────────────────────────────────────┘"""
@@ -702,6 +771,10 @@ def print_summary() -> None:
     if Config.model_provider == "openai":
         print(f"- OpenAI 模型类型: {Config.external_model_profile}")
     print(f"- 阈值/本次上限/每日安全上限: {Config.score_threshold} / {Config.session_greet_limit} / {Config.daily_greet_safe_limit}")
+    print(
+        f"- 搜索策略: 无新岗位冷却 {Config.search_round_cooldown_minutes} 分钟 / "
+        f"标签间隔 {Config.tag_search_delay_seconds} 秒 / 滚动扩展 {Config.search_result_scroll_rounds} 次"
+    )
     print(
         f"- 自动模式定时启动: {'开启' if Config.auto_start_enabled else '关闭'}"
         f"{' / ' + Config.auto_start_time if Config.auto_start_enabled else ''}"
@@ -808,6 +881,19 @@ def _format_wait_seconds(seconds: int) -> str:
     if minutes:
         return f"{minutes}分{secs:02d}秒"
     return f"{secs}秒"
+
+
+def _format_script_cooldown(detail: dict[str, Any]) -> str:
+    raw = str(detail.get("cooldownUntil") or "").strip()
+    if not raw:
+        return "未冷却"
+    try:
+        until = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        now = datetime.now(until.tzinfo) if until.tzinfo else datetime.now()
+        remaining = max(0, int((until - now).total_seconds()))
+        return f"冷却中 / 到 {until.astimezone().strftime('%H:%M:%S')} / 剩余 {_format_wait_seconds(remaining)}"
+    except ValueError:
+        return f"冷却中 / 到 {raw}"
 
 
 def wait_for_auto_start_schedule() -> bool:
@@ -1074,6 +1160,15 @@ def show_doctor() -> None:
             f"  今日计数: {detail.get('dailyGreetCount', 0)} / "
             f"{detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} / "
             f"date={detail.get('dailyGreetDate') or '-'}"
+        )
+        print(
+            f"  搜索轮次: round={detail.get('searchRoundId', '-')} / "
+            f"tag={detail.get('currentTagIndex', '-')} / "
+            f"checked={detail.get('tagsCheckedThisRound', '-')}"
+        )
+        print(
+            f"  搜索冷却: {_format_script_cooldown(detail)} / "
+            f"{detail.get('cooldownMinutes') or Config.search_round_cooldown_minutes} 分钟"
         )
     if script.get("stale"):
         print("- 建议: 刷新 BOSS 搜索页，等待 CLI 出现新的脚本心跳后再输入 start。")

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.8
+// @version      2026.06.26.9
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06-cli-autogreet.24',
+        scriptVersion: '2026.06-cli-autogreet.25',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -33,6 +33,9 @@
         onlyGreet: true, // 仅辅助打招呼，不自动扫描普通聊天页
         sessionGreetLimit: 50,
         dailyGreetSafeLimit: 120,
+        searchRoundCooldownMinutes: 30,
+        tagSearchDelaySeconds: 10,
+        searchResultScrollRounds: 1,
         actionDelayMs: 2500,
         manualInterventionMaxRetries: 3,
         searchLeaseMs: 12000,
@@ -55,6 +58,15 @@
         }
         if (Number.isFinite(Number(config.daily_greet_safe_limit))) {
             OPTIONS.dailyGreetSafeLimit = Number(config.daily_greet_safe_limit);
+        }
+        if (Number.isFinite(Number(config.search_round_cooldown_minutes))) {
+            OPTIONS.searchRoundCooldownMinutes = Math.max(1, Math.min(240, Number(config.search_round_cooldown_minutes)));
+        }
+        if (Number.isFinite(Number(config.tag_search_delay_seconds))) {
+            OPTIONS.tagSearchDelaySeconds = Math.max(3, Math.min(60, Number(config.tag_search_delay_seconds)));
+        }
+        if (Number.isFinite(Number(config.search_result_scroll_rounds))) {
+            OPTIONS.searchResultScrollRounds = Math.max(0, Math.min(2, Number(config.search_result_scroll_rounds)));
         }
     }
 
@@ -1288,6 +1300,10 @@
             const seenJobHrefs = new Set();
             const backendProcessedHrefs = new Set();
             let lastJobListEventKey = '';
+            let searchRoundId = 0;
+            let tagsCheckedThisRound = new Set();
+            let cooldownUntil = 0;
+            let cooldownTimer = null;
             // 缓存
             let started = false;
             let booting = false;
@@ -1380,6 +1396,11 @@
                     localSessionRunId: session.runId,
                     backendRunId: session.backendRunId || lastBackendRunId,
                     sessionEnded: Boolean(session.ended),
+                    searchRoundId,
+                    currentTagIndex: currentTagIdx,
+                    tagsCheckedThisRound: tagsCheckedThisRound.size,
+                    cooldownUntil: cooldownUntil ? new Date(cooldownUntil).toISOString() : '',
+                    cooldownMinutes: OPTIONS.searchRoundCooldownMinutes,
                 };
             };
 
@@ -1422,6 +1443,11 @@
 
             const releaseSearchLease = () => {
                 closeActiveTempTab();
+                if (cooldownTimer) {
+                    clearTimeout(cooldownTimer);
+                    cooldownTimer = null;
+                }
+                cooldownUntil = 0;
                 const lease = readSearchLease();
                 if (lease.owner === PAGE_INSTANCE_ID) {
                     localStorage.removeItem(searchLeaseKey);
@@ -2090,6 +2116,39 @@
             };
 
             // 获取职位链接
+            const searchResultScrollDelayMs = () => 3000 + Math.floor(Math.random() * 2000);
+
+            const scrollSearchResultsOnce = async (round) => {
+                const platformLimit = tools.detectPlatformLimit();
+                if (platformLimit) {
+                    throw new Error(`平台次数限制: ${platformLimit}`);
+                }
+                const interruption = tools.detectManualInterruption();
+                if (interruption) {
+                    throw new Error(`需要人工处理: ${interruption}`);
+                }
+                const keyword = this.tags[currentTagIdx] || '';
+                const container = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLISTCTN)
+                    || document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLIST)
+                    || document.scrollingElement
+                    || document.documentElement;
+                const distance = Math.max(420, Math.floor(window.innerHeight * 0.75));
+                setSearchAction(`低频滚动读取: ${keyword}`);
+                logger.add(`低频滚动读取搜索结果: ${keyword} (${round}/${OPTIONS.searchResultScrollRounds})`);
+                await api.event('search_result_scroll', `低频滚动读取搜索结果: ${keyword}`, 'script', 'info', {
+                    keyword,
+                    round,
+                    maxRounds: OPTIONS.searchResultScrollRounds,
+                    searchRoundId,
+                });
+                if (container && typeof container.scrollBy === 'function') {
+                    container.scrollBy({ top: distance, behavior: 'smooth' });
+                } else {
+                    window.scrollBy({ top: distance, behavior: 'smooth' });
+                }
+                await tools.asyncSleep(searchResultScrollDelayMs());
+            };
+
             const getJobHrefs = async () => {
                 try {
                     setSearchAction('读取职位列表');
@@ -2123,10 +2182,27 @@
                         hrefs = collect();
                         newHrefs = hrefs.filter(href => !seenJobHrefs.has(href) && !backendProcessedHrefs.has(href));
                     }
+                    const scrollRounds = Math.max(0, Math.min(2, Number(OPTIONS.searchResultScrollRounds) || 0));
+                    for (let scrollRound = 1; !newHrefs.length && scrollRound <= scrollRounds; scrollRound++) {
+                        await scrollSearchResultsOnce(scrollRound);
+                        hrefs = collect();
+                        newHrefs = hrefs.filter(href => !seenJobHrefs.has(href) && !backendProcessedHrefs.has(href));
+                    }
                     const eventKey = `${hrefs.length}:${newHrefs.length}:${hrefs[hrefs.length - 1] || ''}`;
                     if (eventKey !== lastJobListEventKey) {
                         lastJobListEventKey = eventKey;
                         await api.event('job_list_found', `发现职位链接 ${hrefs.length} 个，新职位 ${newHrefs.length} 个`, 'script', 'info', { count: hrefs.length, newCount: newHrefs.length });
+                    }
+                    if (hrefs.length && !newHrefs.length) {
+                        const recentlyProcessedCount = hrefs.filter(href => backendProcessedHrefs.has(href)).length;
+                        const seenCount = hrefs.filter(href => seenJobHrefs.has(href)).length;
+                        await api.event('all_results_recently_processed', '搜索结果已全部处理或近期跳过', 'script', 'info', {
+                            keyword: this.tags[currentTagIdx] || '',
+                            count: hrefs.length,
+                            recentlyProcessedCount,
+                            seenCount,
+                            searchRoundId,
+                        });
                     }
                     return [newHrefs, hrefs];
                 } catch (e) {
@@ -2138,7 +2214,7 @@
                 }
             };
 
-            // 读取当前关键词的职位。没有新职位时不滚动，直接切换关键词。
+            // 读取当前关键词的职位。没有新职位时只做低频滚动扩展，然后切换关键词。
             const nextPage = async () => {
                 let hrefs;
                 [jobHrefs, hrefs] = await getJobHrefs();
@@ -2162,15 +2238,76 @@
 
             document.nextPage = nextPage;
 
+            const resetKeywordState = () => {
+                jobHrefs = [];
+                elsLen = 0;
+                page = 0;
+                lastJobListEventKey = '';
+            };
+
+            const beginSearchRound = async (reason = '') => {
+                searchRoundId += 1;
+                tagsCheckedThisRound.clear();
+                cooldownUntil = 0;
+                currentTagIdx = 0;
+                resetKeywordState();
+                await api.event('search_round_started', `开始第 ${searchRoundId} 轮关键词搜索`, 'script', 'info', {
+                    searchRoundId,
+                    reason,
+                    tags: this.tags,
+                    cooldownMinutes: OPTIONS.searchRoundCooldownMinutes,
+                });
+            };
+
+            const markCurrentTagChecked = () => {
+                if (this.tags[currentTagIdx]) {
+                    tagsCheckedThisRound.add(currentTagIdx);
+                }
+            };
+
+            const tagSearchDelayMs = () => {
+                const baseSeconds = Math.max(3, Number(OPTIONS.tagSearchDelaySeconds) || 10);
+                const jitterSeconds = Math.floor(Math.random() * 6);
+                return (baseSeconds + jitterSeconds) * 1000;
+            };
+
+            const waitBeforeTagSearch = async (keyword, reason = '') => {
+                const delayMs = tagSearchDelayMs();
+                const seconds = Math.round(delayMs / 1000);
+                const message = `等待 ${seconds} 秒后搜索关键词: ${keyword}`;
+                setSearchAction(message);
+                logger.add(message);
+                await api.heartbeat('search', 'running', message, {
+                    ...scriptHeartbeatDetail(),
+                    nextKeyword: keyword,
+                    reason,
+                    delaySeconds: seconds,
+                });
+                await tools.asyncSleep(delayMs);
+            };
+
+            const searchCurrentKeyword = async (reason = '', waitBefore = false) => {
+                const keyword = this.tags[currentTagIdx];
+                resetKeywordState();
+                if (waitBefore) {
+                    await waitBeforeTagSearch(keyword, reason);
+                }
+                setSearchAction(`搜索关键词: ${keyword}`);
+                await search(keyword);
+                markCurrentTagChecked();
+                await tools.actionSleep(1500);
+            };
+
             const switchToNextKeyword = async (reason = '') => {
                 if (!this.tags.length) return false;
                 const total = this.tags.length;
-                for (let attempt = 0; attempt < total; attempt++) {
-                    currentTagIdx = (currentTagIdx + 1) % total;
-                    jobHrefs = [];
-                    elsLen = 0;
-                    page = 0;
-                    lastJobListEventKey = '';
+                const startTagIdx = currentTagIdx;
+                for (let attempt = 1; attempt <= total; attempt++) {
+                    const nextTagIdx = (startTagIdx + attempt) % total;
+                    if (tagsCheckedThisRound.has(nextTagIdx)) {
+                        continue;
+                    }
+                    currentTagIdx = nextTagIdx;
                     const keyword = this.tags[currentTagIdx];
                     const suffix = reason ? `（${reason}）` : '';
                     logger.add(`切换搜索关键词: ${keyword}${suffix}`);
@@ -2179,21 +2316,99 @@
                         index: currentTagIdx,
                         wrapped: currentTagIdx === 0,
                         reason,
+                        searchRoundId,
+                        checkedCount: tagsCheckedThisRound.size,
                     });
-                    setSearchAction(`搜索关键词: ${keyword}`);
-                    await search(keyword);
-                    await tools.actionSleep(1500);
+                    await searchCurrentKeyword(reason, true);
                     if (await nextPage()) {
                         return true;
                     }
                 }
-                logger.add('所有关键词本轮未发现新职位，稍后从第一个关键词重新开始');
-                await api.event('all_keywords_no_new_jobs', '所有关键词本轮未发现新职位，稍后从第一个关键词重新开始', 'script', 'info', {
+                logger.add('所有关键词本轮未发现新职位，进入搜索冷却');
+                await api.event('all_keywords_no_new_jobs', '所有关键词本轮未发现新职位，进入搜索冷却', 'script', 'info', {
                     tags: this.tags,
                     seenCount: seenJobHrefs.size,
                     reason,
+                    searchRoundId,
+                    checkedCount: tagsCheckedThisRound.size,
                 });
                 return false;
+            };
+
+            const enterSearchCooldown = async (reason = '') => {
+                if (cooldownTimer) {
+                    clearTimeout(cooldownTimer);
+                    cooldownTimer = null;
+                }
+                const minutes = Math.max(1, Number(OPTIONS.searchRoundCooldownMinutes) || 30);
+                cooldownUntil = Date.now() + minutes * 60 * 1000;
+                const untilText = new Date(cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false });
+                const message = `所有关键词本轮暂无新职位，冷却 ${minutes} 分钟后再搜索（预计 ${untilText}）`;
+                setSearchAction(message);
+                logger.add(message);
+                await api.event('search_round_cooldown_started', message, 'script', 'info', {
+                    reason,
+                    searchRoundId,
+                    cooldownMinutes: minutes,
+                    cooldownUntil: new Date(cooldownUntil).toISOString(),
+                    checkedCount: tagsCheckedThisRound.size,
+                });
+                await api.heartbeat('search', 'cooldown', message, scriptHeartbeatDetail());
+
+                const cooldownTick = async () => {
+                    try {
+                        if (!started) {
+                            cooldownTimer = null;
+                            return;
+                        }
+                        const remainingMs = cooldownUntil - Date.now();
+                        if (remainingMs > 0) {
+                            await api.heartbeat('search', 'cooldown', message, {
+                                ...scriptHeartbeatDetail(),
+                                remainingSeconds: Math.ceil(remainingMs / 1000),
+                            });
+                            cooldownTimer = setTimeout(cooldownTick, Math.min(30000, remainingMs));
+                            return;
+                        }
+                        cooldownTimer = null;
+                        cooldownUntil = 0;
+                        if (!(await ensureSearchLease('冷却结束'))) return;
+                        if (!(await syncControlFromBackend('搜索冷却结束'))) return;
+                        if (this.pause) {
+                            return;
+                        }
+                        if (!(await ensureGreetLimitsAvailable())) return;
+                        await beginSearchRound('cooldown_finished');
+                        await searchCurrentKeyword('冷却结束', false);
+                        if (await nextPage()) {
+                            setTimeout(loop, 0);
+                            return;
+                        }
+                        const hasNextKeyword = await switchToNextKeyword('冷却后首个关键词无新职位');
+                        if (hasNextKeyword) {
+                            setTimeout(loop, 0);
+                            return;
+                        }
+                        await enterSearchCooldown('冷却后仍无新职位');
+                    } catch (e) {
+                        if (tools.isPlatformLimitError(e)) {
+                            await handlePageFailure(tools.platformLimitReason(e), 'platform_limit', 'search');
+                            return;
+                        }
+                        if (tools.isManualInterruptionError(e)) {
+                            await handleManualInterruption(tools.manualInterruptionReason(e), 'search');
+                            return;
+                        }
+                        logger.add(`搜索冷却结束后恢复失败: ${e}`);
+                        await api.event('search_cooldown_resume_failed', `搜索冷却结束后恢复失败: ${e}`, 'script', 'error', {
+                            reason,
+                            searchRoundId,
+                        });
+                        setTimeout(loop, OPTIONS.actionDelayMs);
+                    }
+                };
+
+                cooldownTimer = setTimeout(cooldownTick, Math.min(30000, minutes * 60 * 1000));
             };
 
             const extractJobInfoFromDocument = (doc, href, source = 'document') => {
@@ -2582,6 +2797,10 @@
                         logger.add('暂停中...');
                         return;
                     }
+                    if (cooldownUntil && Date.now() < cooldownUntil) {
+                        setSearchAction(`搜索冷却中，预计 ${new Date(cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false })} 后继续`);
+                        return;
+                    }
                     if (!(await ensureGreetLimitsAvailable())) return;
                     logger.divider();
 
@@ -2596,8 +2815,7 @@
                             setTimeout(loop, 0);
                             return;
                         }
-                        await api.heartbeat('search', 'running', '所有关键词暂无新职位，稍后重新轮询');
-                        setTimeout(loop, OPTIONS.actionDelayMs);
+                        await enterSearchCooldown('本轮所有关键词无新职位');
                         return;
                     }
 
@@ -2756,21 +2974,16 @@
                     }
                     logger.add('获取自我介绍成功: ' + this.introduce);
                     // 开始搜索
-                    if (currentTagIdx >= this.tags.length) {
-                        currentTagIdx = 0;
-                    }
+                    await beginSearchRound('program_start');
                     setSearchAction(`准备搜索关键词: ${this.tags[currentTagIdx]}`);
-                    await search(this.tags[currentTagIdx]);
-                    await tools.actionSleep(1500);
+                    await searchCurrentKeyword('首个关键词', false);
                     const hasJobs = await nextPage();
                     if (!hasJobs) {
                         const hasNextKeyword = await switchToNextKeyword('搜索后没有读取到职位列表');
                         if (hasNextKeyword) {
                             loop();
                         } else {
-                            logger.add('所有关键词暂无新职位，稍后重新轮询');
-                            await api.heartbeat('search', 'running', '所有关键词暂无新职位，稍后重新轮询');
-                            setTimeout(loop, OPTIONS.actionDelayMs);
+                            await enterSearchCooldown('启动后所有关键词无新职位');
                         }
                         return;
                     }
@@ -2849,7 +3062,7 @@
             };
             startBroadcast();
 
-            // 鑾峰彇鑱屼綅淇℃伅
+            // 获取职位信息
             const getJobInfo = async () => {
                 const platformLimit = tools.detectPlatformLimit();
                 if (platformLimit) throw new Error(`平台次数限制: ${platformLimit}`);
