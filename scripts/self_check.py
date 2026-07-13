@@ -33,12 +33,14 @@ def check_config_normalization() -> None:
             "daily_greet_safe_limit": 999,
             "search_round_cooldown_minutes": 999,
             "tag_search_delay_seconds": 1,
+            "tag_search_delay_max_seconds": 1,
             "search_result_scroll_rounds": 9,
             "auto_start_time": "9:00",
         })
         assert Config.daily_greet_safe_limit == 150
         assert Config.search_round_cooldown_minutes == 240
         assert Config.tag_search_delay_seconds == 3
+        assert Config.tag_search_delay_max_seconds == 3
         assert Config.search_result_scroll_rounds == 2
         assert Config.auto_start_time == "09:00"
     finally:

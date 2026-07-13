@@ -365,6 +365,7 @@ class RuntimeState:
                 "daily_greet_safe_limit": Config.daily_greet_safe_limit,
                 "search_round_cooldown_minutes": Config.search_round_cooldown_minutes,
                 "tag_search_delay_seconds": Config.tag_search_delay_seconds,
+                "tag_search_delay_max_seconds": Config.tag_search_delay_max_seconds,
                 "search_result_scroll_rounds": Config.search_result_scroll_rounds,
             },
             "script": self.script_snapshot(),

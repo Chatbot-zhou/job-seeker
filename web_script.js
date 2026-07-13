@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.9
+// @version      2026.06.26.13
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06-cli-autogreet.25',
+        scriptVersion: '2026.06-cli-autogreet.28',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -35,6 +35,7 @@
         dailyGreetSafeLimit: 120,
         searchRoundCooldownMinutes: 30,
         tagSearchDelaySeconds: 10,
+        tagSearchDelayMaxSeconds: 30,
         searchResultScrollRounds: 1,
         actionDelayMs: 2500,
         manualInterventionMaxRetries: 3,
@@ -65,6 +66,12 @@
         if (Number.isFinite(Number(config.tag_search_delay_seconds))) {
             OPTIONS.tagSearchDelaySeconds = Math.max(3, Math.min(60, Number(config.tag_search_delay_seconds)));
         }
+        if (Number.isFinite(Number(config.tag_search_delay_max_seconds))) {
+            OPTIONS.tagSearchDelayMaxSeconds = Math.max(
+                OPTIONS.tagSearchDelaySeconds,
+                Math.min(60, Number(config.tag_search_delay_max_seconds)),
+            );
+        }
         if (Number.isFinite(Number(config.search_result_scroll_rounds))) {
             OPTIONS.searchResultScrollRounds = Math.max(0, Math.min(2, Number(config.search_result_scroll_rounds)));
         }
@@ -80,6 +87,7 @@
                 JOBLIST: '.rec-job-list', // 职位列表
                 JOBHREFS: '.job-card-box .job-name', // 职位链接
                 JOBLIST_CANDIDATES: ['.rec-job-list', '.job-list-box', '.job-list-container', '.search-job-result'],
+                JOB_SCROLL_CANDIDATES: ['.job-list-container', '.job-list-box', '.search-job-result', '.rec-job-list'],
                 JOBHREFS_CANDIDATES: ['.job-card-box .job-name', '.job-card-wrapper .job-title a', 'a[href*="/job_detail/"]'],
             },
             DETAIL: {
@@ -2118,6 +2126,47 @@
             // 获取职位链接
             const searchResultScrollDelayMs = () => 3000 + Math.floor(Math.random() * 2000);
 
+            const isScrollableJobContainer = (el) => {
+                if (!el || el === document.body || el === document.documentElement) return false;
+                const style = window.getComputedStyle(el);
+                const overflowY = `${style.overflowY || ''} ${style.overflow || ''}`;
+                const allowsScroll = /(auto|scroll|overlay)/i.test(overflowY);
+                return el.scrollHeight > el.clientHeight + 40 && (allowsScroll || el.scrollTop >= 0);
+            };
+
+            const describeScrollTarget = (el) => {
+                if (!el) return 'window';
+                const parts = [el.tagName ? el.tagName.toLowerCase() : 'element'];
+                if (el.id) parts.push(`#${el.id}`);
+                if (el.className && typeof el.className === 'string') {
+                    parts.push(`.${el.className.trim().split(/\s+/).slice(0, 3).join('.')}`);
+                }
+                return parts.join('');
+            };
+
+            const findJobListScrollContainer = () => {
+                const candidates = [];
+                const pushCandidate = (el) => {
+                    if (el && !candidates.includes(el)) candidates.push(el);
+                };
+
+                for (const selector of SELECTORS.ZHIPIN.SEARCH.JOB_SCROLL_CANDIDATES) {
+                    document.querySelectorAll(selector).forEach(pushCandidate);
+                }
+
+                const firstJobLink = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBHREFS_CANDIDATES.join(','));
+                let cursor = firstJobLink ? firstJobLink.parentElement : null;
+                while (cursor && cursor !== document.body && cursor !== document.documentElement) {
+                    pushCandidate(cursor);
+                    cursor = cursor.parentElement;
+                }
+
+                const scrollable = candidates
+                    .filter(isScrollableJobContainer)
+                    .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                return scrollable[0] || null;
+            };
+
             const scrollSearchResultsOnce = async (round) => {
                 const platformLimit = tools.detectPlatformLimit();
                 if (platformLimit) {
@@ -2128,10 +2177,7 @@
                     throw new Error(`需要人工处理: ${interruption}`);
                 }
                 const keyword = this.tags[currentTagIdx] || '';
-                const container = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLISTCTN)
-                    || document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLIST)
-                    || document.scrollingElement
-                    || document.documentElement;
+                const container = findJobListScrollContainer();
                 const distance = Math.max(420, Math.floor(window.innerHeight * 0.75));
                 setSearchAction(`低频滚动读取: ${keyword}`);
                 logger.add(`低频滚动读取搜索结果: ${keyword} (${round}/${OPTIONS.searchResultScrollRounds})`);
@@ -2140,9 +2186,19 @@
                     round,
                     maxRounds: OPTIONS.searchResultScrollRounds,
                     searchRoundId,
+                    target: describeScrollTarget(container),
                 });
-                if (container && typeof container.scrollBy === 'function') {
-                    container.scrollBy({ top: distance, behavior: 'smooth' });
+                if (container) {
+                    const before = container.scrollTop;
+                    if (typeof container.scrollBy === 'function') {
+                        container.scrollBy({ top: distance, behavior: 'smooth' });
+                    } else {
+                        container.scrollTop = before + distance;
+                    }
+                    await tools.asyncSleep(350);
+                    if (Math.abs(container.scrollTop - before) < 5) {
+                        container.scrollTop = before + distance;
+                    }
                 } else {
                     window.scrollBy({ top: distance, behavior: 'smooth' });
                 }
@@ -2266,9 +2322,13 @@
             };
 
             const tagSearchDelayMs = () => {
-                const baseSeconds = Math.max(3, Number(OPTIONS.tagSearchDelaySeconds) || 10);
-                const jitterSeconds = Math.floor(Math.random() * 6);
-                return (baseSeconds + jitterSeconds) * 1000;
+                const minSeconds = Math.max(3, Number(OPTIONS.tagSearchDelaySeconds) || 10);
+                const maxSeconds = Math.max(
+                    minSeconds,
+                    Number(OPTIONS.tagSearchDelayMaxSeconds) || 30,
+                );
+                const randomSeconds = minSeconds + Math.floor(Math.random() * (maxSeconds - minSeconds + 1));
+                return randomSeconds * 1000;
             };
 
             const waitBeforeTagSearch = async (keyword, reason = '') => {

@@ -325,8 +325,12 @@ def configure_base() -> None:
             int(current.get("search_round_cooldown_minutes", 30)),
         ),
         "tag_search_delay_seconds": ask_int(
-            "标签之间的搜索间隔秒数",
+            "标签之间的最小搜索间隔秒数",
             int(current.get("tag_search_delay_seconds", 10)),
+        ),
+        "tag_search_delay_max_seconds": ask_int(
+            "标签之间的最大搜索间隔秒数",
+            int(current.get("tag_search_delay_max_seconds", 30)),
         ),
         "search_result_scroll_rounds": ask_int(
             "每个标签最多低频滚动读取次数 0-2",
@@ -427,14 +431,14 @@ def edit_session_settings() -> None:
     print(f"  打招呼上限: {Config.session_greet_limit}")
     print(f"  每日安全上限: {Config.daily_greet_safe_limit}")
     print(f"  搜索冷却: {Config.search_round_cooldown_minutes} 分钟")
-    print(f"  标签间隔: {Config.tag_search_delay_seconds} 秒")
+    print(f"  标签间隔: 随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒")
     print(f"  滚动扩展: {Config.search_result_scroll_rounds} 次")
     print()
     print("[1] 修改岗位搜索标签")
     print("[2] 修改本次打招呼上限")
     print("[3] 修改每日安全上限")
     print("[4] 修改搜索冷却时间")
-    print("[5] 修改标签搜索间隔")
+    print("[5] 修改标签随机搜索间隔")
     print("[6] 修改滚动扩展次数")
     choice = input("  选择 [Enter 取消]: ").strip()
 
@@ -492,18 +496,28 @@ def edit_session_settings() -> None:
         print(f"[配置] 搜索冷却已更新为: {minutes} 分钟")
     elif choice == "5":
         while True:
-            seconds = ask_int("标签之间的搜索间隔秒数", int(Config.tag_search_delay_seconds))
-            if not 3 <= seconds <= 60:
-                print("[配置] 标签搜索间隔建议设置为 3-60 秒。")
+            min_seconds = ask_int("标签之间的最小搜索间隔秒数", int(Config.tag_search_delay_seconds))
+            if not 3 <= min_seconds <= 60:
+                print("[配置] 最小标签搜索间隔应为 3-60 秒。")
+                continue
+            max_seconds = ask_int(
+                "标签之间的最大搜索间隔秒数",
+                int(Config.tag_search_delay_max_seconds),
+            )
+            if not min_seconds <= max_seconds <= 60:
+                print(f"[配置] 最大间隔应为 {min_seconds}-60 秒，且不能小于最小间隔。")
                 continue
             break
-        Config.save({"tag_search_delay_seconds": seconds})
+        Config.save({
+            "tag_search_delay_seconds": min_seconds,
+            "tag_search_delay_max_seconds": max_seconds,
+        })
         runtime_state.emit(
             "tag_search_delay_updated",
-            f"标签搜索间隔调整为 {seconds} 秒",
+            f"标签搜索间隔调整为随机 {min_seconds}-{max_seconds} 秒",
             source="config",
         )
-        print(f"[配置] 标签搜索间隔已更新为: {seconds} 秒")
+        print(f"[配置] 标签搜索间隔已更新为: 随机 {min_seconds}-{max_seconds} 秒")
     elif choice == "6":
         while True:
             rounds = ask_int("每个标签最多低频滚动读取次数 0-2", int(Config.search_result_scroll_rounds))
@@ -708,7 +722,7 @@ def print_status_panel() -> None:
         schedule_label += f" / 等待中 {_format_wait_seconds(int(schedule.get('seconds_until_start', 0)))}"
     search_strategy_label = (
         f"冷却 {Config.search_round_cooldown_minutes}分 / "
-        f"间隔 {Config.tag_search_delay_seconds}秒 / "
+        f"间隔 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds}秒 / "
         f"滚动 {Config.search_result_scroll_rounds}次"
     )
     if script_detail.get("cooldownUntil"):
@@ -773,7 +787,8 @@ def print_summary() -> None:
     print(f"- 阈值/本次上限/每日安全上限: {Config.score_threshold} / {Config.session_greet_limit} / {Config.daily_greet_safe_limit}")
     print(
         f"- 搜索策略: 无新岗位冷却 {Config.search_round_cooldown_minutes} 分钟 / "
-        f"标签间隔 {Config.tag_search_delay_seconds} 秒 / 滚动扩展 {Config.search_result_scroll_rounds} 次"
+        f"标签间隔随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
+        f"滚动扩展 {Config.search_result_scroll_rounds} 次"
     )
     print(
         f"- 自动模式定时启动: {'开启' if Config.auto_start_enabled else '关闭'}"

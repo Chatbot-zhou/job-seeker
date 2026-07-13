@@ -36,6 +36,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "daily_greet_safe_limit": 120,
     "search_round_cooldown_minutes": 30,
     "tag_search_delay_seconds": 10,
+    "tag_search_delay_max_seconds": 30,
     "search_result_scroll_rounds": 1,
     "max_contacts_per_company": 1,
     "skip_contacted_companies": True,
@@ -152,6 +153,7 @@ class Config:
     daily_greet_safe_limit = DEFAULT_CONFIG["daily_greet_safe_limit"]
     search_round_cooldown_minutes = DEFAULT_CONFIG["search_round_cooldown_minutes"]
     tag_search_delay_seconds = DEFAULT_CONFIG["tag_search_delay_seconds"]
+    tag_search_delay_max_seconds = DEFAULT_CONFIG["tag_search_delay_max_seconds"]
     search_result_scroll_rounds = DEFAULT_CONFIG["search_result_scroll_rounds"]
     max_contacts_per_company = DEFAULT_CONFIG["max_contacts_per_company"]
     skip_contacted_companies = DEFAULT_CONFIG["skip_contacted_companies"]
@@ -228,6 +230,12 @@ class Config:
             data.get("tag_search_delay_seconds"),
             DEFAULT_CONFIG["tag_search_delay_seconds"],
             3,
+            60,
+        )
+        data["tag_search_delay_max_seconds"] = _as_int(
+            data.get("tag_search_delay_max_seconds"),
+            DEFAULT_CONFIG["tag_search_delay_max_seconds"],
+            data["tag_search_delay_seconds"],
             60,
         )
         data["search_result_scroll_rounds"] = _as_int(
