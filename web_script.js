@@ -133,14 +133,27 @@
                     '#chat-input',
                     '.chat-input [contenteditable="true"]',
                     '.input-area [contenteditable="true"]',
+                    '.message-input [contenteditable="true"]',
+                    '.chat-editor [contenteditable="true"]',
+                    '.boss-chat-editor [contenteditable="true"]',
+                    '[class*="editor"] [contenteditable="true"]',
+                    '[class*="input"] [contenteditable="true"]',
+                    '[contenteditable="true"][data-placeholder]',
                     'textarea[id*="chat"]',
                     'textarea[class*="chat"]',
                     '[contenteditable="true"]',
                 ], // 聊天输入框
                 MSGSEND: [
                     '.btn-send',
+                    '.send-btn',
+                    '.btn-send-message',
+                    '.send-message',
                     '[class*="btn-send"]',
+                    '[class*="send-btn"]',
+                    '[class*="send-message"]',
                     '[ka*="send"]',
+                    '[ka*="chat_send"]',
+                    '[ka*="send_message"]',
                     'button[class*="send"]:not(.disabled)',
                 ], // 消息发送按钮
                 // 聊天记录
@@ -2093,27 +2106,21 @@
                         attempt,
                         error,
                     });
-                    finishGreetingWait(requestId, { preserveTempTab: true });
-                    finishJobProgress('发送结果未知，已暂停');
-                    const message = `打招呼发送结果无法确认，已暂停且不会重试: ${jobInfo.title || href}`;
+                    finishGreetingWait(requestId);
+                    finishJobProgress('发送结果未知，跳过');
+                    const message = `打招呼发送结果无法确认，已跳过当前岗位并继续: ${jobInfo.title || href}`;
                     logger.add(message);
                     setSearchAction(message);
-                    await api.event('greet_delivery_unknown', message, 'script', 'error', {
+                    await api.event('greet_delivery_unknown', message, 'script', 'warning', {
                         title: jobInfo.title || '',
                         url: href,
                         requestId,
                         attempt,
                         error,
                     });
-                    await api.heartbeat('search', 'error', message, scriptHeartbeatDetail());
-                    this.pause = true;
-                    logger.setPaused(true);
-                    try {
-                        await api.control('pause');
-                    } catch (pauseError) {
-                        await api.event('greet_unknown_pause_failed', `发送结果未知后暂停失败: ${pauseError}`, 'script', 'error');
-                    }
-                    lastBackendControl = 'paused';
+                    await api.heartbeat('search', 'running', message, scriptHeartbeatDetail());
+                    if (await markPreferredFeedJobHandled('发送结果未知跳过')) return;
+                    loop();
                     return;
                 }
 
@@ -4066,6 +4073,61 @@
                 };
             };
 
+            const findChatInput = async () => {
+                const startedAt = Date.now();
+                while (Date.now() - startedAt < 15000) {
+                    const candidates = [];
+                    for (const selector of SELECTORS.ZHIPIN.CHAT.CHATINPUT) {
+                        try {
+                            candidates.push(...Array.from(document.querySelectorAll(selector)));
+                        } catch (e) {
+                            // Ignore unsupported selectors in older browsers.
+                        }
+                    }
+                    const visible = candidates.find(el => tools.isVisible(el) && !tools.isDisabled(el));
+                    if (visible) return visible;
+                    const platformLimit = tools.detectPlatformLimit();
+                    if (platformLimit) throw new Error(`平台次数限制: ${platformLimit}`);
+                    const interruption = tools.detectManualInterruption();
+                    if (interruption) throw new Error(`需要人工处理: ${interruption}`);
+                    await tools.asyncSleep(300);
+                }
+                throw new Error(`未找到目标元素: ${SELECTORS.ZHIPIN.CHAT.CHATINPUT.join(', ')}`);
+            };
+
+            const findSendButton = async () => {
+                const startedAt = Date.now();
+                while (Date.now() - startedAt < 10000) {
+                    const candidates = [];
+                    for (const selector of SELECTORS.ZHIPIN.CHAT.MSGSEND) {
+                        try {
+                            candidates.push(...Array.from(document.querySelectorAll(selector)));
+                        } catch (e) {
+                            // Ignore unsupported selectors in older browsers.
+                        }
+                    }
+                    const visible = candidates.find(el => tools.isVisible(el) && !tools.isDisabled(el));
+                    if (visible) return visible;
+                    await tools.asyncSleep(300);
+                }
+                return null;
+            };
+
+            const trySendByEnter = async (inputEl, text, beforeSnapshot) => {
+                inputEl.focus();
+                ['keydown', 'keypress', 'keyup'].forEach(type => {
+                    inputEl.dispatchEvent(new KeyboardEvent(type, {
+                        bubbles: true,
+                        cancelable: true,
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        which: 13,
+                    }));
+                });
+                return waitForMessageSendConfirmed(text, inputEl, beforeSnapshot, 5000);
+            };
+
             const sendMsg = (text, greetContext = {}) => {
                 return new Promise(async (resolve, reject) => {
                     try {
@@ -4075,7 +4137,7 @@
                         if (interruption) throw new Error(`需要人工处理: ${interruption}`);
                         if (!String(text || '').trim()) throw new Error('发送内容为空');
                         await pageApi.event('message_send_started', '准备发送已确认的打招呼消息', 'script', 'info', { length: String(text).length });
-                        const ipt = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.CHATINPUT);
+                        const ipt = await findChatInput();
                         const actualText = tools.inputEditableText(ipt, text);
                         if (!actualText || !actualText.includes(String(text).slice(0, 10))) {
                             const error = new Error('输入框写入后内容校验失败');
@@ -4089,27 +4151,25 @@
                         await tools.actionSleep(600);
                         const limitBeforeButton = tools.detectPlatformLimit();
                         if (limitBeforeButton) throw new Error(`平台次数限制: ${limitBeforeButton}`);
-                        const btn = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.MSGSEND);
+                        const btn = await findSendButton();
                         const limitBeforeClick = tools.detectPlatformLimit();
                         if (limitBeforeClick) throw new Error(`平台次数限制: ${limitBeforeClick}`);
-                        if (!tools.isVisible(btn) || tools.isDisabled(btn)) {
-                            const error = new Error('发送按钮不可用，可能需要人工确认页面状态');
-                            error.detail = {
-                                button: tools.elementBrief(btn),
-                                visible: tools.isVisible(btn),
-                                disabled: tools.isDisabled(btn),
-                                input: tools.elementBrief(ipt),
-                            };
-                            throw error;
-                        }
                         const beforeSnapshot = getSelfMessageSnapshot();
                         tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'send_clicked', {
                             requestId: greetContext.requestId || '',
                             attempt: Number(greetContext.attempt || 1),
                             clickedAt: Date.now(),
                         });
-                        btn.click();
-                        const confirmation = await waitForMessageSendConfirmed(text, ipt, beforeSnapshot);
+                        let confirmation;
+                        if (btn && tools.isVisible(btn) && !tools.isDisabled(btn)) {
+                            btn.click();
+                            confirmation = await waitForMessageSendConfirmed(text, ipt, beforeSnapshot);
+                        } else {
+                            await pageApi.event('message_send_button_missing', '发送按钮不可用，尝试使用 Enter 发送', 'script', 'warning', {
+                                input: tools.elementBrief(ipt),
+                            });
+                            confirmation = await trySendByEnter(ipt, text, beforeSnapshot);
+                        }
                         if (!confirmation.confirmed) {
                             tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'unknown', {
                                 requestId: greetContext.requestId || '',
@@ -4142,6 +4202,41 @@
                         reject(e);
                     }
                 })
+            };
+
+            const sendMsgWithRetries = async (text, greetContext = {}) => {
+                const maxAttempts = Math.max(1, Number(greetContext.maxAttempts || OPTIONS.greetMaxAttempts || 3));
+                let lastError = null;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        await pageApi.event('message_send_attempt', `聊天页发送尝试 ${attempt}/${maxAttempts}`, 'script', 'info', {
+                            requestId: greetContext.requestId || '',
+                            attempt,
+                            maxAttempts,
+                        });
+                        await sendMsg(text, { ...greetContext, attempt });
+                        return;
+                    } catch (e) {
+                        lastError = e;
+                        if (e.deliveryUnknown || tools.isPlatformLimitError(e) || tools.isManualInterruptionError(e)) {
+                            throw e;
+                        }
+                        if (attempt < maxAttempts) {
+                            const delay = Number((OPTIONS.greetRetryDelays || [0, 3000, 8000])[attempt] || 3000);
+                            await pageApi.event('message_send_attempt_retry', `聊天页发送失败，准备在当前页面重试 ${attempt + 1}/${maxAttempts}: ${e}`, 'script', 'warning', {
+                                requestId: greetContext.requestId || '',
+                                attempt,
+                                nextAttempt: attempt + 1,
+                                maxAttempts,
+                                error: String(e),
+                            });
+                            await tools.asyncSleep(delay);
+                        }
+                    }
+                }
+                const finalError = lastError || new Error('message_send_failed');
+                finalError.preSendFailed = true;
+                throw finalError;
             };
 
             // 打招呼
@@ -4205,7 +4300,7 @@
                     if (!introduce) throw new Error('未启用打招呼用语');
                     await tools.actionSleep();
                     ensureCurrentGreetRequest();
-                    await sendMsg(introduce, claimedContext);
+                    await sendMsgWithRetries(introduce, claimedContext);
                     const greetContext = claimedContext || {};
                     await pageApi.createAction('greet', {
                         message: introduce,
@@ -4245,31 +4340,22 @@
                             attempt: greetAttempt,
                             error: String(e),
                         });
-                        try {
-                            await pageApi.control('pause');
-                        } catch (pauseError) {
-                            await pageApi.event('greet_unknown_pause_failed', `发送结果未知后暂停失败: ${pauseError}`, 'script', 'error');
-                        }
                     }
                     await pageApi.heartbeat('chat_greet', 'error', String(e));
                     await pageApi.event('greet_failed', `打招呼失败: ${e}`, 'script', 'error');
                     this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {
                         success: false,
                         error: String(e),
+                        failureCode: e.preSendFailed ? 'message_pre_send_failed' : 'message_send_failed',
                         greetRequestId,
                         attempt: greetAttempt,
                         deliveryUnknown,
-                        retryable: !deliveryUnknown && !(tools.isPlatformLimitError(e) || tools.isManualInterruptionError(e)),
+                        retryable: false,
                     }).catch(async (sendError) => {
                         await pageApi.event('broadcast_send_failed', `打招呼失败结果回传失败: ${sendError}`, 'script', 'error');
                     }).finally(() => {
                         this.broadcast.destroy();
-                        if (deliveryUnknown) {
-                            tools.releaseGreetClaim(greetRequestId);
-                            banner('发送结果无法确认，自动化已暂停，请人工检查此页面');
-                        } else {
-                            closeTemporaryChatPage(greetRequestId);
-                        }
+                        closeTemporaryChatPage(greetRequestId);
                     });
                 }
             };

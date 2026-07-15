@@ -69,15 +69,23 @@ test('feed tabs are rediscovered and map-like controls are excluded', () => {
   assert.equal(hooks.isStrongCustomFeedName('早九晚六点半/企业客服审核员/不加班'), false);
 });
 
-test('send-clicked transactions become unknown and are not retried', () => {
+test('send-clicked unknown results are skipped without reopening chat', () => {
   assert.match(source, /send_clicked/);
   assert.match(source, /greet_delivery_unknown/);
-  assert.match(source, /已暂停且不会重试/);
+  assert.match(source, /已跳过当前岗位并继续/);
+  assert.doesNotMatch(source, /greet_unknown_pause_failed/);
   const unknownBranch = source.indexOf('if (deliveryUnknown)');
   const unknownReturn = source.indexOf('return;', unknownBranch);
   const retryBranch = source.indexOf('if (canRetry)', unknownBranch);
   assert.ok(unknownBranch >= 0 && unknownReturn > unknownBranch);
   assert.ok(retryBranch > unknownReturn, 'unknown delivery must return before retry handling');
+});
+
+test('chat send retries stay in the same page and search does not reopen chat on send failure', () => {
+  assert.match(source, /sendMsgWithRetries/);
+  assert.match(source, /message_send_attempt_retry/);
+  assert.match(source, /failureCode:\s*e\.preSendFailed \? 'message_pre_send_failed'/);
+  assert.match(source, /retryable:\s*false/);
 });
 
 test('background tabs remain non-active', () => {
