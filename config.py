@@ -32,16 +32,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_api_key": "",
     "think_model": "qwen3:1.7b",
     "score_threshold": 70,
-    "session_greet_limit": 50,
-    "daily_greet_safe_limit": 120,
     "search_round_cooldown_minutes": 60,
     "tag_search_delay_seconds": 20,
     "tag_search_delay_max_seconds": 45,
     "max_search_submissions_per_hour": 6,
     "max_search_submissions_per_day": 30,
-    "search_result_scroll_rounds": 5,
+    "search_result_scroll_rounds": 10,
     "preferred_feed_mode": "all_custom_tabs",
-    "preferred_feed_max_jobs_per_tab": 10,
+    "preferred_feed_max_jobs_per_tab": 0,
     "max_contacts_per_company": 1,
     "skip_contacted_companies": True,
     "job_detail_max_chars": 1600,
@@ -153,8 +151,6 @@ class Config:
     openai_api_key = DEFAULT_CONFIG["openai_api_key"]
     think_model = DEFAULT_CONFIG["think_model"]
     score_threshold = DEFAULT_CONFIG["score_threshold"]
-    session_greet_limit = DEFAULT_CONFIG["session_greet_limit"]
-    daily_greet_safe_limit = DEFAULT_CONFIG["daily_greet_safe_limit"]
     search_round_cooldown_minutes = DEFAULT_CONFIG["search_round_cooldown_minutes"]
     tag_search_delay_seconds = DEFAULT_CONFIG["tag_search_delay_seconds"]
     tag_search_delay_max_seconds = DEFAULT_CONFIG["tag_search_delay_max_seconds"]
@@ -196,9 +192,6 @@ class Config:
                     if saved.get("model_provider") == "openai_compatible":
                         saved["model_provider"] = "openai"
                         should_rewrite = True
-                    if "daily_greet_limit" in saved and "session_greet_limit" not in saved:
-                        saved["session_greet_limit"] = saved.get("daily_greet_limit")
-                        should_rewrite = True
                     if any(key not in DEFAULT_CONFIG for key in saved):
                         should_rewrite = True
                     if any(key not in saved for key in DEFAULT_CONFIG):
@@ -229,7 +222,6 @@ class Config:
         data["show_model_reasoning"] = _as_bool(data.get("show_model_reasoning"))
         data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
         data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
-        data["daily_greet_safe_limit"] = _as_int(data.get("daily_greet_safe_limit"), 120, 1, 150)
         data["search_round_cooldown_minutes"] = _as_int(
             data.get("search_round_cooldown_minutes"),
             DEFAULT_CONFIG["search_round_cooldown_minutes"],
@@ -264,7 +256,7 @@ class Config:
             data.get("search_result_scroll_rounds"),
             DEFAULT_CONFIG["search_result_scroll_rounds"],
             0,
-            5,
+            20,
         )
         data["preferred_feed_max_jobs_per_tab"] = _as_int(
             data.get("preferred_feed_max_jobs_per_tab"),
@@ -316,8 +308,6 @@ class Config:
     def save(cls, updates: dict[str, Any]) -> dict[str, Any]:
         ensure_data_dirs()
         updates = dict(updates)
-        if "daily_greet_limit" in updates and "session_greet_limit" not in updates:
-            updates["session_greet_limit"] = updates.get("daily_greet_limit")
         current = cls.as_dict()
         current.update({k: v for k, v in updates.items() if k in DEFAULT_CONFIG})
         cls.apply(current)

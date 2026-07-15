@@ -294,6 +294,11 @@ def ensure_range_int(prompt: str, current: int, minimum: int, maximum: int) -> i
         print(f"[配置] 请输入 {minimum}-{maximum} 之间的整数。")
 
 
+def format_feed_job_limit(value: Any) -> str:
+    limit = int(value or 0)
+    return "不限" if limit == 0 else f"{limit} 个"
+
+
 def print_config_preview(updates: dict[str, Any]) -> None:
     preview = Config.as_dict()
     preview.update(updates)
@@ -304,10 +309,7 @@ def print_config_preview(updates: dict[str, Any]) -> None:
         print(f"- OpenAI: {preview.get('openai_api_base')} / Key: {key_source}")
     else:
         print(f"- Ollama: {preview.get('ollama_host')}")
-    print(
-        f"- 阈值/本轮/每日安全: {preview.get('score_threshold')} / "
-        f"{preview.get('session_greet_limit')} / {preview.get('daily_greet_safe_limit')}"
-    )
+    print(f"- 匹配度阈值: {preview.get('score_threshold')}")
     print(
         f"- 搜索: 冷却 {preview.get('search_round_cooldown_minutes')} 分钟 / "
         f"标签间隔 {preview.get('tag_search_delay_seconds')}-{preview.get('tag_search_delay_max_seconds')} 秒 / "
@@ -319,7 +321,7 @@ def print_config_preview(updates: dict[str, Any]) -> None:
     )
     print(
         f"- 推荐源: {preview.get('preferred_feed_mode')} / "
-        f"每个自定义 Tab {preview.get('preferred_feed_max_jobs_per_tab')} 个"
+        f"每个自定义 Tab {format_feed_job_limit(preview.get('preferred_feed_max_jobs_per_tab'))}"
     )
 
 
@@ -373,8 +375,6 @@ def configure_search_safety_settings() -> None:
     current = Config.as_dict()
     updates = {
         "score_threshold": ask_int("最低匹配度阈值", int(current["score_threshold"])),
-        "session_greet_limit": ask_int("本次最多打招呼数量", int(current["session_greet_limit"])),
-        "daily_greet_safe_limit": ask_int("每日自动打招呼安全上限", int(current.get("daily_greet_safe_limit", 120))),
         "search_round_cooldown_minutes": ask_int(
             "所有标签无新岗位后的搜索冷却分钟数",
             int(current.get("search_round_cooldown_minutes", 60)),
@@ -396,12 +396,12 @@ def configure_search_safety_settings() -> None:
             int(current.get("max_search_submissions_per_day", 30)),
         ),
         "search_result_scroll_rounds": ask_int(
-            "每个标签最多低频滚动读取次数 0-5",
-            int(current.get("search_result_scroll_rounds", 5)),
+            "每个推荐源或标签最多低频滚动读取次数 0-20",
+            int(current.get("search_result_scroll_rounds", 10)),
         ),
         "preferred_feed_max_jobs_per_tab": ask_int(
             "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
-            int(current.get("preferred_feed_max_jobs_per_tab", 10)),
+            int(current.get("preferred_feed_max_jobs_per_tab", 0)),
         ),
         "job_detail_max_chars": ask_int("职位描述传给模型的最大字数", int(current["job_detail_max_chars"])),
     }
@@ -552,70 +552,30 @@ def edit_profile() -> None:
 
 
 def edit_session_settings() -> None:
-    """修改本轮轮次设置：岗位标签 + 打招呼上限。"""
+    """修改本轮轮次设置：岗位标签 + 搜索策略。"""
     cache.load()
     print("[轮次设置] 当前配置:")
     print(f"  岗位标签: {'、'.join(cache.tags) if cache.tags else '(空)'}")
-    print(f"  打招呼上限: {Config.session_greet_limit}")
-    print(f"  每日安全上限: {Config.daily_greet_safe_limit}")
     print(f"  搜索冷却: {Config.search_round_cooldown_minutes} 分钟")
     print(f"  标签间隔: 随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒")
     print(f"  搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / 每日 {Config.max_search_submissions_per_day} 次")
     print(f"  滚动扩展: {Config.search_result_scroll_rounds} 次")
     print(
         f"  自定义推荐: {'启用' if Config.preferred_feed_mode != 'off' else '关闭'} / "
-        f"每个 Tab {Config.preferred_feed_max_jobs_per_tab} 个"
+        f"每个 Tab {format_feed_job_limit(Config.preferred_feed_max_jobs_per_tab)}"
     )
     print()
     print("[1] 修改岗位搜索标签")
-    print("[2] 修改本次打招呼上限")
-    print("[3] 修改每日安全上限")
-    print("[4] 修改搜索冷却时间")
-    print("[5] 修改标签随机搜索间隔")
-    print("[6] 修改滚动扩展次数")
-    print("[7] 修改自定义推荐 Tab 上限")
-    print("[8] 修改关键词搜索预算")
+    print("[2] 修改搜索冷却时间")
+    print("[3] 修改标签随机搜索间隔")
+    print("[4] 修改滚动扩展次数")
+    print("[5] 修改自定义推荐 Tab 上限")
+    print("[6] 修改关键词搜索预算")
     choice = input("  选择 [Enter 取消]: ").strip()
 
     if choice == "1":
         edit_tags()
     elif choice == "2":
-        while True:
-            raw = ask("本次最多打招呼数量", str(Config.session_greet_limit))
-            try:
-                limit = int(raw)
-            except ValueError:
-                print("[配置] 请输入整数。")
-                continue
-            if limit <= 0:
-                print("[配置] 本次最多打招呼数量必须大于 0。")
-                continue
-            break
-        Config.save({"session_greet_limit": limit})
-        runtime_state.emit(
-            "session_limit_updated",
-            f"打招呼上限调整为 {limit}",
-            source="config",
-        )
-        print(f"[配置] 本次最多打招呼数量已更新为: {limit}")
-    elif choice == "3":
-        while True:
-            limit = ask_int("每日自动打招呼安全上限", int(Config.daily_greet_safe_limit))
-            if limit <= 0:
-                print("[配置] 每日安全上限必须大于 0。")
-                continue
-            if limit > 150:
-                print("[配置] BOSS 平台每日总额度约 150，建议不要超过 120；如需修改请重新输入 1-150。")
-                continue
-            break
-        Config.save({"daily_greet_safe_limit": limit})
-        runtime_state.emit(
-            "daily_safe_limit_updated",
-            f"每日安全上限调整为 {limit}",
-            source="config",
-        )
-        print(f"[配置] 每日自动打招呼安全上限已更新为: {limit}")
-    elif choice == "4":
         while True:
             minutes = ask_int("所有标签无新岗位后的搜索冷却分钟数", int(Config.search_round_cooldown_minutes))
             if not 1 <= minutes <= 240:
@@ -629,7 +589,7 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 搜索冷却已更新为: {minutes} 分钟")
-    elif choice == "5":
+    elif choice == "3":
         while True:
             min_seconds = ask_int("标签之间的最小搜索间隔秒数", int(Config.tag_search_delay_seconds))
             if not 3 <= min_seconds <= 60:
@@ -653,11 +613,11 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 标签搜索间隔已更新为: 随机 {min_seconds}-{max_seconds} 秒")
-    elif choice == "6":
+    elif choice == "4":
         while True:
-            rounds = ask_int("每个标签最多低频滚动读取次数 0-5", int(Config.search_result_scroll_rounds))
-            if not 0 <= rounds <= 5:
-                print("[配置] 滚动扩展次数只能设置为 0-5。")
+            rounds = ask_int("每个推荐源或标签最多低频滚动读取次数 0-20", int(Config.search_result_scroll_rounds))
+            if not 0 <= rounds <= 20:
+                print("[配置] 滚动扩展次数只能设置为 0-20。")
                 continue
             break
         Config.save({"search_result_scroll_rounds": rounds})
@@ -667,7 +627,7 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 搜索滚动扩展次数已更新为: {rounds}")
-    elif choice == "7":
+    elif choice == "5":
         while True:
             limit = ask_int(
                 "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
@@ -684,7 +644,7 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 自定义推荐 Tab 上限已更新为: {limit}")
-    elif choice == "8":
+    elif choice == "6":
         while True:
             hourly = ask_int("每小时最多提交关键词搜索次数", int(Config.max_search_submissions_per_hour))
             daily = ask_int("每日最多提交关键词搜索次数", int(Config.max_search_submissions_per_day))
@@ -770,17 +730,14 @@ def prepare_session_start(force: bool = False) -> bool:
         runtime_state.emit("session_prepare_failed", "岗位标签为空，本轮未启动，请先使用 tags 命令处理", source="config", level="error")
         return False
 
-    limit = Config.session_greet_limit  # 直接使用已有配置，不再交互询问
-
     SESSION_PREPARED = True
     runtime_state.emit(
         "session_config_saved",
-        f"本轮设置已确认: 标签 {len(cache.tags)} 个 / 本次上限 {limit}",
+        f"本轮设置已确认: 标签 {len(cache.tags)} 个",
         source="config",
-        detail={"tags": cache.tags, "session_greet_limit": limit},
+        detail={"tags": cache.tags},
     )
     print(f"[配置] 本轮岗位标签: {'、'.join(cache.tags)}")
-    print(f"[配置] 本次最多打招呼数量: {limit}")
     return True
 
 
@@ -862,8 +819,6 @@ def setup_quick_start() -> None:
         "model_provider": model_provider,
         "think_model": ask("模型名称", current["think_model"]),
         "score_threshold": ensure_range_int("最低匹配度阈值", int(current["score_threshold"]), 0, 100),
-        "session_greet_limit": ensure_range_int("本次最多打招呼数量", int(current["session_greet_limit"]), 1, 150),
-        "daily_greet_safe_limit": ensure_range_int("每日自动打招呼安全上限", int(current.get("daily_greet_safe_limit", 120)), 1, 150),
         "search_round_cooldown_minutes": ensure_range_int(
             "所有标签无新岗位后的搜索冷却分钟数",
             int(current.get("search_round_cooldown_minutes", 60)),
@@ -889,14 +844,14 @@ def setup_quick_start() -> None:
             300,
         ),
         "search_result_scroll_rounds": ensure_range_int(
-            "每个标签最多低频滚动读取次数 0-5",
-            int(current.get("search_result_scroll_rounds", 5)),
+            "每个推荐源或标签最多低频滚动读取次数 0-20",
+            int(current.get("search_result_scroll_rounds", 10)),
             0,
-            5,
+            20,
         ),
         "preferred_feed_max_jobs_per_tab": ensure_range_int(
             "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
-            int(current.get("preferred_feed_max_jobs_per_tab", 10)),
+            int(current.get("preferred_feed_max_jobs_per_tab", 0)),
             0,
             500,
         ),
@@ -1023,7 +978,7 @@ def print_status_panel() -> None:
         f"{script_detail.get('jobSource') or '未上报'}"
         f" / {script_detail.get('currentFeedTabName') or '-'}"
         f" / {script_detail.get('feedTabProcessedCount', 0)}/"
-        f"{script_detail.get('feedTabMaxJobs') if script_detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab}"
+        f"{format_feed_job_limit(script_detail.get('feedTabMaxJobs') if script_detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
     )
     if script_detail.get("cooldownUntil"):
         search_strategy_label = _format_script_cooldown(script_detail)
@@ -1041,7 +996,7 @@ def print_status_panel() -> None:
         print(f"- 脚本地址: http://{Config.server_host}:{Config.server_port}/web_script.user.js")
         print(f"- 模型: {model_label} / {model_status}")
         print(f"- 思考模式: 评分 {scoring_think} / 画像标签 {scoring_think} / 打招呼 {greeting_think}")
-        print(f"- 阈值与上限: {Config.score_threshold} 分 / 本轮 {Config.session_greet_limit} / 今日安全 {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}")
+        print(f"- 阈值与统计: {Config.score_threshold} 分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}")
         print(f"- 搜索策略: {search_strategy_label}")
         print(f"- 岗位来源: {source_label}")
         print(f"- 定时启动: {schedule_label}")
@@ -1058,8 +1013,7 @@ def print_status_panel() -> None:
 ║  模型        {model_label:<48}║
 ║  模型状态    {model_status:<48}║
 ║  思考模式    评分: {scoring_think:<6} │ 画像/标签: {scoring_think:<6} │ 打招呼: {greeting_think:<6}{' ' * 8}║
-║  评分阈值    {Config.score_threshold}分 / 本次上限 {Config.session_greet_limit}{' ' * 30}║
-║  今日安全    {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}{' ' * 42}║
+║  评分阈值    {Config.score_threshold}分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}{' ' * 18}║
 ║  搜索策略    {search_strategy_label[:48]:<48}║
 ║  岗位来源    {source_label[:48]:<48}║
 ║  定时启动    {schedule_label:<48}║
@@ -1079,8 +1033,8 @@ def print_status_panel() -> None:
         panel = f"""
 ┌──────────────────────────────────────────────────────────────┐
 │  Job Seeker  v2026.07                                        │
-│  {model_label} │ 评分思考: {scoring_think} │ 画像/标签: {scoring_think} │ 打招呼: {greeting_think} │ 阈值: {Config.score_threshold}分 │ 上限: {Config.session_greet_limit}  │
-│  今日安全: {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} │ 定时启动: {schedule_label[:38]:<38} │
+│  {model_label} │ 评分思考: {scoring_think} │ 画像/标签: {scoring_think} │ 打招呼: {greeting_think} │ 阈值: {Config.score_threshold}分 │
+│  本轮成功: {script_detail.get('sessionGreetCount', 0)} │ 今日成功: {script_detail.get('dailyGreetCount', 0)} │ 定时启动: {schedule_label[:30]:<30} │
 │  搜索: {search_strategy_label[:54]:<54} │
 │  来源: {source_label[:54]:<54} │
 │  模型: {model_status[:50]} │ 评分令牌: {Config.job_score_num_predict_think_off}/{Config.job_score_num_predict_think_on} │
@@ -1103,7 +1057,7 @@ def print_summary() -> None:
     print(f"- 模型: {Config.think_model}")
     if Config.model_provider == "openai":
         print(f"- OpenAI 模型类型: {Config.external_model_profile}")
-    print(f"- 阈值/本次上限/每日安全上限: {Config.score_threshold} / {Config.session_greet_limit} / {Config.daily_greet_safe_limit}")
+    print(f"- 最低匹配度阈值: {Config.score_threshold}")
     print(
         f"- 搜索策略: 无新岗位冷却 {Config.search_round_cooldown_minutes} 分钟 / "
         f"标签间隔随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
@@ -1115,7 +1069,7 @@ def print_summary() -> None:
     )
     print(
         f"- 自定义推荐: {'启用' if Config.preferred_feed_mode != 'off' else '关闭'} / "
-        f"每个 Tab {Config.preferred_feed_max_jobs_per_tab} 个（0 表示不限）"
+        f"每个 Tab {format_feed_job_limit(Config.preferred_feed_max_jobs_per_tab)}"
     )
     print(
         f"- 自动模式定时启动: {'开启' if Config.auto_start_enabled else '关闭'}"
@@ -1179,7 +1133,7 @@ def show_startup_next_steps() -> None:
     print("\n[启动] 下一步:")
     print(f"  1. 确认油猴脚本已安装或更新: {script_install_url()}")
     print("  2. 刷新 BOSS 搜索页，等待 CLI 显示脚本就绪")
-    print("  3. 输入 start，确认本轮岗位标签和本次打招呼上限后开始")
+    print("  3. 输入 start，确认岗位标签和运行配置后开始")
 
 
 def show_autorun_next_steps() -> None:
@@ -1352,8 +1306,9 @@ def show_status() -> None:
     print_status_panel()
     # 补充脚本会话细节（面板中已包含基本连接状态，这里追加会话计数和版本）
     detail = runtime_state.script_snapshot().get("detail") or {}
-    if detail.get("sessionGreetLimit") is not None:
-        print(f"  会话详情: 本轮 {detail.get('sessionGreetCount', 0)}/{detail.get('sessionGreetLimit')} | "
+    if detail:
+        print(f"  会话详情: 本轮成功 {detail.get('sessionGreetCount', 0)} | "
+              f"今日成功 {detail.get('dailyGreetCount', 0)} | "
               f"脚本版本 {detail.get('version', '-')} | "
               f"会话ID {detail.get('localSessionRunId') or detail.get('runId') or '-'}")
     if not runtime_state.script_snapshot().get("connected"):
@@ -1473,14 +1428,8 @@ def show_run_summary() -> None:
     print(f"- run_id: {runtime_state.run_id}")
     print(f"- 控制状态: {runtime_state.control} / 当前任务: {runtime_state.current_task}")
     print(f"- 脚本: {script.get('page')} / {script.get('status')} / {script.get('current_action') or '空闲'}")
-    print(
-        f"- 本轮计数: {detail.get('sessionGreetCount', 0)} / "
-        f"{detail.get('sessionGreetLimit') or Config.session_greet_limit}"
-    )
-    print(
-        f"- 今日安全: {detail.get('dailyGreetCount', 0)} / "
-        f"{detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}"
-    )
+    print(f"- 本轮成功: {detail.get('sessionGreetCount', 0)}")
+    print(f"- 今日成功: {detail.get('dailyGreetCount', 0)}")
     print(
         f"- 搜索轮次: round={detail.get('searchRoundId', '-')} / "
         f"tag={detail.get('currentTagIndex', '-')} / checked={detail.get('tagsCheckedThisRound', '-')}"
@@ -1489,7 +1438,7 @@ def show_run_summary() -> None:
         f"- 岗位来源: {detail.get('jobSource') or '-'} / "
         f"{detail.get('currentFeedTabName') or '-'} / "
         f"{detail.get('feedTabProcessedCount', 0)}/"
-        f"{detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab}"
+        f"{format_feed_job_limit(detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
     )
     print(f"- 搜索冷却: {_format_script_cooldown(detail)}")
     print(f"- 近期职位: {len(jobs)} 个 / 已沟通 {len(greeted)} / 跳过 {len(skipped)} / 有错误 {len(errored)}")
@@ -1642,16 +1591,8 @@ def show_doctor() -> None:
             f"脚本 {detail.get('localSessionRunId') or detail.get('runId') or '-'} / "
             f"脚本后端 {detail.get('backendRunId') or '-'}"
         )
-        print(
-            f"  本轮计数: {detail.get('sessionGreetCount', 0)} / "
-            f"{detail.get('sessionGreetLimit') or Config.session_greet_limit} / "
-            f"ended={detail.get('sessionEnded')}"
-        )
-        print(
-            f"  今日计数: {detail.get('dailyGreetCount', 0)} / "
-            f"{detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} / "
-            f"date={detail.get('dailyGreetDate') or '-'}"
-        )
+        print(f"  本轮成功: {detail.get('sessionGreetCount', 0)} / ended={detail.get('sessionEnded')}")
+        print(f"  今日成功: {detail.get('dailyGreetCount', 0)} / date={detail.get('dailyGreetDate') or '-'}")
         print(
             f"  搜索轮次: round={detail.get('searchRoundId', '-')} / "
             f"tag={detail.get('currentTagIndex', '-')} / "
@@ -1661,7 +1602,7 @@ def show_doctor() -> None:
             f"  岗位来源: {detail.get('jobSource') or '-'} / "
             f"推荐源={detail.get('currentFeedTabName') or '-'} / "
             f"{detail.get('feedTabProcessedCount', 0)}/"
-            f"{detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab}"
+            f"{format_feed_job_limit(detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
         )
         print(
             f"  搜索冷却: {_format_script_cooldown(detail)} / "
@@ -1834,12 +1775,11 @@ def auto_prepare_saved_configuration() -> bool:
         return block_autorun("岗位标签为空，自动运行已暂停", next_action="运行人工启动器 tags 配置岗位标签")
     runtime_state.emit(
         "autorun_config_ready",
-        f"自动运行配置就绪: 标签 {len(cache.tags)} 个 / 本次上限 {Config.session_greet_limit}",
+        f"自动运行配置就绪: 标签 {len(cache.tags)} 个",
         source="startup",
-        detail={"tags": cache.tags, "session_greet_limit": Config.session_greet_limit},
+        detail={"tags": cache.tags},
     )
     print(f"[配置] 自动运行将使用岗位标签: {'、'.join(cache.tags)}")
-    print(f"[配置] 本次最多打招呼数量: {Config.session_greet_limit}")
     return True
 
 
@@ -1862,7 +1802,7 @@ def show_help() -> None:
   config        重新配置基础参数
   resume        重新上传/编辑简历
   profile       重新生成/编辑用户画像
-  session       修改本轮轮次设置（岗位标签 / 打招呼上限）
+  session       修改本轮轮次设置（岗位标签 / 搜索策略）
   tags          重新生成/编辑岗位搜索标签
   greeting      重新生成/编辑打招呼用语
   start         开始或继续运行

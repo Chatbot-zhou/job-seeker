@@ -31,22 +31,21 @@ def check_config_normalization() -> None:
     try:
         Config.apply({
             **original,
-            "daily_greet_safe_limit": 999,
             "search_round_cooldown_minutes": 999,
             "tag_search_delay_seconds": 1,
             "tag_search_delay_max_seconds": 1,
             "max_search_submissions_per_hour": 9,
             "max_search_submissions_per_day": 3,
-            "search_result_scroll_rounds": 9,
+            "search_result_scroll_rounds": 25,
             "auto_start_time": "9:00",
         })
-        assert Config.daily_greet_safe_limit == 150
+        assert "daily_greet_safe_limit" not in Config.as_dict()
         assert Config.search_round_cooldown_minutes == 240
         assert Config.tag_search_delay_seconds == 3
         assert Config.tag_search_delay_max_seconds == 3
         assert Config.max_search_submissions_per_hour == 9
         assert Config.max_search_submissions_per_day == 9
-        assert Config.search_result_scroll_rounds == 5
+        assert Config.search_result_scroll_rounds == 20
         assert Config.auto_start_time == "09:00"
     finally:
         Config.apply(original)

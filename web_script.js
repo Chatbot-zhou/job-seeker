@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.20
+// @version      2026.06.26.21
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06.26.20',
+        scriptVersion: '2026.06.26.21',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -31,16 +31,14 @@
         timestampTimeout: 120000, // 页面跳转来源标记有效期，单位毫秒
         jobInfoResponseTimeout: 90000, // 详情页回传职位信息的最长等待时间
         onlyGreet: true, // 仅辅助打招呼，不自动扫描普通聊天页
-        sessionGreetLimit: 50,
-        dailyGreetSafeLimit: 120,
         searchRoundCooldownMinutes: 60,
         tagSearchDelaySeconds: 20,
         tagSearchDelayMaxSeconds: 45,
         maxSearchSubmissionsPerHour: 6,
         maxSearchSubmissionsPerDay: 30,
-        searchResultScrollRounds: 5,
+        searchResultScrollRounds: 10,
         preferredFeedMode: 'all_custom_tabs',
-        preferredFeedMaxJobsPerTab: 10,
+        preferredFeedMaxJobsPerTab: 0,
         actionDelayMs: 2500,
         searchLeaseMs: 12000,
         openCooldownMs: 45000,
@@ -56,12 +54,6 @@
         if (!config) return;
         if (Number.isFinite(Number(config.score_threshold))) {
             OPTIONS.thread = Number(config.score_threshold);
-        }
-        if (Number.isFinite(Number(config.session_greet_limit))) {
-            OPTIONS.sessionGreetLimit = Number(config.session_greet_limit);
-        }
-        if (Number.isFinite(Number(config.daily_greet_safe_limit))) {
-            OPTIONS.dailyGreetSafeLimit = Number(config.daily_greet_safe_limit);
         }
         if (Number.isFinite(Number(config.search_round_cooldown_minutes))) {
             OPTIONS.searchRoundCooldownMinutes = Math.max(1, Math.min(240, Number(config.search_round_cooldown_minutes)));
@@ -82,7 +74,7 @@
             OPTIONS.maxSearchSubmissionsPerDay = Math.max(1, Math.min(300, Number(config.max_search_submissions_per_day)));
         }
         if (Number.isFinite(Number(config.search_result_scroll_rounds))) {
-            OPTIONS.searchResultScrollRounds = Math.max(0, Math.min(5, Number(config.search_result_scroll_rounds)));
+            OPTIONS.searchResultScrollRounds = Math.max(0, Math.min(20, Number(config.search_result_scroll_rounds)));
         }
         if (config.preferred_feed_mode === 'off' || config.preferred_feed_mode === 'all_custom_tabs') {
             OPTIONS.preferredFeedMode = config.preferred_feed_mode;
@@ -693,6 +685,7 @@
                 '[class*="captcha"]', '[id*="captcha"]', '[class*="verify"]', '[id*="verify"]',
                 '[class*="security"]', '[id*="security"]', 'iframe[src*="captcha"]',
                 'iframe[src*="verify"]', '.geetest_panel', '.nc-container', '.login-dialog',
+                '[class*="modal"]', '[class*="popup"]', '[class*="dialog"]', '[class*="layer"]',
             ];
             const texts = [];
             for (const selector of selectors) {
@@ -712,6 +705,108 @@
                 }
             }
             return texts.join(' ').replace(/\s+/g, ' ').trim();
+        },
+        normalizedText(node) {
+            return String(node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
+        },
+        jsonVisibleText(value, maxItems = 80) {
+            const parts = [];
+            const walk = (item, depth = 0) => {
+                if (parts.length >= maxItems || depth > 5 || item == null) return;
+                if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') {
+                    parts.push(String(item));
+                    return;
+                }
+                if (Array.isArray(item)) {
+                    item.slice(0, 20).forEach(child => walk(child, depth + 1));
+                    return;
+                }
+                if (typeof item === 'object') {
+                    Object.keys(item).slice(0, 40).forEach(key => {
+                        parts.push(String(key));
+                        walk(item[key], depth + 1);
+                    });
+                }
+            };
+            walk(value);
+            return parts.join(' ').replace(/\s+/g, ' ').trim();
+        },
+        isQuotaReminderText(text) {
+            const content = String(text || '').replace(/\s+/g, ' ');
+            if (!content) return false;
+            const hasBossCount = /今天已与\s*\d+\s*位?\s*BOSS\s*沟通/.test(content)
+                || /已与\s*\d+\s*位?\s*BOSS\s*沟通/.test(content);
+            const hasRemaining = /(还剩|剩余)\s*\d+\s*次\s*(沟通机会|沟通|机会)?/.test(content)
+                || /还有\s*\d+\s*次\s*(沟通机会|沟通|机会)?/.test(content);
+            const hasFriendlyTitle = content.includes('温馨提示');
+            return (hasBossCount && hasRemaining) || (hasFriendlyTitle && hasRemaining && content.includes('BOSS'));
+        },
+        quotaReminderReasonFromValue(value) {
+            const text = typeof value === 'string' ? value : this.jsonVisibleText(value);
+            if (this.isQuotaReminderText(text)) return 'BOSS 温馨提示额度弹窗';
+            return this.detectQuotaWarningText(text);
+        },
+        findQuotaReminderDialog() {
+            const selector = [
+                '[role="dialog"]',
+                '[aria-modal="true"]',
+                '.dialog-wrap',
+                '.boss-dialog',
+                '.boss-popup',
+                '[class*="dialog"]',
+                '[class*="modal"]',
+                '[class*="popup"]',
+                '[class*="layer"]',
+                'body > div',
+            ].join(',');
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(selector));
+            } catch (e) {
+                nodes = [];
+            }
+            const textMatched = [];
+            for (const node of nodes.slice(0, 250)) {
+                if (!this.isVisible(node)) continue;
+                const text = this.normalizedText(node);
+                if (!this.isQuotaReminderText(text)) continue;
+                const rect = node.getBoundingClientRect();
+                textMatched.push({ node, text, area: Math.max(1, rect.width * rect.height) });
+            }
+            textMatched.sort((a, b) => a.area - b.area);
+            for (const item of textMatched) {
+                const buttons = Array.from(item.node.querySelectorAll('button,a,[role="button"],.btn,[class*="btn"],span,div'))
+                    .filter(el => this.isVisible(el) && !this.isDisabled(el));
+                const confirmButton = buttons.find(el => /^(好|确定|知道了|我知道了)$/.test(this.normalizedText(el)));
+                if (confirmButton) {
+                    return {
+                        dialog: item.node,
+                        button: confirmButton,
+                        text: item.text.slice(0, 160),
+                    };
+                }
+            }
+            return null;
+        },
+        async confirmQuotaReminderDialog() {
+            const found = this.findQuotaReminderDialog();
+            if (!found) return null;
+            found.button.click();
+            const deadline = Date.now() + 2000;
+            let stillVisible = true;
+            while (Date.now() < deadline) {
+                await this.asyncSleep(200);
+                if (!this.findQuotaReminderDialog()) {
+                    stillVisible = false;
+                    break;
+                }
+            }
+            return {
+                confirmed: !stillVisible,
+                text: found.text,
+                button: this.normalizedText(found.button),
+                dialog: this.elementBrief(found.dialog),
+            };
         },
         compactPageText(maxLength = 1800) {
             const text = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
@@ -749,14 +844,11 @@
         },
         detectPlatformLimitText(text) {
             const content = String(text || '').replace(/\s+/g, ' ');
-            const quotaWarning = this.detectQuotaWarningText(content);
-            if (quotaWarning) return quotaWarning;
             const patterns = [
                 '次数已用完',
                 '次数已达上限',
                 '达到上限',
                 '今日无法继续沟通',
-                '今日沟通次数',
                 '今日招呼次数',
                 '明日再试',
                 '明天再试',
@@ -1650,9 +1742,7 @@
                 return {
                     version: OPTIONS.scriptVersion,
                     threshold: OPTIONS.thread,
-                    sessionGreetLimit: OPTIONS.sessionGreetLimit,
                     sessionGreetCount: session.count,
-                    dailyGreetSafeLimit: OPTIONS.dailyGreetSafeLimit,
                     dailyGreetCount: daily.count,
                     dailyGreetDate: daily.date,
                     runId: session.runId,
@@ -1777,7 +1867,7 @@
                 }
                 logger.setPaused(true);
                 this.pause = true;
-                logger.add('请回到 CLI 输入 start，确认本轮岗位标签和打招呼上限后开始');
+                logger.add('请回到 CLI 输入 start，确认岗位标签和运行配置后开始');
             }, async () => {
                 await api.control('pause');
                 this.pause = true;
@@ -1836,87 +1926,6 @@
                     newRunId: next.runId,
                 });
                 return next;
-            };
-
-            const isSessionLimitReached = () => (
-                Number(OPTIONS.sessionGreetLimit) > 0
-                && tools.getSessionGreetCount() >= Number(OPTIONS.sessionGreetLimit)
-            );
-
-            const isDailySafeLimitReached = () => (
-                Number(OPTIONS.dailyGreetSafeLimit) > 0
-                && tools.getDailyGreetCount() >= Number(OPTIONS.dailyGreetSafeLimit)
-            );
-
-            const stopForSessionLimit = async (count = tools.getSessionGreetCount()) => {
-                const limit = Number(OPTIONS.sessionGreetLimit);
-                const message = `本次打招呼上限已达: ${count}/${limit}，自动化已停止`;
-                tools.endGreetSession();
-                this.pause = true;
-                logger.setPaused(true);
-                setSearchAction(message);
-                logger.add(message);
-                await api.event('session_limit_reached', message, 'script', 'info', {
-                    sessionGreetCount: count,
-                    limit,
-                    runId: tools.getGreetSession().runId,
-                });
-                await api.heartbeat('search', 'idle', message, scriptHeartbeatDetail());
-                try {
-                    await api.control('stop');
-                } catch (e) {
-                    await api.event('session_limit_stop_failed', `本次上限已达，但通知后端 stop 失败: ${e}`, 'script', 'error', {
-                        sessionGreetCount: count,
-                        limit,
-                    });
-                }
-                lastBackendControl = 'stopped';
-            };
-
-            const stopForDailySafeLimit = async (count = tools.getDailyGreetCount()) => {
-                const limit = Number(OPTIONS.dailyGreetSafeLimit);
-                const daily = tools.getDailyGreetState();
-                const message = `今日安全打招呼上限已达: ${count}/${limit}，自动化已停止`;
-                tools.endGreetSession();
-                this.pause = true;
-                logger.setPaused(true);
-                setSearchAction(message);
-                logger.add(message);
-                await api.event('daily_safe_limit_reached', message, 'script', 'info', {
-                    dailyGreetCount: count,
-                    dailyGreetSafeLimit: limit,
-                    dailyGreetDate: daily.date,
-                    runId: tools.getGreetSession().runId,
-                });
-                await api.heartbeat('search', 'idle', message, scriptHeartbeatDetail());
-                try {
-                    await api.control('stop');
-                } catch (e) {
-                    await api.event('daily_safe_limit_stop_failed', `每日安全上限已达，但通知后端 stop 失败: ${e}`, 'script', 'error', {
-                        dailyGreetCount: count,
-                        dailyGreetSafeLimit: limit,
-                        dailyGreetDate: daily.date,
-                    });
-                }
-                lastBackendControl = 'stopped';
-            };
-
-            const ensureSessionLimitAvailable = async () => {
-                if (!isSessionLimitReached()) return true;
-                await stopForSessionLimit();
-                return false;
-            };
-
-            const ensureDailySafeLimitAvailable = async () => {
-                if (!isDailySafeLimitReached()) return true;
-                await stopForDailySafeLimit();
-                return false;
-            };
-
-            const ensureGreetLimitsAvailable = async () => {
-                if (!(await ensureDailySafeLimitAvailable())) return false;
-                if (!(await ensureSessionLimitAvailable())) return false;
-                return true;
             };
 
             const beginJobProgress = (href) => {
@@ -2025,7 +2034,7 @@
                         requestId,
                     });
                     return;
-                }, 60000);
+                }, 120000);
             };
 
             const finishGreetingWait = (requestId = '', { preserveTempTab = false } = {}) => {
@@ -2038,6 +2047,41 @@
                 else activeTempTab = null;
                 tools.clearGreetContext(requestId);
                 activeGreetingJob = null;
+            };
+
+            const confirmQuotaReminderIfPresent = async (sourcePage = 'search') => {
+                const result = await tools.confirmQuotaReminderDialog();
+                if (!result) return false;
+                const level = result.confirmed ? 'info' : 'error';
+                const message = result.confirmed
+                    ? `BOSS 温馨提示已确认，继续执行: ${result.text}`
+                    : `BOSS 温馨提示确认失败，已暂停: ${result.text}`;
+                logger.add(message);
+                setSearchAction(message);
+                await api.event(
+                    result.confirmed ? 'quota_reminder_confirmed' : 'quota_reminder_confirm_failed',
+                    message,
+                    'script',
+                    level,
+                    { sourcePage, text: result.text, button: result.button, dialog: result.dialog }
+                );
+                if (!result.confirmed) {
+                    this.pause = true;
+                    logger.setPaused(true);
+                    await api.control('pause').catch(() => null);
+                    lastBackendControl = 'paused';
+                    throw new Error('quota_reminder_confirm_failed');
+                }
+                return true;
+            };
+
+            const waitForQuotaReminderConfirmation = async (sourcePage = 'search', timeout = 3000) => {
+                const deadline = Date.now() + timeout;
+                while (Date.now() < deadline) {
+                    if (await confirmQuotaReminderIfPresent(sourcePage)) return true;
+                    await tools.asyncSleep(250);
+                }
+                return false;
             };
 
             const isNonRetryableGreetingError = (error) => {
@@ -2076,17 +2120,9 @@
                     });
                     const count = Number(data.sessionGreetCount || tools.getSessionGreetCount());
                     const dailyCount = Number(data.dailyGreetCount || tools.getDailyGreetCount());
-                    logger.add(`打招呼成功，本轮计数 ${count}/${OPTIONS.sessionGreetLimit}，今日计数 ${dailyCount}/${OPTIONS.dailyGreetSafeLimit}`);
+                    logger.add(`打招呼成功，本轮计数 ${count}，今日计数 ${dailyCount}`);
                     finishGreetingWait(requestId);
                     finishJobProgress('打招呼成功');
-                    if (isDailySafeLimitReached()) {
-                        await stopForDailySafeLimit(dailyCount);
-                        return;
-                    }
-                    if (isSessionLimitReached()) {
-                        await stopForSessionLimit(Number(data.sessionGreetCount || tools.getSessionGreetCount()));
-                        return;
-                    }
                     if (await markPreferredFeedJobHandled('打招呼成功')) return;
                     loop();
                     return;
@@ -2201,9 +2237,15 @@
                     maxAttempts,
                     requestId,
                 });
-                finishJobProgress('打招呼最终失败');
-                if (await markPreferredFeedJobHandled('打招呼最终失败')) return;
-                loop();
+                finishJobProgress('打招呼最终失败，已暂停');
+                const message = `打招呼连续 ${maxAttempts} 次失败，系统已暂停: ${jobInfo.title || href}`;
+                logger.add(message);
+                setSearchAction(message);
+                await api.heartbeat('search', 'paused', message, scriptHeartbeatDetail());
+                this.pause = true;
+                logger.setPaused(true);
+                await api.control('pause').catch(() => null);
+                lastBackendControl = 'paused';
             };
 
             const handlePageFailure = async (reason, kind = 'element_retry', sourcePage = 'search') => {
@@ -2229,7 +2271,6 @@
                         reason: finalReason,
                         sourcePage,
                         dailyGreetCount: tools.getDailyGreetCount(),
-                        dailyGreetSafeLimit: OPTIONS.dailyGreetSafeLimit,
                     });
                     await api.heartbeat('search', 'error', message, {
                         ...scriptHeartbeatDetail(),
@@ -2376,6 +2417,7 @@
             const search = async (kw) => {
                 try {
                     setSearchAction(`搜索关键词: ${kw}`);
+                    await confirmQuotaReminderIfPresent('keyword_search');
                     const platformLimit = tools.detectPlatformLimit();
                     if (platformLimit) {
                         throw new Error(`平台次数限制: ${platformLimit}`);
@@ -2470,6 +2512,7 @@
             };
 
             const scrollSearchResultsOnce = async (round) => {
+                await confirmQuotaReminderIfPresent('search_scroll');
                 const platformLimit = tools.detectPlatformLimit();
                 if (platformLimit) {
                     throw new Error(`平台次数限制: ${platformLimit}`);
@@ -2844,6 +2887,7 @@
             const getJobHrefs = async () => {
                 try {
                     setSearchAction('读取职位列表');
+                    await confirmQuotaReminderIfPresent('job_list');
                     const platformLimit = tools.detectPlatformLimit();
                     if (platformLimit) {
                         throw new Error(`平台次数限制: ${platformLimit}`);
@@ -2874,7 +2918,7 @@
                         hrefs = collect();
                         newHrefs = hrefs.filter(href => !seenJobHrefs.has(href) && !backendProcessedHrefs.has(href));
                     }
-                    const scrollRounds = Math.max(0, Math.min(5, Number(OPTIONS.searchResultScrollRounds) || 0));
+                    const scrollRounds = Math.max(0, Math.min(20, Number(OPTIONS.searchResultScrollRounds) || 0));
                     for (let scrollRound = 1; !newHrefs.length && scrollRound <= scrollRounds; scrollRound++) {
                         const scrollWorked = await scrollSearchResultsOnce(scrollRound);
                         hrefs = collect();
@@ -3111,7 +3155,6 @@
                         if (this.pause) {
                             return;
                         }
-                        if (!(await ensureGreetLimitsAvailable())) return;
                         await beginSearchRound('cooldown_finished');
                         if (!(await searchCurrentKeyword('冷却结束', false))) return;
                         if (await nextPage()) {
@@ -3206,6 +3249,7 @@
 
             // 获取职位信息
             const getJobInfo = async (href) => {
+                await confirmQuotaReminderIfPresent('job_detail');
                 const platformLimit = tools.detectPlatformLimit();
                 if (platformLimit) throw new Error(`平台次数限制: ${platformLimit}`);
                 const interruption = tools.detectManualInterruption();
@@ -3310,12 +3354,25 @@
             const addToChatList = async (url) => {
                 if (!url) throw new Error('缺少打招呼请求链接');
                 try {
+                    await confirmQuotaReminderIfPresent('chat_entry_before_request');
                     await api.event('chat_entry_request_started', `请求打招呼入口: ${url}`, 'script', 'info', { url });
                     const resp = await fetch(url, { credentials: 'include' });
                     if (!(resp.ok && resp.status === 200)) {
                         throw new Error(`BOSS 网络响应异常: ${resp.status}`);
                     }
                     const data = await resp.json();
+                    const quotaReason = tools.quotaReminderReasonFromValue(data);
+                    if (quotaReason) {
+                        await api.event('quota_reminder_response_detected', `打招呼入口返回额度提醒: ${quotaReason}`, 'script', 'warning', {
+                            reason: quotaReason,
+                        });
+                        const confirmed = await waitForQuotaReminderConfirmation('chat_entry_response', 3000);
+                        if (!confirmed) {
+                            await api.event('quota_reminder_not_rendered', `接口返回额度提醒，但页面未发现可确认弹窗，继续当前流程: ${quotaReason}`, 'script', 'warning', {
+                                reason: quotaReason,
+                            });
+                        }
+                    }
                     if (data.code === 0) {
                         await api.event('chat_entry_request_finished', '打招呼入口请求成功', 'script', 'info', {
                             hasRedirect: Boolean(tools.findChatUrlDeep(data)),
@@ -3548,6 +3605,7 @@
                 try {
                     if (!(await ensureSearchLease('循环运行'))) return;
                     if (waitingForGreeting) return;
+                    await confirmQuotaReminderIfPresent('loop');
                     const platformLimit = tools.detectPlatformLimit();
                     if (platformLimit) {
                         await handlePageFailure(platformLimit, 'platform_limit', 'search');
@@ -3566,7 +3624,6 @@
                         setSearchAction(`搜索冷却中，预计 ${new Date(cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false })} 后继续`);
                         return;
                     }
-                    if (!(await ensureGreetLimitsAvailable())) return;
                     logger.divider();
 
                     if (jobHrefs.length === 0) {
@@ -3609,10 +3666,6 @@
                         finishJobProgress('暂停停止');
                         return;
                     }
-                    if (!(await ensureGreetLimitsAvailable())) {
-                        finishJobProgress('本次上限停止');
-                        return;
-                    }
                     if (jobInfo.talked) {
                         const reason = jobInfo.talked_reason || '页面显示已沟通';
                         logger.add(`职位 [${jobInfo.title}] ${reason}，下一个`);
@@ -3624,10 +3677,6 @@
                         return;
                     }
 
-                    if (!(await ensureGreetLimitsAvailable())) {
-                        finishJobProgress('本次上限停止');
-                        return;
-                    }
                     logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`);
                     setSearchAction(`分析职位: ${jobInfo.title}`);
                     await api.event('job_analysis_started', `开始分析职位: ${jobInfo.title}`, 'script', 'info', { title: jobInfo.title, salary: jobInfo.salary });
@@ -3655,17 +3704,9 @@
                     }
                     if (analysis.recommendation === 'greet' && score >= OPTIONS.thread) {
                         jobInfo.score = score;
-                        if (!(await ensureGreetLimitsAvailable())) {
-                            finishJobProgress('本次上限停止');
-                            return;
-                        }
                         setSearchAction(`准备打招呼: ${jobInfo.title}`);
                         if (!(await syncControlFromBackend(`暂停检查: 准备打招呼 ${jobInfo.title}`))) {
                             finishJobProgress('暂停停止');
-                            return;
-                        }
-                        if (!(await ensureGreetLimitsAvailable())) {
-                            finishJobProgress('本次上限停止');
                             return;
                         }
                         await sendGreetingFromSearch(jobInfo, href);
@@ -3853,7 +3894,6 @@
                     version: OPTIONS.scriptVersion,
                     serverHost: OPTIONS.serverHost,
                     threshold: OPTIONS.thread,
-                    sessionGreetLimit: OPTIONS.sessionGreetLimit,
                     sessionGreetCount: tools.getSessionGreetCount(),
                 });
                 logger.add('等待 CLI 输入 start 开始自动化');
@@ -4073,9 +4113,26 @@
                 };
             };
 
+            const confirmChatQuotaReminderIfPresent = async (sourcePage = 'chat') => {
+                const result = await tools.confirmQuotaReminderDialog();
+                if (!result) return false;
+                await pageApi.event(
+                    result.confirmed ? 'quota_reminder_confirmed' : 'quota_reminder_confirm_failed',
+                    result.confirmed
+                        ? `BOSS 温馨提示已确认，继续发送: ${result.text}`
+                        : `BOSS 温馨提示确认失败: ${result.text}`,
+                    'script',
+                    result.confirmed ? 'info' : 'error',
+                    { sourcePage, text: result.text, button: result.button, dialog: result.dialog }
+                );
+                if (!result.confirmed) throw new Error('quota_reminder_confirm_failed');
+                return true;
+            };
+
             const findChatInput = async () => {
                 const startedAt = Date.now();
                 while (Date.now() - startedAt < 15000) {
+                    await confirmChatQuotaReminderIfPresent('find_chat_input');
                     const candidates = [];
                     for (const selector of SELECTORS.ZHIPIN.CHAT.CHATINPUT) {
                         try {
@@ -4098,6 +4155,7 @@
             const findSendButton = async () => {
                 const startedAt = Date.now();
                 while (Date.now() - startedAt < 10000) {
+                    await confirmChatQuotaReminderIfPresent('find_send_button');
                     const candidates = [];
                     for (const selector of SELECTORS.ZHIPIN.CHAT.MSGSEND) {
                         try {
@@ -4131,6 +4189,7 @@
             const sendMsg = (text, greetContext = {}) => {
                 return new Promise(async (resolve, reject) => {
                     try {
+                        await confirmChatQuotaReminderIfPresent('before_send_message');
                         const platformLimit = tools.detectPlatformLimit();
                         if (platformLimit) throw new Error(`平台次数限制: ${platformLimit}`);
                         const interruption = tools.detectManualInterruption();
@@ -4149,9 +4208,11 @@
                             throw error;
                         }
                         await tools.actionSleep(600);
+                        await confirmChatQuotaReminderIfPresent('before_send_button');
                         const limitBeforeButton = tools.detectPlatformLimit();
                         if (limitBeforeButton) throw new Error(`平台次数限制: ${limitBeforeButton}`);
                         const btn = await findSendButton();
+                        await confirmChatQuotaReminderIfPresent('before_send_click');
                         const limitBeforeClick = tools.detectPlatformLimit();
                         if (limitBeforeClick) throw new Error(`平台次数限制: ${limitBeforeClick}`);
                         const beforeSnapshot = getSelfMessageSnapshot();
@@ -4314,7 +4375,7 @@
                         `打招呼消息已发送，本轮计数 ${sessionGreetCount}，今日计数 ${dailyGreetCount}`,
                         'script',
                         'info',
-                        { sessionGreetCount, dailyGreetCount, dailyGreetSafeLimit: OPTIONS.dailyGreetSafeLimit, runId: tools.getGreetSession().runId, requestId: greetRequestId, attempt: greetAttempt }
+                        { sessionGreetCount, dailyGreetCount, runId: tools.getGreetSession().runId, requestId: greetRequestId, attempt: greetAttempt }
                     );
                     heartbeatActive = false;
                     this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {
@@ -4520,6 +4581,8 @@
             detectInterruptionText: (text) => tools.detectInterruptionText(text),
             detectPlatformLimitText: (text) => tools.detectPlatformLimitText(text),
             detectQuotaWarningText: (text) => tools.detectQuotaWarningText(text),
+            isQuotaReminderText: (text) => tools.isQuotaReminderText(text),
+            quotaReminderReasonFromValue: (value) => tools.quotaReminderReasonFromValue(value),
             isSystemFeedName: (text) => tools.isSystemFeedName(text),
             isIgnoredFeedName: (text) => tools.isIgnoredFeedName(text),
             isCompositeFeedName: (text) => tools.isCompositeFeedName(text),

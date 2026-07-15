@@ -15,6 +15,7 @@ test('risk classifier ignores generic job text and detects real challenges', () 
   assert.match(hooks.detectInterruptionText('登录状态已失效，请重新登录'), /登录/);
   assert.match(hooks.detectPlatformLimitText('访问过于频繁，请稍后再试'), /频繁/);
   assert.equal(hooks.detectQuotaWarningText('今天剩余次数还有30次'), '平台额度提醒');
+  assert.equal(hooks.detectPlatformLimitText('您今天已与120位BOSS沟通，还剩30次沟通机会哦'), '');
 });
 
 test('risk detection avoids generic whole-page English tokens', () => {
@@ -86,6 +87,18 @@ test('chat send retries stay in the same page and search does not reopen chat on
   assert.match(source, /message_send_attempt_retry/);
   assert.match(source, /failureCode:\s*e\.preSendFailed \? 'message_pre_send_failed'/);
   assert.match(source, /retryable:\s*false/);
+  assert.match(source, /打招呼连续 \$\{maxAttempts\} 次失败，系统已暂停/);
+  assert.match(source, /api\.control\('pause'\)/);
+});
+
+test('boss quota reminder is confirmed instead of treated as a hard limit', () => {
+  const text = '温馨提示 您今天已与120位BOSS沟通，还剩30次沟通机会哦 好';
+  assert.equal(hooks.isQuotaReminderText(text), true);
+  assert.match(hooks.quotaReminderReasonFromValue({ zpData: { bizData: { chatRemindDialog: { title: '温馨提示', content: text } } } }), /BOSS 温馨提示/);
+  assert.match(source, /findQuotaReminderDialog/);
+  assert.match(source, /confirmQuotaReminderDialog/);
+  assert.match(source, /quota_reminder_confirmed/);
+  assert.doesNotMatch(source, /dailyGreetSafeLimit|sessionGreetLimit/);
 });
 
 test('background tabs remain non-active', () => {
