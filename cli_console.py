@@ -9,6 +9,7 @@ import re
 import shutil
 import time
 import webbrowser
+import zipfile
 from datetime import datetime
 from getpass import getpass
 from pathlib import Path
@@ -22,7 +23,7 @@ import resume_service
 from cache import cache
 from config import CONFIG_WAS_MISSING, Config
 from runtime_state import runtime_state
-from tools import script_connect_hosts as build_script_connect_hosts
+from tools import redact_privacy, script_connect_hosts as build_script_connect_hosts
 
 
 PREFIX = {
@@ -45,7 +46,7 @@ PREFIX = {
 CLI_CONFIRM_ACTIONS: set[str] = {"greet_suggestion"}
 
 WEB_SCRIPT_PATH = Path(__file__).resolve().parent / "web_script.js"
-BOSS_SEARCH_URL = "https://www.zhipin.com/web/geek/job"
+BOSS_SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
 SESSION_PREPARED = False
 BROWSER_OPEN_COOLDOWN_SECONDS = 60
 DEFAULT_AUTORUN_OLLAMA_MODEL = "qwen3:1.7b"
@@ -278,6 +279,50 @@ def ask_list(prompt: str, current: list[str]) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def clean_user_path(value: str) -> Path:
+    text = str(value or "").strip()
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        text = text[1:-1]
+    return Path(text.strip())
+
+
+def ensure_range_int(prompt: str, current: int, minimum: int, maximum: int) -> int:
+    while True:
+        value = ask_int(prompt, current)
+        if minimum <= value <= maximum:
+            return value
+        print(f"[配置] 请输入 {minimum}-{maximum} 之间的整数。")
+
+
+def print_config_preview(updates: dict[str, Any]) -> None:
+    preview = Config.as_dict()
+    preview.update(updates)
+    key_source = "环境变量" if os.environ.get("OPENAI_API_KEY") else ("配置文件" if preview.get("openai_api_key") else "未配置")
+    print("\n[配置] 即将保存:")
+    print(f"- 模型: {preview.get('model_provider')} / {preview.get('think_model')}")
+    if preview.get("model_provider") == "openai":
+        print(f"- OpenAI: {preview.get('openai_api_base')} / Key: {key_source}")
+    else:
+        print(f"- Ollama: {preview.get('ollama_host')}")
+    print(
+        f"- 阈值/本轮/每日安全: {preview.get('score_threshold')} / "
+        f"{preview.get('session_greet_limit')} / {preview.get('daily_greet_safe_limit')}"
+    )
+    print(
+        f"- 搜索: 冷却 {preview.get('search_round_cooldown_minutes')} 分钟 / "
+        f"标签间隔 {preview.get('tag_search_delay_seconds')}-{preview.get('tag_search_delay_max_seconds')} 秒 / "
+        f"滚动 {preview.get('search_result_scroll_rounds')} 次"
+    )
+    print(
+        f"- 搜索预算: 每小时 {preview.get('max_search_submissions_per_hour')} 次 / "
+        f"每日 {preview.get('max_search_submissions_per_day')} 次"
+    )
+    print(
+        f"- 推荐源: {preview.get('preferred_feed_mode')} / "
+        f"每个自定义 Tab {preview.get('preferred_feed_max_jobs_per_tab')} 个"
+    )
+
+
 def _ask_thinking(current: dict[str, Any]) -> bool:
     """询问是否关闭模型思考，提前告知策略再让用户选择。"""
     print("[提示] 评分任务输出简短（仅3个数字），推荐关闭思考以获得更快响应。")
@@ -301,9 +346,8 @@ def open_editor(path: Path, message: str = "打开编辑器确认文件", event_
     input("保存并关闭编辑器后按回车继续...")
 
 
-def configure_base() -> None:
+def configure_model_settings() -> None:
     current = Config.as_dict()
-    runtime_state.emit("config_start", "进入配置向导", source="config")
     model_provider = ask("模型来源 ollama/openai", current["model_provider"]).strip()
     if model_provider == "openai_compatible":
         model_provider = "openai"
@@ -316,54 +360,138 @@ def configure_base() -> None:
         "openai_api_base": ask("OpenAI API 地址", current["openai_api_base"]),
         "openai_api_key": ask_api_key(str(current.get("openai_api_key", ""))) if model_provider == "openai" else current.get("openai_api_key", ""),
         "think_model": ask("模型名称", current["think_model"]),
-        "server_port": ask_int("本地服务端口", int(current["server_port"])),
+        "disable_model_thinking": _ask_thinking(current),
+        "external_model_profile": ask("OpenAI 模型类型 generic/qwen/deepseek/doubao", str(current.get("external_model_profile", "generic"))),
+    }
+    print_config_preview(updates)
+    if ask_bool("保存模型配置", True):
+        Config.save(updates)
+        runtime_state.emit("config_saved", "模型配置已保存", source="config", detail=Config.public_dict())
+
+
+def configure_search_safety_settings() -> None:
+    current = Config.as_dict()
+    updates = {
         "score_threshold": ask_int("最低匹配度阈值", int(current["score_threshold"])),
         "session_greet_limit": ask_int("本次最多打招呼数量", int(current["session_greet_limit"])),
         "daily_greet_safe_limit": ask_int("每日自动打招呼安全上限", int(current.get("daily_greet_safe_limit", 120))),
         "search_round_cooldown_minutes": ask_int(
             "所有标签无新岗位后的搜索冷却分钟数",
-            int(current.get("search_round_cooldown_minutes", 30)),
+            int(current.get("search_round_cooldown_minutes", 60)),
         ),
         "tag_search_delay_seconds": ask_int(
             "标签之间的最小搜索间隔秒数",
-            int(current.get("tag_search_delay_seconds", 10)),
+            int(current.get("tag_search_delay_seconds", 20)),
         ),
         "tag_search_delay_max_seconds": ask_int(
             "标签之间的最大搜索间隔秒数",
-            int(current.get("tag_search_delay_max_seconds", 30)),
+            int(current.get("tag_search_delay_max_seconds", 45)),
+        ),
+        "max_search_submissions_per_hour": ask_int(
+            "每小时最多提交关键词搜索次数",
+            int(current.get("max_search_submissions_per_hour", 6)),
+        ),
+        "max_search_submissions_per_day": ask_int(
+            "每日最多提交关键词搜索次数",
+            int(current.get("max_search_submissions_per_day", 30)),
         ),
         "search_result_scroll_rounds": ask_int(
-            "每个标签最多低频滚动读取次数 0-2",
-            int(current.get("search_result_scroll_rounds", 1)),
+            "每个标签最多低频滚动读取次数 0-5",
+            int(current.get("search_result_scroll_rounds", 5)),
+        ),
+        "preferred_feed_max_jobs_per_tab": ask_int(
+            "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
+            int(current.get("preferred_feed_max_jobs_per_tab", 10)),
         ),
         "job_detail_max_chars": ask_int("职位描述传给模型的最大字数", int(current["job_detail_max_chars"])),
-        "log_verbosity": ask("日志模式 compact/normal/debug", str(current.get("log_verbosity", "compact"))),
-        "disable_model_thinking": _ask_thinking(current),
-        "show_model_reasoning": ask_bool("是否显示模型思考过程", bool(current.get("show_model_reasoning", False))),
-        "external_model_profile": ask("OpenAI 模型类型 generic/qwen/deepseek/doubao", str(current.get("external_model_profile", "generic"))),
     }
-    updates["auto_start_enabled"] = ask_bool(
-        "是否启用自动模式定时启动",
-        bool(current.get("auto_start_enabled", False)),
-    )
-    if updates["auto_start_enabled"]:
+    print_config_preview(updates)
+    if ask_bool("保存搜索与风控配置", True):
+        Config.save(updates)
+        runtime_state.emit("config_saved", "搜索与风控配置已保存", source="config", detail=Config.public_dict())
+
+
+def configure_schedule_settings() -> None:
+    current = Config.as_dict()
+    enabled = ask_bool("是否启用自动模式定时启动", bool(current.get("auto_start_enabled", False)))
+    updates: dict[str, Any] = {"auto_start_enabled": enabled}
+    if enabled:
         updates["auto_start_time"] = ask_hhmm(
             "自动模式启动时间 HH:MM",
             str(current.get("auto_start_time", "09:00")),
         )
     else:
         updates["auto_start_time"] = normalize_hhmm(str(current.get("auto_start_time", "09:00"))) or "09:00"
-    if ask_bool("是否配置高级模型参数", False):
-        updates.update({
-            "model_temperature": ask_float("temperature", float(current.get("model_temperature", 0.2))),
-            "model_top_p": ask_float("top_p", float(current.get("model_top_p", 0.8))),
-            "model_repeat_penalty": ask_float("Ollama repeat_penalty", float(current.get("model_repeat_penalty", 1.18))),
-            "model_repeat_last_n": ask_int("Ollama repeat_last_n", int(current.get("model_repeat_last_n", 128))),
-            "model_frequency_penalty": ask_float("OpenAI frequency_penalty", float(current.get("model_frequency_penalty", 0.3))),
-            "model_presence_penalty": ask_float("OpenAI presence_penalty", float(current.get("model_presence_penalty", 0.1))),
-        })
-    Config.save(updates)
-    runtime_state.emit("config_saved", "配置已保存", source="config", detail=Config.public_dict())
+    print_config_preview(updates)
+    if ask_bool("保存定时启动配置", True):
+        Config.save(updates)
+        runtime_state.emit("config_saved", "定时启动配置已保存", source="config", detail=Config.public_dict())
+
+
+def configure_log_display_settings() -> None:
+    current = Config.as_dict()
+    updates = {
+        "log_verbosity": ask("日志模式 compact/normal/debug", str(current.get("log_verbosity", "compact"))),
+        "show_model_reasoning": ask_bool("是否显示模型思考过程", bool(current.get("show_model_reasoning", False))),
+    }
+    print_config_preview(updates)
+    if ask_bool("保存日志与显示配置", True):
+        Config.save(updates)
+        runtime_state.emit("config_saved", "日志与显示配置已保存", source="config", detail=Config.public_dict())
+
+
+def configure_advanced_model_settings() -> None:
+    current = Config.as_dict()
+    updates = {
+        "model_temperature": ask_float("temperature", float(current.get("model_temperature", 0.2))),
+        "model_top_p": ask_float("top_p", float(current.get("model_top_p", 0.8))),
+        "model_repeat_penalty": ask_float("Ollama repeat_penalty", float(current.get("model_repeat_penalty", 1.18))),
+        "model_repeat_last_n": ask_int("Ollama repeat_last_n", int(current.get("model_repeat_last_n", 128))),
+        "model_frequency_penalty": ask_float("OpenAI frequency_penalty", float(current.get("model_frequency_penalty", 0.3))),
+        "model_presence_penalty": ask_float("OpenAI presence_penalty", float(current.get("model_presence_penalty", 0.1))),
+        "job_score_num_predict_think_off": ask_int(
+            "评分关思考 token 预算，-1 表示不限制",
+            int(current.get("job_score_num_predict_think_off", -1)),
+        ),
+        "job_score_num_predict_think_on": ask_int(
+            "评分开思考 token 预算，-1 表示不限制",
+            int(current.get("job_score_num_predict_think_on", -1)),
+        ),
+        "server_port": ask_int("本地服务端口", int(current["server_port"])),
+    }
+    print_config_preview(updates)
+    if ask_bool("保存高级模型配置", True):
+        Config.save(updates)
+        runtime_state.emit("config_saved", "高级模型配置已保存", source="config", detail=Config.public_dict())
+
+
+def configure_base() -> None:
+    runtime_state.emit("config_start", "进入分组配置菜单", source="config")
+    while True:
+        print("\n[配置] 选择要修改的分组")
+        print("[1] 模型与思考")
+        print("[2] 搜索与风控")
+        print("[3] 自动启动时间")
+        print("[4] 日志与显示")
+        print("[5] 高级模型参数")
+        print("[6] 查看当前摘要")
+        choice = input("  选择 [Enter 退出]: ").strip()
+        if not choice:
+            return
+        if choice == "1":
+            configure_model_settings()
+        elif choice == "2":
+            configure_search_safety_settings()
+        elif choice == "3":
+            configure_schedule_settings()
+        elif choice == "4":
+            configure_log_display_settings()
+        elif choice == "5":
+            configure_advanced_model_settings()
+        elif choice == "6":
+            print_summary()
+        else:
+            print("[配置] 无效选择。")
 
 
 def ensure_resume() -> None:
@@ -372,7 +500,7 @@ def ensure_resume() -> None:
         runtime_state.emit("resume_ready", "继续使用已有简历", source="config")
         return
     while True:
-        pdf_path = Path(ask("请输入 PDF 简历路径"))
+        pdf_path = clean_user_path(ask("请输入 PDF 简历路径"))
         if pdf_path.exists() and pdf_path.suffix.lower() == ".pdf":
             data = resume_service.upload_pdf(pdf_path.name, pdf_path.read_bytes())
             runtime_state.emit("resume_extracted", "PDF 简历已提取", source="config")
@@ -432,7 +560,12 @@ def edit_session_settings() -> None:
     print(f"  每日安全上限: {Config.daily_greet_safe_limit}")
     print(f"  搜索冷却: {Config.search_round_cooldown_minutes} 分钟")
     print(f"  标签间隔: 随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒")
+    print(f"  搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / 每日 {Config.max_search_submissions_per_day} 次")
     print(f"  滚动扩展: {Config.search_result_scroll_rounds} 次")
+    print(
+        f"  自定义推荐: {'启用' if Config.preferred_feed_mode != 'off' else '关闭'} / "
+        f"每个 Tab {Config.preferred_feed_max_jobs_per_tab} 个"
+    )
     print()
     print("[1] 修改岗位搜索标签")
     print("[2] 修改本次打招呼上限")
@@ -440,6 +573,8 @@ def edit_session_settings() -> None:
     print("[4] 修改搜索冷却时间")
     print("[5] 修改标签随机搜索间隔")
     print("[6] 修改滚动扩展次数")
+    print("[7] 修改自定义推荐 Tab 上限")
+    print("[8] 修改关键词搜索预算")
     choice = input("  选择 [Enter 取消]: ").strip()
 
     if choice == "1":
@@ -520,9 +655,9 @@ def edit_session_settings() -> None:
         print(f"[配置] 标签搜索间隔已更新为: 随机 {min_seconds}-{max_seconds} 秒")
     elif choice == "6":
         while True:
-            rounds = ask_int("每个标签最多低频滚动读取次数 0-2", int(Config.search_result_scroll_rounds))
-            if not 0 <= rounds <= 2:
-                print("[配置] 滚动扩展次数只能设置为 0-2。")
+            rounds = ask_int("每个标签最多低频滚动读取次数 0-5", int(Config.search_result_scroll_rounds))
+            if not 0 <= rounds <= 5:
+                print("[配置] 滚动扩展次数只能设置为 0-5。")
                 continue
             break
         Config.save({"search_result_scroll_rounds": rounds})
@@ -532,6 +667,44 @@ def edit_session_settings() -> None:
             source="config",
         )
         print(f"[配置] 搜索滚动扩展次数已更新为: {rounds}")
+    elif choice == "7":
+        while True:
+            limit = ask_int(
+                "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
+                int(Config.preferred_feed_max_jobs_per_tab),
+            )
+            if not 0 <= limit <= 500:
+                print("[配置] 自定义推荐 Tab 上限建议设置为 0-500。")
+                continue
+            break
+        Config.save({"preferred_feed_max_jobs_per_tab": limit})
+        runtime_state.emit(
+            "preferred_feed_limit_updated",
+            f"自定义推荐 Tab 上限调整为 {limit}",
+            source="config",
+        )
+        print(f"[配置] 自定义推荐 Tab 上限已更新为: {limit}")
+    elif choice == "8":
+        while True:
+            hourly = ask_int("每小时最多提交关键词搜索次数", int(Config.max_search_submissions_per_hour))
+            daily = ask_int("每日最多提交关键词搜索次数", int(Config.max_search_submissions_per_day))
+            if not 1 <= hourly <= 60:
+                print("[配置] 每小时搜索预算应为 1-60 次。")
+                continue
+            if not hourly <= daily <= 300:
+                print(f"[配置] 每日搜索预算应为 {hourly}-300 次，且不能小于每小时预算。")
+                continue
+            break
+        Config.save({
+            "max_search_submissions_per_hour": hourly,
+            "max_search_submissions_per_day": daily,
+        })
+        runtime_state.emit(
+            "search_budget_updated",
+            f"关键词搜索预算调整为每小时 {hourly} 次、每日 {daily} 次",
+            source="config",
+        )
+        print(f"[配置] 关键词搜索预算已更新: 每小时 {hourly} 次 / 每日 {daily} 次")
     elif choice:
         print("[配置] 无效选择，已取消。")
 
@@ -662,7 +835,7 @@ def run_initialization() -> None:
     if not needs_initialization():
         runtime_state.emit("init_skip", "初始化已跳过", source="startup")
         return
-    configure_base()
+    setup_quick_start()
     ensure_resume()
     ensure_profile()
     ensure_greeting()
@@ -673,6 +846,87 @@ def run_initialization() -> None:
     else:
         runtime_state.set_control("pause")
         print("[控制] 已暂停。可输入 config/resume/greeting 调整配置。")
+
+
+def setup_quick_start() -> None:
+    current = Config.as_dict()
+    runtime_state.emit("setup_start", "进入首次快速配置", source="config")
+    print("\n[设置] 首次快速配置")
+    print("[提示] 后续可用 config 分组修改任意高级参数。")
+    model_provider = ask("模型来源 ollama/openai", current["model_provider"]).strip()
+    if model_provider == "openai_compatible":
+        model_provider = "openai"
+    if model_provider not in {"ollama", "openai"}:
+        model_provider = "ollama"
+    updates: dict[str, Any] = {
+        "model_provider": model_provider,
+        "think_model": ask("模型名称", current["think_model"]),
+        "score_threshold": ensure_range_int("最低匹配度阈值", int(current["score_threshold"]), 0, 100),
+        "session_greet_limit": ensure_range_int("本次最多打招呼数量", int(current["session_greet_limit"]), 1, 150),
+        "daily_greet_safe_limit": ensure_range_int("每日自动打招呼安全上限", int(current.get("daily_greet_safe_limit", 120)), 1, 150),
+        "search_round_cooldown_minutes": ensure_range_int(
+            "所有标签无新岗位后的搜索冷却分钟数",
+            int(current.get("search_round_cooldown_minutes", 60)),
+            1,
+            240,
+        ),
+        "tag_search_delay_seconds": ensure_range_int(
+            "标签之间的最小搜索间隔秒数",
+            int(current.get("tag_search_delay_seconds", 20)),
+            3,
+            60,
+        ),
+        "max_search_submissions_per_hour": ensure_range_int(
+            "每小时最多提交关键词搜索次数",
+            int(current.get("max_search_submissions_per_hour", 6)),
+            1,
+            60,
+        ),
+        "max_search_submissions_per_day": ensure_range_int(
+            "每日最多提交关键词搜索次数",
+            int(current.get("max_search_submissions_per_day", 30)),
+            1,
+            300,
+        ),
+        "search_result_scroll_rounds": ensure_range_int(
+            "每个标签最多低频滚动读取次数 0-5",
+            int(current.get("search_result_scroll_rounds", 5)),
+            0,
+            5,
+        ),
+        "preferred_feed_max_jobs_per_tab": ensure_range_int(
+            "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
+            int(current.get("preferred_feed_max_jobs_per_tab", 10)),
+            0,
+            500,
+        ),
+        "disable_model_thinking": ask_bool(
+            "是否关闭模型思考（小模型推荐关闭）",
+            bool(current.get("disable_model_thinking", True)),
+        ),
+    }
+    updates["tag_search_delay_max_seconds"] = ensure_range_int(
+        "标签之间的最大搜索间隔秒数",
+        max(int(current.get("tag_search_delay_max_seconds", 45)), updates["tag_search_delay_seconds"]),
+        updates["tag_search_delay_seconds"],
+        60,
+    )
+    if updates["max_search_submissions_per_day"] < updates["max_search_submissions_per_hour"]:
+        updates["max_search_submissions_per_day"] = updates["max_search_submissions_per_hour"]
+        print("[配置] 每日搜索预算不能小于每小时预算，已自动对齐。")
+    if model_provider == "ollama":
+        updates["ollama_host"] = ask("Ollama 地址", current["ollama_host"])
+    else:
+        updates["openai_api_base"] = ask("OpenAI API 地址", current["openai_api_base"])
+        updates["openai_api_key"] = ask_api_key(str(current.get("openai_api_key", "")))
+        updates["external_model_profile"] = ask(
+            "OpenAI 模型类型 generic/qwen/deepseek/doubao",
+            str(current.get("external_model_profile", "generic")),
+        )
+    print_config_preview(updates)
+    if ask_bool("保存首次配置", True):
+        Config.save(updates)
+        runtime_state.emit("setup_saved", "首次快速配置已保存", source="config", detail=Config.public_dict())
 
 
 def _ensure_model_warmup() -> None:
@@ -687,20 +941,58 @@ def _ensure_model_warmup() -> None:
         print(f"[预热] 模型连通性检查: {warmup['model']} ... 失败 ({warmup.get('error', '未知')})")
 
 
-def print_status_panel() -> None:
-    """显示格式化的系统状态面板（读取缓存的预热结果，不重复检测）。"""
-    from model_stream import model_warmup_check
+def start_model_warmup_background() -> None:
+    """后台检查模型连通性，避免 CLI 启动被远程 API 或本地模型冷启动阻塞。"""
+    runtime_state.update_model_warmup(
+        "checking",
+        provider=Config.model_provider,
+        model=Config.think_model,
+    )
+    runtime_state.emit(
+        "model_warmup_checking",
+        f"模型状态检查中: {Config.think_model}",
+        source="model",
+    )
 
+    def worker() -> None:
+        from model_stream import model_warmup_check
+
+        warmup = model_warmup_check()
+        runtime_state.model_warmup.update(warmup)
+        if warmup.get("status") == "ready":
+            runtime_state.emit(
+                "model_warmup_ready",
+                f"模型已连接: {warmup.get('model')} ({warmup.get('latency_seconds', 0)}s)",
+                source="model",
+                detail=warmup,
+            )
+        else:
+            runtime_state.emit(
+                "model_warmup_failed",
+                f"模型连接检查失败: {warmup.get('model')} / {warmup.get('error', '未知')}",
+                source="model",
+                level="warning",
+                detail=warmup,
+            )
+
+    threading.Thread(target=worker, name="jobseeker-model-warmup", daemon=True).start()
+
+
+def print_status_panel() -> None:
+    """显示格式化的系统状态面板；只读缓存，不触发模型检测。"""
     cache.load()
     greeting = greeting_service.get_greeting()
 
-    # 使用缓存的预热结果；首次（unknown）则执行一次检测
     warmup = runtime_state.model_warmup
-    if warmup.get("status") == "unknown":
-        warmup = model_warmup_check()
-        runtime_state.model_warmup.update(warmup)
     model_ok = warmup.get("status") == "ready"
-    model_status = f"✓ 已连接 ({warmup.get('latency_seconds', 0)}s)" if model_ok else f"✗ 未连接: {warmup.get('error', '未知')}"
+    if model_ok:
+        model_status = f"已连接 ({warmup.get('latency_seconds', 0)}s)"
+    elif warmup.get("status") == "checking":
+        model_status = "检查中，稍后会自动提示结果"
+    elif warmup.get("status") == "unknown":
+        model_status = "未检查，输入 doctor 主动检测"
+    else:
+        model_status = f"未连接: {warmup.get('error', '未知')}"
     resume_ok = bool(cache.resume.strip())
     profile_ok = cache.cache_status().get("profile_generated", False)
     greeting_ok = greeting.get("confirmed", False)
@@ -723,13 +1015,38 @@ def print_status_panel() -> None:
     search_strategy_label = (
         f"冷却 {Config.search_round_cooldown_minutes}分 / "
         f"间隔 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds}秒 / "
-        f"滚动 {Config.search_result_scroll_rounds}次"
+        f"滚动 {Config.search_result_scroll_rounds}次 / "
+        f"预算 {script_detail.get('searchBudgetHourlyCount', 0)}/{script_detail.get('searchBudgetHourlyLimit') or Config.max_search_submissions_per_hour}时 "
+        f"{script_detail.get('searchBudgetDailyCount', 0)}/{script_detail.get('searchBudgetDailyLimit') or Config.max_search_submissions_per_day}日"
+    )
+    source_label = (
+        f"{script_detail.get('jobSource') or '未上报'}"
+        f" / {script_detail.get('currentFeedTabName') or '-'}"
+        f" / {script_detail.get('feedTabProcessedCount', 0)}/"
+        f"{script_detail.get('feedTabMaxJobs') if script_detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab}"
     )
     if script_detail.get("cooldownUntil"):
         search_strategy_label = _format_script_cooldown(script_detail)
 
     def _icon(ok: bool) -> str:
         return "✓" if ok else "○"
+
+    simple_status = (
+        os.environ.get("JOB_SEEKER_SIMPLE_STATUS", "").strip() == "1"
+        or shutil.get_terminal_size((100, 30)).columns < 88
+    )
+    if simple_status:
+        print("\n[状态] Job Seeker")
+        print(f"- 服务地址: http://{Config.server_host}:{Config.server_port}")
+        print(f"- 脚本地址: http://{Config.server_host}:{Config.server_port}/web_script.user.js")
+        print(f"- 模型: {model_label} / {model_status}")
+        print(f"- 思考模式: 评分 {scoring_think} / 画像标签 {scoring_think} / 打招呼 {greeting_think}")
+        print(f"- 阈值与上限: {Config.score_threshold} 分 / 本轮 {Config.session_greet_limit} / 今日安全 {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}")
+        print(f"- 搜索策略: {search_strategy_label}")
+        print(f"- 岗位来源: {source_label}")
+        print(f"- 定时启动: {schedule_label}")
+        print(f"- 准备状态: 简历 {_icon(resume_ok)} / 画像 {_icon(profile_ok)} / 话术 {_icon(greeting_ok)} / 脚本 {_icon(script_ok)} / 控制 {control}")
+        return
 
     panel = f"""
 ╔══════════════════════════════════════════════════════════════╗
@@ -744,6 +1061,7 @@ def print_status_panel() -> None:
 ║  评分阈值    {Config.score_threshold}分 / 本次上限 {Config.session_greet_limit}{' ' * 30}║
 ║  今日安全    {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}{' ' * 42}║
 ║  搜索策略    {search_strategy_label[:48]:<48}║
+║  岗位来源    {source_label[:48]:<48}║
 ║  定时启动    {schedule_label:<48}║
 ║  评分令牌    关思考 {Config.job_score_num_predict_think_off} / 开思考 {Config.job_score_num_predict_think_on}{' ' * 18}║
 ║  温度/top_p  {Config.model_temperature} / {Config.model_top_p}{' ' * 38}║
@@ -764,6 +1082,7 @@ def print_status_panel() -> None:
 │  {model_label} │ 评分思考: {scoring_think} │ 画像/标签: {scoring_think} │ 打招呼: {greeting_think} │ 阈值: {Config.score_threshold}分 │ 上限: {Config.session_greet_limit}  │
 │  今日安全: {script_detail.get('dailyGreetCount', 0)}/{script_detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit} │ 定时启动: {schedule_label[:38]:<38} │
 │  搜索: {search_strategy_label[:54]:<54} │
+│  来源: {source_label[:54]:<54} │
 │  模型: {model_status[:50]} │ 评分令牌: {Config.job_score_num_predict_think_off}/{Config.job_score_num_predict_think_on} │
 │  简历: {_icon(resume_ok)} 画像: {_icon(profile_ok)} 话术: {_icon(greeting_ok)} │ 脚本: {_icon(script_ok)} │ {control} │
 └──────────────────────────────────────────────────────────────┘"""
@@ -789,6 +1108,14 @@ def print_summary() -> None:
         f"- 搜索策略: 无新岗位冷却 {Config.search_round_cooldown_minutes} 分钟 / "
         f"标签间隔随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
         f"滚动扩展 {Config.search_result_scroll_rounds} 次"
+    )
+    print(
+        f"- 关键词搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / "
+        f"每日 {Config.max_search_submissions_per_day} 次"
+    )
+    print(
+        f"- 自定义推荐: {'启用' if Config.preferred_feed_mode != 'off' else '关闭'} / "
+        f"每个 Tab {Config.preferred_feed_max_jobs_per_tab} 个（0 表示不限）"
     )
     print(
         f"- 自动模式定时启动: {'开启' if Config.auto_start_enabled else '关闭'}"
@@ -1009,6 +1336,8 @@ def show_script_install() -> None:
     print(f"- 安装地址: {url}")
     print(f"- 元数据版本: {meta_version}")
     print(f"- 运行版本: {runtime_version}")
+    if meta_version != runtime_version:
+        print("- 提醒: 元数据版本和运行版本不一致，请先更新油猴脚本。")
     print(f"- 需要 @connect: {', '.join(build_script_connect_hosts(url))}")
     print("- 用法: 在浏览器打开安装地址，按篡改猴提示安装或更新，然后刷新 BOSS 搜索页。")
     print("- 验证: CLI 应显示脚本就绪，并且 status/doctor 中的脚本版本等于运行版本。")
@@ -1128,16 +1457,137 @@ def show_logs(limit: int = 30) -> None:
         print_event(event, force=True)
 
 
+def show_run_summary() -> None:
+    cache.load()
+    script = runtime_state.script_snapshot()
+    detail = script.get("detail") or {}
+    history = database.list_history(200)
+    jobs = history.get("jobs") or []
+    actions = history.get("actions") or []
+    greeted = [job for job in jobs if job.get("greeted")]
+    skipped = [job for job in jobs if (job.get("final_action") or job.get("recommendation")) in {"skip", "model_failed_skip"}]
+    errored = [job for job in jobs if job.get("error")]
+    pending = [action for action in actions if action.get("status") == "pending"]
+    completed_actions = [action for action in actions if action.get("status") in {"completed", "approved"}]
+    print("\n[汇总] 当前运行")
+    print(f"- run_id: {runtime_state.run_id}")
+    print(f"- 控制状态: {runtime_state.control} / 当前任务: {runtime_state.current_task}")
+    print(f"- 脚本: {script.get('page')} / {script.get('status')} / {script.get('current_action') or '空闲'}")
+    print(
+        f"- 本轮计数: {detail.get('sessionGreetCount', 0)} / "
+        f"{detail.get('sessionGreetLimit') or Config.session_greet_limit}"
+    )
+    print(
+        f"- 今日安全: {detail.get('dailyGreetCount', 0)} / "
+        f"{detail.get('dailyGreetSafeLimit') or Config.daily_greet_safe_limit}"
+    )
+    print(
+        f"- 搜索轮次: round={detail.get('searchRoundId', '-')} / "
+        f"tag={detail.get('currentTagIndex', '-')} / checked={detail.get('tagsCheckedThisRound', '-')}"
+    )
+    print(
+        f"- 岗位来源: {detail.get('jobSource') or '-'} / "
+        f"{detail.get('currentFeedTabName') or '-'} / "
+        f"{detail.get('feedTabProcessedCount', 0)}/"
+        f"{detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab}"
+    )
+    print(f"- 搜索冷却: {_format_script_cooldown(detail)}")
+    print(f"- 近期职位: {len(jobs)} 个 / 已沟通 {len(greeted)} / 跳过 {len(skipped)} / 有错误 {len(errored)}")
+    print(f"- 近期动作: {len(actions)} 个 / 已完成 {len(completed_actions)} / 待确认 {len(pending)}")
+    if runtime_state.last_error:
+        print(f"- 最近错误: {runtime_state.last_error}")
+
+
+def _redact_export_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_privacy(value)
+    if isinstance(value, list):
+        return [_redact_export_value(item) for item in value]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if "api_key" in key_text or "key" == key_text:
+                result[str(key)] = "[已隐藏]"
+            elif key_text in {"resume", "detail", "greeting", "active_content", "content"}:
+                text = redact_privacy(str(item or ""))
+                result[str(key)] = text[:240] + ("..." if len(text) > 240 else "")
+            else:
+                result[str(key)] = _redact_export_value(item)
+        return result
+    return value
+
+
+def write_diagnostic_report() -> Path:
+    out_dir = Path(Config.app_db_name).parent / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache.load()
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "status": runtime_state.as_dict(cache.status(), cache.cache_status()),
+        "config": Config.public_dict(),
+        "greeting": {
+            "confirmed": bool(greeting_service.get_greeting().get("confirmed")),
+            "variant_count": len(greeting_service.get_greeting().get("variants") or []),
+        },
+        "logs": list(runtime_state.logs)[:120],
+        "recent_history": database.list_history(50),
+    }
+    payload = _redact_export_value(payload)
+    path = out_dir / f"diagnostic-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def show_report() -> None:
+    path = write_diagnostic_report()
+    print(f"[诊断] 已生成脱敏诊断文件: {path}")
+    print("[诊断] 已隐藏 API Key，并截断简历、岗位正文和话术内容。")
+
+
+def create_backup() -> Path:
+    out_dir = Path(Config.app_db_name).parent / "backups"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"job-seeker-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    data_dir = Path(Config.app_db_name).parent
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("config.public.json", json.dumps(Config.public_dict(), ensure_ascii=False, indent=2))
+        for folder_name in ("resume", "cache"):
+            folder = data_dir / folder_name
+            if not folder.exists():
+                continue
+            for file_path in folder.rglob("*"):
+                if file_path.is_file():
+                    archive.write(file_path, file_path.relative_to(data_dir).as_posix())
+        db_path = Path(Config.app_db_name)
+        if db_path.exists():
+            archive.write(db_path, db_path.relative_to(data_dir).as_posix())
+    return path
+
+
+def show_backup() -> None:
+    path = create_backup()
+    print(f"[备份] 已生成本地备份: {path}")
+    print("[备份] 备份不包含明文 API Key，但包含简历、画像、话术和历史数据库，请妥善保存。")
+
+
 def show_doctor() -> None:
+    from model_stream import model_warmup_check
+
+    issues: list[tuple[str, str]] = []
     print("[诊断] 本地环境")
     for package in ("fastapi", "uvicorn", "ollama", "pypdf", "multipart"):
         found = importlib.util.find_spec(package) is not None
         print(f"- Python 依赖 {package}: {'已安装' if found else '缺失'}")
+        if not found:
+            issues.append((f"缺少 Python 依赖: {package}", "关闭窗口后重新运行启动器，或执行 pip install -r requirements.txt"))
     print(f"- API 地址: http://{Config.server_host}:{Config.server_port}")
     print(f"- 模型来源: {Config.model_provider}")
     if Config.model_provider == "openai":
         print(f"- OpenAI: {Config.openai_api_base}")
         print(f"- API Key: {'已配置' if Config.openai_api_key else '未配置'}")
+        if not Config.openai_api_key:
+            issues.append(("OpenAI API Key 未配置", "运行 config -> 模型与思考，或设置 OPENAI_API_KEY 环境变量"))
     else:
         print(f"- Ollama 地址: {Config.ollama_host}")
     model_status = runtime_state.ollama_status()
@@ -1145,12 +1595,38 @@ def show_doctor() -> None:
     if Config.model_provider == "ollama" and model_status.get("available"):
         installed = "已安装" if model_status.get("model_available") else "未在 Ollama 模型列表中"
         print(f"- 当前模型: {Config.think_model} / {installed}")
+        if not model_status.get("model_available"):
+            issues.append((f"Ollama 模型未安装: {Config.think_model}", f"运行 ollama pull {Config.think_model}"))
     if not model_status.get("available") and model_status.get("error"):
         print(f"  错误: {model_status['error']}")
+        issues.append(("模型服务不可用", "启动 Ollama 或检查 OpenAI API 配置"))
+    print("- 模型真实生成检查: 正在检测...")
+    warmup = model_warmup_check()
+    runtime_state.model_warmup.update(warmup)
+    if warmup.get("status") == "ready":
+        print(f"  可用: {warmup.get('model')} / {warmup.get('latency_seconds', 0)}s")
+    else:
+        print(f"  不可用: {warmup.get('error') or '未知错误'}")
+        issues.append(("模型真实生成失败", "检查模型是否可生成短文本；小模型建议关闭思考功能"))
     print(
         f"- 模型参数: temp={Config.model_temperature} / top_p={Config.model_top_p} / "
         f"repeat_penalty={Config.model_repeat_penalty} / freq_penalty={Config.model_frequency_penalty}"
     )
+    conservative_search = (
+        Config.search_round_cooldown_minutes >= 60
+        and Config.tag_search_delay_seconds >= 20
+        and Config.tag_search_delay_max_seconds >= 45
+        and Config.max_search_submissions_per_hour <= 6
+        and Config.max_search_submissions_per_day <= 30
+    )
+    print(
+        f"- 搜索安全策略: {'保守默认' if conservative_search else '自定义（低于当前保守建议）'} / "
+        f"冷却 {Config.search_round_cooldown_minutes} 分 / "
+        f"间隔 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
+        f"预算 {Config.max_search_submissions_per_hour} 次每小时、{Config.max_search_submissions_per_day} 次每日"
+    )
+    if not conservative_search:
+        issues.append(("搜索配置低于当前保守建议", "运行 config -> 搜索与风控，建议使用 60 分钟冷却、20-45 秒间隔、每小时 6 次和每日 30 次预算"))
     script = runtime_state.script_snapshot()
     state = "在线" if script.get("connected") else ("心跳过期" if script.get("stale") else "离线")
     print(f"- 油猴脚本: {state}")
@@ -1182,19 +1658,72 @@ def show_doctor() -> None:
             f"checked={detail.get('tagsCheckedThisRound', '-')}"
         )
         print(
+            f"  岗位来源: {detail.get('jobSource') or '-'} / "
+            f"推荐源={detail.get('currentFeedTabName') or '-'} / "
+            f"{detail.get('feedTabProcessedCount', 0)}/"
+            f"{detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab}"
+        )
+        print(
             f"  搜索冷却: {_format_script_cooldown(detail)} / "
             f"{detail.get('cooldownMinutes') or Config.search_round_cooldown_minutes} 分钟"
         )
+        print(
+            f"  关键词搜索预算: 小时 "
+            f"{detail.get('searchBudgetHourlyCount', 0)}/"
+            f"{detail.get('searchBudgetHourlyLimit') or Config.max_search_submissions_per_hour} / 今日 "
+            f"{detail.get('searchBudgetDailyCount', 0)}/"
+            f"{detail.get('searchBudgetDailyLimit') or Config.max_search_submissions_per_day}"
+        )
+        if detail.get("searchBudgetBlockedReason"):
+            print(f"  搜索预算状态: {detail.get('searchBudgetBlockedReason')}")
+            if detail.get("searchBudgetNextAllowedAt"):
+                print(f"  下次允许搜索: {detail.get('searchBudgetNextAllowedAt')}")
+    try:
+        import database
+
+        db_stats = database.database_stats()
+        print(
+            f"- 本地数据库: {db_stats.get('size_mb', 0):.1f} MB / "
+            f"事件 {db_stats.get('event_count', 0)} 条 / schema v{db_stats.get('schema_version', 0)}"
+        )
+        if db_stats.get("size_mb", 0) >= 100 or db_stats.get("event_count", 0) >= 100000:
+            issues.append(("本地运行日志较大", "重启服务会执行低频日志清理；建议先运行 backup 备份重要历史"))
+    except Exception as exc:
+        print(f"- 本地数据库诊断失败: {exc}")
+    if Config.model_provider == "openai" and Config.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
+        print("- API Key 来源: data/config.json（建议迁移到 OPENAI_API_KEY 环境变量）")
+        issues.append(("API Key 仍保存在本地配置文件", "先设置 OPENAI_API_KEY 并验证可用，再清空 data/config.json 中的 openai_api_key"))
     if script.get("stale"):
         print("- 建议: 刷新 BOSS 搜索页，等待 CLI 出现新的脚本心跳后再输入 start。")
+        issues.append(("油猴脚本心跳过期", "刷新 BOSS 搜索页，确认脚本状态重新在线"))
     elif not script.get("connected"):
         print("- 建议: 打开或刷新 BOSS 搜索页，确认脚本头包含 @connect 127.0.0.1 和 @connect localhost。")
+        issues.append(("油猴脚本未连接", "运行 script 更新脚本，然后打开或刷新 BOSS 搜索页"))
     greeting = greeting_service.get_greeting()
     cache.load()
     print(f"- 简历: {'已保存' if cache.resume.strip() else '未保存'}")
     print(f"- 简历画像: {'已生成' if cache.cache_status()['profile_generated'] else '未生成'}")
     print(f"- 用户详情: {'已确认' if cache.user_detail.strip() else '未确认'}")
     print(f"- 打招呼话术: {'已确认' if greeting.get('confirmed') else '未确认'}")
+    if not cache.resume.strip():
+        issues.append(("简历未保存", "运行 resume 上传并确认简历"))
+    elif not cache.cache_status()["profile_generated"]:
+        issues.append(("简历画像或标签未生成", "运行 profile 生成画像，或运行 tags 手动确认标签"))
+    if not greeting.get("confirmed"):
+        issues.append(("打招呼话术未确认", "运行 greeting 生成或编辑话术"))
+    autorun = runtime_state.as_dict(cache.status(), cache.cache_status()).get("autorun") or {}
+    if autorun.get("blocked"):
+        print(f"- 自动模式 blocked: {autorun.get('reason')}")
+        if autorun.get("next_action"):
+            print(f"  建议: {autorun.get('next_action')}")
+        issues.append((f"自动模式暂停: {autorun.get('reason')}", autorun.get("next_action") or "按上方诊断逐项处理"))
+    print("\n[诊断] 下一步")
+    if issues:
+        issue, action = issues[0]
+        print(f"- 当前最需要处理: {issue}")
+        print(f"- 建议操作: {action}")
+    else:
+        print("- 未发现阻塞项。可输入 start 开始或继续运行。")
 
 
 def block_autorun(message: str, *, detail: dict[str, Any] | None = None, next_action: str = "") -> bool:
@@ -1329,6 +1858,7 @@ def show_help() -> None:
         """
 可用命令:
   status        显示系统状态
+  setup         首次快速配置（模型、简历、标签、话术）
   config        重新配置基础参数
   resume        重新上传/编辑简历
   profile       重新生成/编辑用户画像
@@ -1342,6 +1872,9 @@ def show_help() -> None:
   actions       处理待确认动作
   history       显示最近历史
   logs          显示最近日志
+  summary       显示当前运行汇总
+  report        生成脱敏诊断文件
+  backup        备份配置、简历、缓存和数据库
   script        显示篡改猴脚本安装/更新地址
   doctor        检查依赖、Ollama 和油猴连接
   help          显示帮助
@@ -1358,6 +1891,12 @@ def command_loop() -> None:
             continue
         if command == "status":
             show_status()
+        elif command == "setup":
+            setup_quick_start()
+            ensure_resume()
+            ensure_profile()
+            ensure_greeting()
+            print_summary()
         elif command == "config":
             configure_base()
         elif command == "resume":
@@ -1383,6 +1922,12 @@ def command_loop() -> None:
             show_history()
         elif command == "logs":
             show_logs()
+        elif command == "summary":
+            show_run_summary()
+        elif command == "report":
+            show_report()
+        elif command == "backup":
+            show_backup()
         elif command == "script":
             show_script_install()
         elif command == "doctor":
@@ -1404,7 +1949,7 @@ def run_cli(app, shutdown_callback: Callable[[], None] | None = None) -> None:
     run_initialization()
     server = start_api_server(app)
     wait_for_api_ready()
-    _ensure_model_warmup()
+    start_model_warmup_background()
     print_status_panel()
     maybe_open_startup_pages()
     show_startup_next_steps()
@@ -1424,6 +1969,7 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
     cache.load()
     start_event_printer()
     runtime_state.emit("autorun_start", "Job Seeker 自动运行启动", source="startup")
+    print("[1/6] 启动本地 API 服务...")
     server = start_api_server(app)
 
     def shutdown_autorun() -> None:
@@ -1433,13 +1979,16 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
 
     wait_for_api_ready()
     try:
+        print("[2/6] 检查定时启动设置...")
         wait_for_auto_start_schedule()
     except KeyboardInterrupt:
         print("\n[退出] 定时等待已取消，正在关闭服务...")
         shutdown_autorun()
         return 130
+    print("[3/6] 打开油猴脚本和 BOSS 搜索页...")
     maybe_open_startup_pages(always_open_userscript=True)
     show_autorun_next_steps()
+    print("[4/6] 检查模型、简历、画像、标签和话术...")
     if not auto_prepare_saved_configuration():
         print("[启动] 自动运行未开始，但本地服务会保持运行，方便查看 /status 和 /logs。")
         try:
@@ -1447,9 +1996,10 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
         finally:
             shutdown_autorun()
         return 1
+    print("[5/6] 执行模型预热和状态快照...")
     _ensure_model_warmup()
     print_status_panel()
-    print("[脚本] 等待油猴脚本连接，最长等待 120 秒...")
+    print("[6/6] 等待油猴脚本连接，最长等待 120 秒...")
     if not wait_for_script_ready(120):
         block_autorun("油猴脚本未连接，自动运行已暂停", next_action="安装/更新油猴脚本，登录 BOSS 并刷新搜索页")
         print("[脚本] 油猴脚本未连接。请确认已安装/启用脚本、BOSS 已登录，并刷新搜索页。")

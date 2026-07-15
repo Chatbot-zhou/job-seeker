@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import importlib.util
 import sys
 from pathlib import Path
@@ -34,6 +35,8 @@ def check_config_normalization() -> None:
             "search_round_cooldown_minutes": 999,
             "tag_search_delay_seconds": 1,
             "tag_search_delay_max_seconds": 1,
+            "max_search_submissions_per_hour": 9,
+            "max_search_submissions_per_day": 3,
             "search_result_scroll_rounds": 9,
             "auto_start_time": "9:00",
         })
@@ -41,7 +44,9 @@ def check_config_normalization() -> None:
         assert Config.search_round_cooldown_minutes == 240
         assert Config.tag_search_delay_seconds == 3
         assert Config.tag_search_delay_max_seconds == 3
-        assert Config.search_result_scroll_rounds == 2
+        assert Config.max_search_submissions_per_hour == 9
+        assert Config.max_search_submissions_per_day == 9
+        assert Config.search_result_scroll_rounds == 5
         assert Config.auto_start_time == "09:00"
     finally:
         Config.apply(original)
@@ -91,6 +96,46 @@ def check_job_score_parser() -> None:
     assert parse_job_score_block(thinking_only) is None
 
 
+def check_userscript_version_sync() -> None:
+    script = Path("web_script.js").read_text(encoding="utf-8-sig")
+    meta = re.search(r"@version\s+([^\s]+)", script)
+    internal = re.search(r"scriptVersion:\s*'([^']+)'", script)
+    assert meta and internal
+    assert meta.group(1).split(".")[-1] == internal.group(1).split(".")[-1]
+    assert "GM_openInTab" in script
+    assert "active: false" in script
+    assert "__job_seeker_search_budget" in script
+    assert "__job_seeker_search_round_state" in script
+    assert "greet_delivery_unknown" in script
+    assert "window.scrollBy(" not in script
+
+
+def check_diagnostic_redaction() -> None:
+    from cli_console import _redact_export_value
+
+    payload = {
+        "openai_api_key": "test-secret-value",
+        "resume": "电话 13800138000，邮箱 test@example.com，正文很长" * 20,
+        "nested": {"content": "身份证 110105199001011234"},
+    }
+    redacted = _redact_export_value(payload)
+    assert redacted["openai_api_key"] == "[已隐藏]"
+    text = str(redacted)
+    assert "test-secret-value" not in text
+    assert "13800138000" not in text
+    assert "test@example.com" not in text
+    assert "110105199001011234" not in text
+
+
+def check_gitignore_allows_tests() -> None:
+    lines = {
+        line.strip()
+        for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert "test.*" not in lines
+
+
 def main() -> int:
     checks = [
         check_dependencies,
@@ -98,6 +143,9 @@ def main() -> int:
         check_schema_defaults,
         check_privacy_detection,
         check_job_score_parser,
+        check_userscript_version_sync,
+        check_diagnostic_redaction,
+        check_gitignore_allows_tests,
     ]
     for check in checks:
         check()

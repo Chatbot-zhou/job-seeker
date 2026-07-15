@@ -11,7 +11,7 @@ try {
 }
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$BossUrl = "https://www.zhipin.com/web/geek/job"
+$BossUrl = "https://www.zhipin.com/web/geek/jobs"
 $OpenCooldownSeconds = 60
 
 function Write-Info {

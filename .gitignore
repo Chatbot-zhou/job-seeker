@@ -1,5 +1,7 @@
-test.*
+test.local.*
 __pycache__/
+.pytest_cache/
+node_modules/
 *.pyc
 *.pyo
 cache.json

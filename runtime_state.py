@@ -59,6 +59,7 @@ class RuntimeState:
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self._subscribers: list[Queue] = []
         self._lock = threading.RLock()
+        self._last_persisted_script_status: tuple[str, str, str] | None = None
 
     def _new_run_id(self) -> str:
         return f"run-{uuid.uuid4().hex[:12]}"
@@ -100,10 +101,23 @@ class RuntimeState:
                 self._subscribers = [
                     subscriber for subscriber in self._subscribers if subscriber not in failed_subscribers
                 ]
+        persist_event = True
+        if event_type == "script_status":
+            script_detail = (detail or {}).get("detail") or {}
+            signature = (
+                str((detail or {}).get("page", "")),
+                str((detail or {}).get("status", "")),
+                str((detail or {}).get("current_action", "") or script_detail.get("current_action", "")),
+            )
+            with self._lock:
+                persist_event = signature != self._last_persisted_script_status
+                if persist_event:
+                    self._last_persisted_script_status = signature
         try:
             import database
 
-            database.create_event(item)
+            if persist_event:
+                database.create_event(item)
         except Exception:
             pass
         return item
@@ -169,7 +183,9 @@ class RuntimeState:
         return script
 
     def set_control(self, command: str, *, new_run: bool = False) -> None:
+        previous_run_id = ""
         with self._lock:
+            previous_run_id = self.run_id
             if command == "pause":
                 self.control = "paused"
                 self.current_task = "paused"
@@ -182,6 +198,18 @@ class RuntimeState:
             elif command == "stop":
                 self.control = "stopped"
                 self.current_task = "stopped"
+            current_run_id = self.run_id
+            current_control = self.control
+        try:
+            import database
+
+            if current_run_id != previous_run_id and previous_run_id:
+                database.finish_run(previous_run_id, control="completed")
+            database.upsert_run(current_run_id, control=current_control, started_at=self.started_at)
+            if command == "stop":
+                database.finish_run(current_run_id, control="stopped")
+        except Exception:
+            pass
         self.log(f"控制命令: {command}", source="control")
 
     def set_autorun_blocked(self, reason: str, next_action: str = "") -> None:
@@ -366,6 +394,8 @@ class RuntimeState:
                 "search_round_cooldown_minutes": Config.search_round_cooldown_minutes,
                 "tag_search_delay_seconds": Config.tag_search_delay_seconds,
                 "tag_search_delay_max_seconds": Config.tag_search_delay_max_seconds,
+                "max_search_submissions_per_hour": Config.max_search_submissions_per_hour,
+                "max_search_submissions_per_day": Config.max_search_submissions_per_day,
                 "search_result_scroll_rounds": Config.search_result_scroll_rounds,
             },
             "script": self.script_snapshot(),

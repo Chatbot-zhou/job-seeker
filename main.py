@@ -73,13 +73,18 @@ def shutdown_model_executor() -> None:
 async def lifespan(app: FastAPI):
     Config.load()
     database.init_db()
+    database.upsert_run(runtime_state.run_id, control=runtime_state.control, started_at=runtime_state.started_at)
+    cleanup = database.prune_old_events(normal_days=7, important_days=30)
     cache.load()
     runtime_state.log("Job Seeker 服务已启动")
     runtime_state.log(f"岗位评分版本: {SCORING_VERSION}")
+    if cleanup.get("deleted"):
+        runtime_state.log(f"已清理过期运行事件 {cleanup['deleted']} 条", source="database")
     try:
         yield
     finally:
         runtime_state.log("正在关闭服务…")
+        database.finish_run(runtime_state.run_id, control=runtime_state.control)
         shutdown_model_executor()
         runtime_state.log("Job Seeker 服务已关闭")
 
@@ -251,6 +256,8 @@ async def web_script_user_js():
 async def status():
     cache.load()
     result = runtime_state.as_dict(cache.status(), cache.cache_status())
+    result["database"] = database.database_stats()
+    result["run_summary"] = database.summarize_run(runtime_state.run_id)
     greeting = greeting_service.get_greeting()
     result["greeting"] = {
         "confirmed": bool(greeting.get("confirmed")),
@@ -446,6 +453,7 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
                 raise
         if analysis.get("total_score", 0) <= 0 and analysis.get("risks"):
             final_action = final_action or "model_failed_skip"
+    job["run_id"] = runtime_state.run_id
     saved_job = database.upsert_job(job, analysis, final_action=final_action)
     if job.get("talked"):
         saved_job = database.update_job_status(job.get("url", ""), final_action="already_contacted", greeted=True) or saved_job
@@ -460,7 +468,9 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
 
 @app.post("/actions", summary="创建待执行动作")
 async def create_action(payload: ActionCreate):
-    action = database.create_action(payload.model_dump())
+    action_data = payload.model_dump()
+    action_data["run_id"] = runtime_state.run_id
+    action = database.create_action(action_data)
     if payload.action_type in {"greet", "send_greeting"} and payload.status in {"completed", "approved"}:
         database.update_job_status(payload.job_url, final_action="greeted", greeted=True)
     if payload.action_type == "already_contacted" and payload.status in {"completed", "approved"}:

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.13
+// @version      2026.06.26.20
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06-cli-autogreet.28',
+        scriptVersion: '2026.06.26.20',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -33,12 +33,15 @@
         onlyGreet: true, // 仅辅助打招呼，不自动扫描普通聊天页
         sessionGreetLimit: 50,
         dailyGreetSafeLimit: 120,
-        searchRoundCooldownMinutes: 30,
-        tagSearchDelaySeconds: 10,
-        tagSearchDelayMaxSeconds: 30,
-        searchResultScrollRounds: 1,
+        searchRoundCooldownMinutes: 60,
+        tagSearchDelaySeconds: 20,
+        tagSearchDelayMaxSeconds: 45,
+        maxSearchSubmissionsPerHour: 6,
+        maxSearchSubmissionsPerDay: 30,
+        searchResultScrollRounds: 5,
+        preferredFeedMode: 'all_custom_tabs',
+        preferredFeedMaxJobsPerTab: 10,
         actionDelayMs: 2500,
-        manualInterventionMaxRetries: 3,
         searchLeaseMs: 12000,
         openCooldownMs: 45000,
         recentProcessedHours: 24,
@@ -72,8 +75,20 @@
                 Math.min(60, Number(config.tag_search_delay_max_seconds)),
             );
         }
+        if (Number.isFinite(Number(config.max_search_submissions_per_hour))) {
+            OPTIONS.maxSearchSubmissionsPerHour = Math.max(1, Math.min(60, Number(config.max_search_submissions_per_hour)));
+        }
+        if (Number.isFinite(Number(config.max_search_submissions_per_day))) {
+            OPTIONS.maxSearchSubmissionsPerDay = Math.max(1, Math.min(300, Number(config.max_search_submissions_per_day)));
+        }
         if (Number.isFinite(Number(config.search_result_scroll_rounds))) {
-            OPTIONS.searchResultScrollRounds = Math.max(0, Math.min(2, Number(config.search_result_scroll_rounds)));
+            OPTIONS.searchResultScrollRounds = Math.max(0, Math.min(5, Number(config.search_result_scroll_rounds)));
+        }
+        if (config.preferred_feed_mode === 'off' || config.preferred_feed_mode === 'all_custom_tabs') {
+            OPTIONS.preferredFeedMode = config.preferred_feed_mode;
+        }
+        if (Number.isFinite(Number(config.preferred_feed_max_jobs_per_tab))) {
+            OPTIONS.preferredFeedMaxJobsPerTab = Math.max(0, Math.min(500, Number(config.preferred_feed_max_jobs_per_tab)));
         }
     }
 
@@ -142,6 +157,7 @@
     // 搜索路径
     const SEARCHPATH = {
         zhipin: '/web/geek/job',
+        preferred: '/web/geek/jobs',
     };
 
     // 白名单
@@ -152,7 +168,7 @@
         },
     };
 
-    // 宸ュ叿
+    // 工具函数
     const tools = {
         inWhiteList: function (pathObj) {
             return Object.values(pathObj).some((path) => {
@@ -165,7 +181,13 @@
             return list.some(item => location.pathname.startsWith(item) || location.pathname.includes(item));
         },
         isSearchPath(path = location.pathname) {
-            return path.startsWith(SEARCHPATH.zhipin) || path.includes(SEARCHPATH.zhipin);
+            return this.isKeywordSearchPath(path) || this.isPreferredFeedPath(path);
+        },
+        isKeywordSearchPath(path = location.pathname) {
+            return path.startsWith(SEARCHPATH.zhipin) && !this.isPreferredFeedPath(path);
+        },
+        isPreferredFeedPath(path = location.pathname) {
+            return path.startsWith(SEARCHPATH.preferred);
         },
         isCityHomePath(path = location.pathname) {
             return /^\/[a-z][a-z0-9-]*\/?$/.test(path);
@@ -461,6 +483,7 @@
         },
         greetContextKey: '__chatbot_zhou_greet_context',
         greetClaimKey: '__chatbot_zhou_greet_claim',
+        greetTransactionKey: '__job_seeker_greet_transactions',
         dailyGreetKey: '__chatbot_zhou_daily_greet_count',
         newGreetRequestId() {
             return `greet_${Date.now()}_${Math.floor(Math.random() * 100000)}_${PAGE_INSTANCE_ID}`;
@@ -478,6 +501,40 @@
             };
             this.writeJson(this.greetContextKey, next);
             return next;
+        },
+        greetTransactionId(runId, jobUrl) {
+            return `${String(runId || 'unknown')}::${this.normalUrl(jobUrl) || String(jobUrl || '')}`;
+        },
+        getGreetTransactions() {
+            const value = this.readJson(this.greetTransactionKey, {});
+            return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+        },
+        getGreetTransaction(runId, jobUrl) {
+            const transactions = this.getGreetTransactions();
+            return transactions[this.greetTransactionId(runId, jobUrl)] || {};
+        },
+        updateGreetTransaction(runId, jobUrl, state, detail = {}) {
+            const transactions = this.getGreetTransactions();
+            const id = this.greetTransactionId(runId, jobUrl);
+            const previous = transactions[id] || {};
+            transactions[id] = {
+                ...previous,
+                ...detail,
+                id,
+                runId: String(runId || previous.runId || ''),
+                jobUrl: this.normalUrl(jobUrl) || String(jobUrl || previous.jobUrl || ''),
+                state,
+                updatedAt: Date.now(),
+                createdAt: Number(previous.createdAt || Date.now()),
+            };
+            const entries = Object.entries(transactions)
+                .sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0))
+                .slice(0, 500);
+            this.writeJson(this.greetTransactionKey, Object.fromEntries(entries));
+            return transactions[id];
+        },
+        isTerminalGreetTransaction(transaction) {
+            return ['send_clicked', 'confirmed', 'unknown'].includes(String(transaction?.state || ''));
         },
         clearGreetContext(requestId = '') {
             const context = this.getGreetContext();
@@ -617,16 +674,52 @@
             this.writeJson(this.dailyGreetKey, next);
             return next.count;
         },
+        riskSurfaceText() {
+            const selectors = [
+                '[role="dialog"]', '.dialog-wrap', '.boss-dialog', '.boss-popup', '.toast',
+                '[class*="captcha"]', '[id*="captcha"]', '[class*="verify"]', '[id*="verify"]',
+                '[class*="security"]', '[id*="security"]', 'iframe[src*="captcha"]',
+                'iframe[src*="verify"]', '.geetest_panel', '.nc-container', '.login-dialog',
+            ];
+            const texts = [];
+            for (const selector of selectors) {
+                let nodes = [];
+                try {
+                    nodes = Array.from(document.querySelectorAll(selector));
+                } catch (e) {
+                    continue;
+                }
+                for (const node of nodes.slice(0, 20)) {
+                    if (node.tagName === 'IFRAME') {
+                        texts.push(`${node.getAttribute('src') || ''} ${node.getAttribute('title') || ''}`);
+                        continue;
+                    }
+                    if (!this.isVisible(node)) continue;
+                    texts.push(node.innerText || node.textContent || '');
+                }
+            }
+            return texts.join(' ').replace(/\s+/g, ' ').trim();
+        },
+        compactPageText(maxLength = 1800) {
+            const text = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+            return text.length <= maxLength ? text : '';
+        },
+        interruptionLocationReason() {
+            const url = `${location.pathname || ''}${location.search || ''}${location.hash || ''}`.toLowerCase();
+            if (/(captcha|verify|security-check|safe-check|challenge)/.test(url)) return '安全验证页面';
+            if (/\/(login|signin)(\/|$)/.test(url)) return '登录页面';
+            return '';
+        },
         detectInterruptionText(text) {
-            const content = String(text || '').replace(/\s+/g, ' ');
+            const content = String(text || '').replace(/\s+/g, ' ').toLowerCase();
             const patterns = [
                 '安全验证',
                 '访问异常',
                 '请完成验证',
                 '登录已过期',
+                '登录状态已失效',
                 '请先登录',
                 '账号存在异常',
-                '访问过于频繁',
                 '系统检测到异常',
                 '拖动滑块',
                 '向右滑动',
@@ -634,9 +727,10 @@
                 '图形验证码',
                 '请输入验证码',
                 '完成验证码',
-                'captcha',
-                'verify',
-                'login',
+                'security verification',
+                'please complete verification',
+                'please log in',
+                'captcha verification',
             ];
             return patterns.find(pattern => content.includes(pattern)) || '';
         },
@@ -657,8 +751,9 @@
                 '沟通名额已用完',
                 '打招呼次数已用完',
                 '操作过于频繁',
-                'limit',
+                '访问过于频繁',
                 'too frequent',
+                'rate limit exceeded',
             ];
             return patterns.find(pattern => content.includes(pattern)) || '';
         },
@@ -685,12 +780,14 @@
             return keywordPatterns.find(pattern => content.includes(pattern)) || '';
         },
         detectManualInterruption() {
-            const text = document.body ? document.body.innerText : '';
-            return this.detectInterruptionText(text);
+            const locationReason = this.interruptionLocationReason();
+            if (locationReason) return locationReason;
+            return this.detectInterruptionText(this.riskSurfaceText())
+                || this.detectInterruptionText(this.compactPageText());
         },
         detectPlatformLimit() {
-            const text = document.body ? document.body.innerText : '';
-            return this.detectPlatformLimitText(text);
+            return this.detectPlatformLimitText(this.riskSurfaceText())
+                || this.detectPlatformLimitText(this.compactPageText());
         },
         manualInterruptionReason(value) {
             const content = String(value || '');
@@ -740,6 +837,54 @@
                 return '页面属性标记已沟通';
             }
             return '';
+        },
+        normalizeFeedTabText(value) {
+            return String(value || '').replace(/\s+/g, ' ').trim();
+        },
+        isSystemFeedName(value) {
+            return ['推荐', '系统推荐', '为你推荐'].includes(this.normalizeFeedTabText(value));
+        },
+        isIgnoredFeedName(value) {
+            const text = this.normalizeFeedTabText(value);
+            if (!text) return true;
+            const exactIgnored = new Set([
+                '职位', '公司', '消息', '我的', '首页', '搜索', '筛选', '全部', '城市',
+                '经验', '学历', '薪资', '行业', '附近', '地图', '最新', '默认', '清空', '确定',
+                '取消', '重置', '保存', '更多', '排序', '区域', '地铁', '要求', '校园', '海归',
+                'APP', '有了', '海外', '无障碍专区', '简历', 'BOSS直聘', '求职类型', '薪资待遇',
+                '工作经验', '学历要求', '公司行业', '公司规模', '收藏', '立即沟通', '举报',
+            ]);
+            if (exactIgnored.has(text)) return true;
+            if (/地图|筛选|附近|全部|清空|确定|取消|重置|排序|扫码|分享|举报|收藏|立即沟通/.test(text)) return true;
+            if (/客服|不加班|办公室|坐班|工作制|居家办公|销售|大专|年以内|企业客服/.test(text)) return true;
+            if (/^[-\s\d.,，。+\-~—_（）()]+K?$/i.test(text)) return true;
+            if (/^\d+$/.test(text)) return true;
+            return false;
+        },
+        isCompositeFeedName(value) {
+            const text = this.normalizeFeedTabText(value);
+            if (!text) return false;
+            if (/^(推荐|系统推荐|为你推荐)\s+.+/.test(text)) return true;
+            const cityGroups = text.match(/[（(][^）)]{1,10}[）)]/g) || [];
+            if (cityGroups.length >= 2) return true;
+            const jobWordMatches = text.match(/(算法|大模型|自然语言|NLP|AI|AIGC|Agent|RAG|开发|工程师|后端|前端|测试|运维|产品|数据|架构|Java|Python|Go|C\+\+|Dify|Coze|LangChain)/gi) || [];
+            if (jobWordMatches.length >= 2 && /\s+/.test(text)) return true;
+            return false;
+        },
+        isLikelyCustomFeedName(value) {
+            const text = this.normalizeFeedTabText(value);
+            if (!text || text.length > 32) return false;
+            if (this.isCompositeFeedName(text)) return false;
+            if (this.isSystemFeedName(text) || this.isIgnoredFeedName(text)) return false;
+            return /[\u4e00-\u9fa5A-Za-z]/.test(text);
+        },
+        isStrongCustomFeedName(value) {
+            const text = this.normalizeFeedTabText(value);
+            if (!this.isLikelyCustomFeedName(text)) return false;
+            if (/[、，,。；;]/.test(text)) return false;
+            const jobWords = /(算法|大模型|自然语言|NLP|AI|AIGC|Agent|RAG|开发|工程师|后端|前端|测试|运维|产品|数据|架构|Java|Python|Go|C\+\+|Dify|Coze|LangChain)/i;
+            const citySuffix = /[（(][^）)]{1,10}[）)]$/.test(text);
+            return jobWords.test(text) || (citySuffix && text.length <= 24);
         },
     };
 
@@ -1312,6 +1457,15 @@
             let tagsCheckedThisRound = new Set();
             let cooldownUntil = 0;
             let cooldownTimer = null;
+            let currentJobSource = tools.isPreferredFeedPath() ? 'preferred_feed' : 'keyword_search';
+            let feedTabs = [];
+            let currentFeedTabIndex = -1;
+            let currentFeedTabName = '';
+            let feedTabProcessedCount = 0;
+            let feedTabMaxJobs = OPTIONS.preferredFeedMaxJobsPerTab;
+            let preferredFeedsDone = false;
+            let feedSwitchAttempted = false;
+            let feedSwitchReason = '';
             // 缓存
             let started = false;
             let booting = false;
@@ -1326,33 +1480,12 @@
             let leaseTimer = null;
             let activeTempTab = null;
             const searchLeaseKey = '__job_seeker_search_lease';
-            const manualRecoveryStateKey = '__job_seeker_manual_recovery';
-            let manualInterventionRetryCount = 0;
+            localStorage.removeItem('__job_seeker_manual_recovery');
             const pageFailureStateKey = '__job_seeker_page_failure_recovery';
             let pageFailureRetryCount = 0;
-
-            const loadManualRecoveryState = () => {
-                try {
-                    const state = JSON.parse(localStorage.getItem(manualRecoveryStateKey) || '{}');
-                    if (!state || !state.timestamp || Date.now() - Number(state.timestamp) > 5 * 60 * 1000) {
-                        return {};
-                    }
-                    return state;
-                } catch (e) {
-                    return {};
-                }
-            };
-
-            const saveManualRecoveryState = (state) => {
-                localStorage.setItem(manualRecoveryStateKey, JSON.stringify({
-                    ...state,
-                    timestamp: Date.now(),
-                }));
-            };
-
-            const clearManualRecoveryState = () => {
-                localStorage.removeItem(manualRecoveryStateKey);
-            };
+            const preferredFeedStateKey = '__job_seeker_preferred_feed_state';
+            const searchBudgetStateKey = '__job_seeker_search_budget';
+            const searchRoundStateKey = '__job_seeker_search_round_state';
 
             const loadPageFailureState = () => {
                 try {
@@ -1377,13 +1510,121 @@
                 localStorage.removeItem(pageFailureStateKey);
             };
 
-            const loadedManualRecovery = loadManualRecoveryState();
-            if (Number.isFinite(Number(loadedManualRecovery.nextTagIdx))) {
-                currentTagIdx = Math.max(0, Number(loadedManualRecovery.nextTagIdx));
-            }
-            if (Number.isFinite(Number(loadedManualRecovery.retryCount))) {
-                manualInterventionRetryCount = Math.max(0, Number(loadedManualRecovery.retryCount));
-            }
+            const preferredFeedRunKey = () => {
+                const session = tools.getGreetSession();
+                return lastBackendRunId || session.backendRunId || session.runId || 'unknown';
+            };
+
+            const localDateKey = (timestamp = Date.now()) => {
+                const date = new Date(timestamp);
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                return `${date.getFullYear()}-${month}-${day}`;
+            };
+
+            const searchBudgetSnapshot = () => {
+                const now = Date.now();
+                const today = localDateKey(now);
+                const raw = tools.readJson(searchBudgetStateKey, {});
+                const submissions = Array.isArray(raw.submissions)
+                    ? raw.submissions.map(Number).filter(value => Number.isFinite(value) && value > 0 && now - value < 24 * 60 * 60 * 1000)
+                    : [];
+                const dailySubmissions = raw.date === today ? submissions : [];
+                const hourlySubmissions = dailySubmissions.filter(value => now - value < 60 * 60 * 1000);
+                const hourlyLimit = Number(OPTIONS.maxSearchSubmissionsPerHour || 6);
+                const dailyLimit = Number(OPTIONS.maxSearchSubmissionsPerDay || 30);
+                let blockedReason = '';
+                let nextAllowedAt = 0;
+                if (dailySubmissions.length >= dailyLimit) {
+                    const tomorrow = new Date();
+                    tomorrow.setHours(24, 0, 0, 0);
+                    blockedReason = `今日关键词搜索预算已达 ${dailySubmissions.length}/${dailyLimit}`;
+                    nextAllowedAt = tomorrow.getTime();
+                } else if (hourlySubmissions.length >= hourlyLimit) {
+                    blockedReason = `每小时关键词搜索预算已达 ${hourlySubmissions.length}/${hourlyLimit}`;
+                    nextAllowedAt = Math.min(...hourlySubmissions) + 60 * 60 * 1000;
+                }
+                const state = {
+                    date: today,
+                    submissions: dailySubmissions,
+                    hourlyCount: hourlySubmissions.length,
+                    dailyCount: dailySubmissions.length,
+                    hourlyLimit,
+                    dailyLimit,
+                    blockedReason,
+                    nextAllowedAt,
+                };
+                tools.writeJson(searchBudgetStateKey, { date: today, submissions: dailySubmissions });
+                return state;
+            };
+
+            const recordSearchSubmission = () => {
+                const state = searchBudgetSnapshot();
+                state.submissions.push(Date.now());
+                tools.writeJson(searchBudgetStateKey, { date: state.date, submissions: state.submissions });
+                return searchBudgetSnapshot();
+            };
+
+            const saveSearchRoundState = () => {
+                tools.writeJson(searchRoundStateKey, {
+                    runKey: preferredFeedRunKey(),
+                    searchRoundId,
+                    currentTagIdx,
+                    tagsChecked: Array.from(tagsCheckedThisRound),
+                    cooldownUntil,
+                    timestamp: Date.now(),
+                });
+            };
+
+            const restoreSearchRoundState = () => {
+                const state = tools.readJson(searchRoundStateKey, {});
+                if (!state.timestamp || Date.now() - Number(state.timestamp) > 24 * 60 * 60 * 1000) return false;
+                if (state.runKey !== preferredFeedRunKey()) return false;
+                searchRoundId = Math.max(0, Number(state.searchRoundId || 0));
+                currentTagIdx = Math.max(0, Number(state.currentTagIdx || 0));
+                tagsCheckedThisRound = new Set(Array.isArray(state.tagsChecked) ? state.tagsChecked.map(Number) : []);
+                cooldownUntil = Math.max(0, Number(state.cooldownUntil || 0));
+                return true;
+            };
+
+            const loadPreferredFeedState = () => {
+                try {
+                    const state = JSON.parse(localStorage.getItem(preferredFeedStateKey) || '{}');
+                    if (!state || !state.timestamp || Date.now() - Number(state.timestamp) > 24 * 60 * 60 * 1000) {
+                        return {};
+                    }
+                    return state;
+                } catch (e) {
+                    return {};
+                }
+            };
+
+            const savePreferredFeedState = (state) => {
+                localStorage.setItem(preferredFeedStateKey, JSON.stringify({
+                    ...state,
+                    runKey: preferredFeedRunKey(),
+                    timestamp: Date.now(),
+                }));
+            };
+
+            const hasPreferredFeedCompletedForRun = () => {
+                const state = loadPreferredFeedState();
+                return Boolean(state.done && state.runKey === preferredFeedRunKey());
+            };
+
+            const shouldPreferFeedBeforeKeywordSearch = () => (
+                OPTIONS.preferredFeedMode !== 'off'
+                && !tools.isPreferredFeedPath()
+                && !preferredFeedsDone
+                && !hasPreferredFeedCompletedForRun()
+            );
+
+            const recoverySearchPath = () => (
+                currentJobSource === 'preferred_feed' && !preferredFeedsDone
+                    ? SEARCHPATH.preferred
+                    : SEARCHPATH.zhipin
+            );
+
             const loadedPageFailure = loadPageFailureState();
             if (Number.isFinite(Number(loadedPageFailure.retryCount))) {
                 pageFailureRetryCount = Math.max(0, Number(loadedPageFailure.retryCount));
@@ -1392,6 +1633,7 @@
             const scriptHeartbeatDetail = () => {
                 const session = tools.getGreetSession();
                 const daily = tools.getDailyGreetState();
+                const searchBudget = searchBudgetSnapshot();
                 return {
                     version: OPTIONS.scriptVersion,
                     threshold: OPTIONS.thread,
@@ -1409,6 +1651,20 @@
                     tagsCheckedThisRound: tagsCheckedThisRound.size,
                     cooldownUntil: cooldownUntil ? new Date(cooldownUntil).toISOString() : '',
                     cooldownMinutes: OPTIONS.searchRoundCooldownMinutes,
+                    searchBudgetHourlyCount: searchBudget.hourlyCount,
+                    searchBudgetHourlyLimit: searchBudget.hourlyLimit,
+                    searchBudgetDailyCount: searchBudget.dailyCount,
+                    searchBudgetDailyLimit: searchBudget.dailyLimit,
+                    searchBudgetBlockedReason: searchBudget.blockedReason,
+                    searchBudgetNextAllowedAt: searchBudget.nextAllowedAt ? new Date(searchBudget.nextAllowedAt).toISOString() : '',
+                    jobSource: currentJobSource,
+                    feedTabs: feedTabs.map(tab => tab.name),
+                    currentFeedTabName,
+                    currentFeedTabIndex,
+                    feedTabProcessedCount,
+                    feedTabMaxJobs,
+                    feedSwitchAttempted,
+                    feedSwitchReason,
                 };
             };
 
@@ -1669,6 +1925,10 @@
                 const total = processedCount + remaining;
                 const suffix = label ? `，${label}` : '';
                 logger.add(`[进度] 已处理 ${processedCount}/${total}，剩余 ${remaining}，本岗位 ${jobSeconds}s，平均 ${averageSeconds}s，累计 ${convertTime(totalSeconds)}${suffix}`);
+                if (pageFailureRetryCount > 0 && !label.includes('页面元素异常') && !label.includes('页面兼容失败')) {
+                    pageFailureRetryCount = 0;
+                    clearPageFailureState();
+                }
                 currentJobProgress = null;
             };
 
@@ -1732,10 +1992,12 @@
 
             const startGreetingWait = (jobInfo, href, requestId, attempt = 1) => {
                 waitingForGreeting = true;
+                const transactionRunId = lastBackendRunId || tools.getGreetSession().backendRunId || tools.getGreetSession().runId;
                 activeGreetingJob = {
                     jobInfo,
                     href,
                     requestId,
+                    transactionRunId,
                     attempt: Math.max(1, Number(attempt || 1)),
                     maxAttempts: Math.max(1, Number(OPTIONS.greetMaxAttempts || 3)),
                 };
@@ -1746,20 +2008,21 @@
                         success: false,
                         error: 'greet_window_timeout',
                         failureCode: 'greet_timeout',
-                        retryable: true,
+                        retryable: false,
                         requestId,
                     });
                     return;
                 }, 60000);
             };
 
-            const finishGreetingWait = (requestId = '') => {
+            const finishGreetingWait = (requestId = '', { preserveTempTab = false } = {}) => {
                 waitingForGreeting = false;
                 if (greetTimeoutId) {
                     clearTimeout(greetTimeoutId);
                     greetTimeoutId = null;
                 }
-                closeActiveTempTab();
+                if (!preserveTempTab) closeActiveTempTab();
+                else activeTempTab = null;
                 tools.clearGreetContext(requestId);
                 activeGreetingJob = null;
             };
@@ -1787,11 +2050,17 @@
 
                 const jobInfo = active.jobInfo || {};
                 const href = active.href || jobInfo.url || '';
+                const transactionRunId = active.transactionRunId || lastBackendRunId || tools.getGreetSession().backendRunId || tools.getGreetSession().runId;
                 const attempt = Math.max(1, Number(data.attempt || active.attempt || 1));
                 const maxAttempts = Math.max(1, Number(active.maxAttempts || OPTIONS.greetMaxAttempts || 3));
                 const error = String(data.error || data.failureCode || 'greet_failed');
 
                 if (data.success) {
+                    tools.updateGreetTransaction(transactionRunId, href, 'confirmed', {
+                        requestId,
+                        attempt,
+                        confirmedAt: Date.now(),
+                    });
                     const count = Number(data.sessionGreetCount || tools.getSessionGreetCount());
                     const dailyCount = Number(data.dailyGreetCount || tools.getDailyGreetCount());
                     logger.add(`打招呼成功，本轮计数 ${count}/${OPTIONS.sessionGreetLimit}，今日计数 ${dailyCount}/${OPTIONS.dailyGreetSafeLimit}`);
@@ -1805,6 +2074,7 @@
                         await stopForSessionLimit(Number(data.sessionGreetCount || tools.getSessionGreetCount()));
                         return;
                     }
+                    if (await markPreferredFeedJobHandled('打招呼成功')) return;
                     loop();
                     return;
                 }
@@ -1812,6 +2082,64 @@
                 const retryable = data.retryable !== false && !isNonRetryableGreetingError(error);
                 const canRetry = retryable && jobInfo && jobInfo.chatUrl && attempt < maxAttempts;
                 logger.add(`打招呼失败 ${attempt}/${maxAttempts}${error ? ': ' + error : ''}`);
+
+                const transaction = tools.getGreetTransaction(transactionRunId, href);
+                const deliveryUnknown = data.deliveryUnknown === true
+                    || error.includes('greet_delivery_unknown')
+                    || ['send_clicked', 'unknown'].includes(String(transaction.state || ''));
+                if (deliveryUnknown) {
+                    tools.updateGreetTransaction(transactionRunId, href, 'unknown', {
+                        requestId,
+                        attempt,
+                        error,
+                    });
+                    finishGreetingWait(requestId, { preserveTempTab: true });
+                    finishJobProgress('发送结果未知，已暂停');
+                    const message = `打招呼发送结果无法确认，已暂停且不会重试: ${jobInfo.title || href}`;
+                    logger.add(message);
+                    setSearchAction(message);
+                    await api.event('greet_delivery_unknown', message, 'script', 'error', {
+                        title: jobInfo.title || '',
+                        url: href,
+                        requestId,
+                        attempt,
+                        error,
+                    });
+                    await api.heartbeat('search', 'error', message, scriptHeartbeatDetail());
+                    this.pause = true;
+                    logger.setPaused(true);
+                    try {
+                        await api.control('pause');
+                    } catch (pauseError) {
+                        await api.event('greet_unknown_pause_failed', `发送结果未知后暂停失败: ${pauseError}`, 'script', 'error');
+                    }
+                    lastBackendControl = 'paused';
+                    return;
+                }
+
+                if (data.pauseRequired === true) {
+                    tools.updateGreetTransaction(transactionRunId, href, 'failed', {
+                        requestId,
+                        attempt,
+                        error,
+                    });
+                    finishGreetingWait(requestId, { preserveTempTab: data.preservePage === true });
+                    finishJobProgress('页面身份异常，已暂停');
+                    const message = `打招呼页面无法可靠确认，已暂停且不会重试: ${jobInfo.title || href}`;
+                    logger.add(message);
+                    setSearchAction(message);
+                    await api.event('greet_page_identity_failed', message, 'script', 'error', {
+                        title: jobInfo.title || '',
+                        url: href,
+                        requestId,
+                        error,
+                    });
+                    this.pause = true;
+                    logger.setPaused(true);
+                    await api.control('pause').catch(() => null);
+                    lastBackendControl = 'paused';
+                    return;
+                }
 
                 if (tools.isPlatformLimitError(error)) {
                     finishGreetingWait(requestId);
@@ -1854,6 +2182,11 @@
                 }
 
                 finishGreetingWait(requestId);
+                tools.updateGreetTransaction(transactionRunId, href, 'failed', {
+                    requestId,
+                    attempt,
+                    error,
+                });
                 await api.event('greet_failed_final', `打招呼最终失败: ${jobInfo.title || ''} / ${error}`, 'script', 'error', {
                     title: jobInfo.title || '',
                     error,
@@ -1862,34 +2195,13 @@
                     requestId,
                 });
                 finishJobProgress('打招呼最终失败');
+                if (await markPreferredFeedJobHandled('打招呼最终失败')) return;
                 loop();
-            };
-
-            const resetManualInterventionRecovery = async (label = '') => {
-                if (manualInterventionRetryCount <= 0 && !localStorage.getItem(manualRecoveryStateKey)) return;
-                const previousCount = manualInterventionRetryCount;
-                manualInterventionRetryCount = 0;
-                clearManualRecoveryState();
-                await api.event('manual_intervention_recovery_success', label || '人工校验恢复成功，已回到正常流程', 'script', 'info', {
-                    previousCount,
-                });
-            };
-
-            const resetPageFailureRecovery = async (label = '') => {
-                if (pageFailureRetryCount <= 0 && !localStorage.getItem(pageFailureStateKey)) return;
-                const previousCount = pageFailureRetryCount;
-                pageFailureRetryCount = 0;
-                clearPageFailureState();
-                await api.event('page_failure_recovery_success', label || '页面失败恢复成功，已回到正常流程', 'script', 'info', {
-                    previousCount,
-                });
             };
 
             const handlePageFailure = async (reason, kind = 'element_retry', sourcePage = 'search') => {
                 const finalReason = reason || '未知页面失败';
                 const isPlatformLimit = kind === 'platform_limit';
-                const retryEvent = isPlatformLimit ? 'platform_limit_retry' : 'element_retry';
-                const pauseEvent = isPlatformLimit ? 'platform_limit_pause' : 'element_retry_pause';
                 if (isPlatformLimit) {
                     const message = `平台额度或次数提醒，自动化已停止: ${finalReason}`;
                     pageFailureRetryCount = 0;
@@ -1928,131 +2240,88 @@
                     lastBackendControl = 'stopped';
                     return true;
                 }
-                pageFailureRetryCount += 1;
-                jobHrefs = [];
-                elsLen = 0;
-                page = 0;
-                lastJobListEventKey = '';
-                if (currentJobProgress) {
-                    finishJobProgress(isPlatformLimit ? '平台限制恢复' : '元素缺失恢复');
-                }
-
-                if (pageFailureRetryCount <= 3) {
-                    const message = `${isPlatformLimit ? '平台次数限制' : '页面元素缺失'}: ${finalReason}，刷新搜索页重试 ${pageFailureRetryCount}/3`;
-                    logger.add(message);
-                    setSearchAction(message);
-                    savePageFailureState({
-                        retryCount: pageFailureRetryCount,
-                        kind,
-                        reason: finalReason,
-                    });
-                    await api.event(retryEvent, message, 'script', isPlatformLimit ? 'error' : 'info', {
-                        reason: finalReason,
-                        retryCount: pageFailureRetryCount,
-                        maxRetries: 3,
-                        sourcePage,
-                    });
-                    await api.heartbeat('search', 'running', message, {
-                        ...scriptHeartbeatDetail(),
-                        reason: finalReason,
-                        retryCount: pageFailureRetryCount,
-                        maxRetries: 3,
-                        sourcePage,
-                    });
-                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
-                    return true;
-                }
-
-                const message = `${isPlatformLimit ? '平台次数限制' : '页面元素缺失'}连续 3 次恢复失败，已暂停: ${finalReason}`;
-                pageFailureRetryCount = 0;
-                clearPageFailureState();
-                this.pause = true;
-                logger.setPaused(true);
+                const failureSignature = `${sourcePage}:${String(finalReason).toLowerCase().replace(/\d+/g, '#').slice(0, 160)}`;
+                const previousFailure = loadPageFailureState();
+                const isSameRecentFailure = previousFailure.signature === failureSignature
+                    && Date.now() - Number(previousFailure.timestamp || 0) <= 5 * 60 * 1000;
+                pageFailureRetryCount = isSameRecentFailure ? Number(previousFailure.retryCount || 0) + 1 : 1;
+                savePageFailureState({ signature: failureSignature, retryCount: pageFailureRetryCount });
+                const hadActiveJob = Boolean(currentJobProgress);
+                const message = hadActiveJob
+                    ? `当前岗位页面元素异常，已跳过且不刷新搜索页: ${finalReason}`
+                    : `当前来源页面元素异常，已切换来源且不刷新恢复: ${finalReason}`;
                 logger.add(message);
                 setSearchAction(message);
-                await api.event(pauseEvent, message, 'script', 'error', {
+                await api.event('element_failure_skipped', message, 'script', 'warning', {
                     reason: finalReason,
-                    maxRetries: 3,
+                    consecutiveCount: pageFailureRetryCount,
                     sourcePage,
+                    jobSource: currentJobSource,
+                    currentFeedTabName,
+                    currentTagIndex: currentTagIdx,
                 });
-                await api.heartbeat('search', 'error', message, {
+                await api.heartbeat('search', 'running', message, {
                     ...scriptHeartbeatDetail(),
                     reason: finalReason,
-                    maxRetries: 3,
                     sourcePage,
                 });
-                try {
-                    await api.control('pause');
-                } catch (e) {
-                    await api.event('page_failure_pause_failed', `页面失败暂停通知失败: ${e}`, 'script', 'error', {
+                if (pageFailureRetryCount >= 3) {
+                    const pauseMessage = `同类关键页面元素连续失败 ${pageFailureRetryCount} 次，已暂停且不会刷新: ${finalReason}`;
+                    this.pause = true;
+                    logger.setPaused(true);
+                    logger.add(pauseMessage);
+                    setSearchAction(pauseMessage);
+                    if (currentJobProgress) finishJobProgress('连续页面兼容失败，已暂停');
+                    await api.event('element_compatibility_pause', pauseMessage, 'script', 'error', {
                         reason: finalReason,
-                        kind,
+                        signature: failureSignature,
+                        consecutiveCount: pageFailureRetryCount,
+                        sourcePage,
                     });
+                    await api.heartbeat('search', 'error', pauseMessage, scriptHeartbeatDetail());
+                    await api.control('pause').catch(() => null);
+                    lastBackendControl = 'paused';
+                    return true;
                 }
-                lastBackendControl = 'paused';
-                return false;
+                if (hadActiveJob) {
+                    finishJobProgress('页面元素异常跳过');
+                    if (await markPreferredFeedJobHandled('页面元素异常跳过')) return true;
+                    setTimeout(loop, OPTIONS.actionDelayMs);
+                    return true;
+                }
+                resetKeywordState();
+                if (currentJobSource === 'preferred_feed') {
+                    await switchToNextPreferredFeedTab('当前推荐源页面元素异常');
+                    return true;
+                }
+                markCurrentTagChecked();
+                const moved = await switchToNextKeyword('当前关键词页面元素异常');
+                if (!moved) await enterSearchCooldown('本轮关键词页面兼容失败');
+                else setTimeout(loop, 0);
+                return true;
             };
 
             const handleManualInterruption = async (reason, sourcePage = 'search') => {
                 const finalReason = reason || '未知人工校验';
-                manualInterventionRetryCount += 1;
                 jobHrefs = [];
                 elsLen = 0;
                 page = 0;
                 lastJobListEventKey = '';
                 if (currentJobProgress) {
-                    finishJobProgress('人工校验恢复');
+                    finishJobProgress('需要人工处理');
                 }
-
-                if (manualInterventionRetryCount <= OPTIONS.manualInterventionMaxRetries) {
-                    const nextTagIdx = this.tags.length ? (currentTagIdx + 1) % this.tags.length : currentTagIdx;
-                    const nextKeyword = this.tags[nextTagIdx] || '';
-                    const message = `需要人工校验: ${finalReason}，尝试切换关键词恢复 ${manualInterventionRetryCount}/${OPTIONS.manualInterventionMaxRetries}`;
-                    logger.add(message);
-                    setSearchAction(message);
-                    saveManualRecoveryState({
-                        retryCount: manualInterventionRetryCount,
-                        nextTagIdx,
-                        reason: finalReason,
-                    });
-                    await api.event('manual_intervention_recovery_attempt', message, 'script', 'info', {
-                        reason: finalReason,
-                        retryCount: manualInterventionRetryCount,
-                        maxRetries: OPTIONS.manualInterventionMaxRetries,
-                        nextKeyword,
-                        nextTagIdx,
-                        sourcePage,
-                    });
-                    await api.heartbeat('search', 'running', message, {
-                        ...scriptHeartbeatDetail(),
-                        reason: finalReason,
-                        retryCount: manualInterventionRetryCount,
-                        maxRetries: OPTIONS.manualInterventionMaxRetries,
-                        nextKeyword,
-                        sourcePage,
-                    });
-                    currentTagIdx = nextTagIdx;
-                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
-                    return true;
-                }
-
-                const message = `连续 ${OPTIONS.manualInterventionMaxRetries} 次恢复失败，已暂停，请人工处理 BOSS 页面验证: ${finalReason}`;
-                manualInterventionRetryCount = 0;
-                clearManualRecoveryState();
+                const message = `检测到登录或安全验证，已暂停并保留当前页面: ${finalReason}`;
                 this.pause = true;
                 logger.setPaused(true);
                 logger.add(message);
                 setSearchAction(message);
-                await api.event('manual_intervention_recovery_failed', message, 'script', 'error', {
+                await api.event('manual_intervention_required', message, 'script', 'error', {
                     reason: finalReason,
-                    maxRetries: OPTIONS.manualInterventionMaxRetries,
                     sourcePage,
                 });
-                await api.event('manual_intervention_required', message, 'script', 'error', { reason: finalReason });
                 await api.heartbeat('search', 'error', message, {
                     ...scriptHeartbeatDetail(),
                     reason: finalReason,
-                    maxRetries: OPTIONS.manualInterventionMaxRetries,
                     sourcePage,
                 });
                 try {
@@ -2131,7 +2400,32 @@
                 const style = window.getComputedStyle(el);
                 const overflowY = `${style.overflowY || ''} ${style.overflow || ''}`;
                 const allowsScroll = /(auto|scroll|overlay)/i.test(overflowY);
-                return el.scrollHeight > el.clientHeight + 40 && (allowsScroll || el.scrollTop >= 0);
+                const hasJobLinks = Boolean(el.querySelector('a[href*="/job_detail/"]'));
+                const classSignal = /job[-_ ]?(list|result|recommend|rec)/i.test(`${el.id || ''} ${el.className || ''}`);
+                return el.scrollHeight > el.clientHeight + 40 && (allowsScroll || hasJobLinks || classSignal);
+            };
+
+            const jobContainerScore = (el) => {
+                if (!isScrollableJobContainer(el)) return -1;
+                const rect = el.getBoundingClientRect();
+                const descriptor = `${el.id || ''} ${el.className || ''}`;
+                const linkCount = el.querySelectorAll('a[href*="/job_detail/"]').length;
+                let score = 0;
+                if (/job[-_ ]?(list|result|recommend|rec)/i.test(descriptor)) score += 200;
+                if (linkCount >= 3) score += 120;
+                else if (linkCount > 0) score += 40;
+                if (rect.width >= 240 && rect.width <= 900) score += 80;
+                if (rect.height >= 300) score += 40;
+                if (rect.left < window.innerWidth * 0.65) score += 30;
+                score += Math.min(80, Math.floor((el.scrollHeight - el.clientHeight) / 100));
+                return score;
+            };
+
+            const jobListFingerprint = (root = document) => {
+                const hrefs = Array.from(root.querySelectorAll('a[href*="/job_detail/"]'))
+                    .map(node => tools.hrefFromJobNode(node))
+                    .filter(Boolean);
+                return `${hrefs.length}:${hrefs.slice(-3).join('|')}`;
             };
 
             const describeScrollTarget = (el) => {
@@ -2162,9 +2456,10 @@
                 }
 
                 const scrollable = candidates
-                    .filter(isScrollableJobContainer)
-                    .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-                return scrollable[0] || null;
+                    .map(el => ({ el, score: jobContainerScore(el) }))
+                    .filter(item => item.score >= 0)
+                    .sort((a, b) => b.score - a.score);
+                return scrollable[0]?.el || null;
             };
 
             const scrollSearchResultsOnce = async (round) => {
@@ -2176,33 +2471,367 @@
                 if (interruption) {
                     throw new Error(`需要人工处理: ${interruption}`);
                 }
-                const keyword = this.tags[currentTagIdx] || '';
+                const keyword = currentJobSource === 'preferred_feed'
+                    ? (currentFeedTabName || '自定义推荐')
+                    : (this.tags[currentTagIdx] || '');
                 const container = findJobListScrollContainer();
+                if (!container) {
+                    await api.event('search_scroll_target_missing', `未找到可验证的左侧岗位列表滚动容器: ${keyword}`, 'script', 'warning', {
+                        keyword,
+                        source: currentJobSource,
+                        round,
+                    });
+                    return false;
+                }
                 const distance = Math.max(420, Math.floor(window.innerHeight * 0.75));
                 setSearchAction(`低频滚动读取: ${keyword}`);
                 logger.add(`低频滚动读取搜索结果: ${keyword} (${round}/${OPTIONS.searchResultScrollRounds})`);
                 await api.event('search_result_scroll', `低频滚动读取搜索结果: ${keyword}`, 'script', 'info', {
                     keyword,
+                    source: currentJobSource,
                     round,
                     maxRounds: OPTIONS.searchResultScrollRounds,
                     searchRoundId,
                     target: describeScrollTarget(container),
                 });
-                if (container) {
-                    const before = container.scrollTop;
-                    if (typeof container.scrollBy === 'function') {
-                        container.scrollBy({ top: distance, behavior: 'smooth' });
-                    } else {
-                        container.scrollTop = before + distance;
-                    }
-                    await tools.asyncSleep(350);
-                    if (Math.abs(container.scrollTop - before) < 5) {
-                        container.scrollTop = before + distance;
-                    }
+                const before = container.scrollTop;
+                const beforeFingerprint = jobListFingerprint(container);
+                if (typeof container.scrollBy === 'function') {
+                    container.scrollBy({ top: distance, behavior: 'smooth' });
                 } else {
-                    window.scrollBy({ top: distance, behavior: 'smooth' });
+                    container.scrollTop = before + distance;
                 }
                 await tools.asyncSleep(searchResultScrollDelayMs());
+                const after = container.scrollTop;
+                const afterFingerprint = jobListFingerprint(container);
+                const moved = Math.abs(after - before) >= 5;
+                const changed = afterFingerprint !== beforeFingerprint;
+                await api.event('search_result_scroll_verified', `岗位列表滚动验证: ${keyword} / ${moved ? '已移动' : '未移动'} / ${changed ? '列表有变化' : '列表未变化'}`, 'script', moved || changed ? 'info' : 'warning', {
+                    keyword,
+                    source: currentJobSource,
+                    round,
+                    target: describeScrollTarget(container),
+                    before,
+                    after,
+                    beforeFingerprint,
+                    afterFingerprint,
+                    moved,
+                    changed,
+                });
+                return moved || changed;
+            };
+
+            const isVisibleFeedElement = (el) => {
+                if (!el || !document.body.contains(el)) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 8 && rect.height > 8 && rect.bottom > 0 && rect.top < Math.min(window.innerHeight, 460);
+            };
+
+            const feedTabText = (el) => tools.normalizeFeedTabText(el?.innerText || el?.textContent || '');
+
+            const feedTabClickable = (el) => (
+                el?.closest?.('a,button,[role="tab"],li,[class*="tab"],[class*="Tab"]')
+                || el
+            );
+
+            const hasFeedTabSemantics = (el) => {
+                if (!el) return false;
+                const role = String(el.getAttribute?.('role') || '').toLowerCase();
+                const descriptor = `${el.className || ''} ${el.parentElement?.className || ''}`;
+                return role === 'tab'
+                    || /(^|[\s_-])tab([\s_-]|$)/i.test(descriptor)
+                    || el.parentElement?.getAttribute?.('role') === 'tablist';
+            };
+
+            const isInsideJobResult = (el) => Boolean(
+                el?.closest?.('a[href*="/job_detail/"], [href*="/job_detail/"], [class*="job-card"], [class*="jobCard"]')
+            );
+
+            const isSelectedFeedTab = (el) => {
+                if (!el) return false;
+                const nodes = [el, el.parentElement].filter(Boolean);
+                return nodes.some(node => {
+                    const ariaSelected = String(node.getAttribute?.('aria-selected') || '').toLowerCase();
+                    const ariaCurrent = String(node.getAttribute?.('aria-current') || '').toLowerCase();
+                    const descriptor = `${node.className || ''}`;
+                    return ariaSelected === 'true'
+                        || ['page', 'true'].includes(ariaCurrent)
+                        || /(^|[\s_-])(active|selected|checked|current)([\s_-]|$)/i.test(descriptor);
+                });
+            };
+
+            const feedTabCandidate = (el, options = {}) => {
+                let clickable = feedTabClickable(el);
+                let text = feedTabText(clickable);
+                const ownText = feedTabText(el);
+                if (
+                    tools.isCompositeFeedName(text)
+                    && (tools.isSystemFeedName(ownText) || tools.isStrongCustomFeedName(ownText))
+                ) {
+                    clickable = el;
+                    text = ownText;
+                }
+                if (!text || text.length > 32) return null;
+                if (tools.isCompositeFeedName(text)) return null;
+                if (!isVisibleFeedElement(clickable)) return null;
+                if (isInsideJobResult(clickable)) return null;
+                const rect = clickable.getBoundingClientRect();
+                if (rect.top > 430 || rect.height > 64) return null;
+                const isSystem = tools.isSystemFeedName(text);
+                if (!isSystem && !tools.isLikelyCustomFeedName(text)) return null;
+                if (!isSystem && !options.allowLoose && !hasFeedTabSemantics(clickable)) return null;
+                return {
+                    name: text,
+                    element: clickable,
+                    isSystem,
+                    selected: isSelectedFeedTab(clickable),
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top),
+                };
+            };
+
+            const uniqueFeedTabs = (items) => {
+                const map = new Map();
+                for (const item of items) {
+                    if (!item) continue;
+                    const key = item.name;
+                    const previous = map.get(key);
+                    if (!previous || item.top < previous.top || item.left < previous.left) {
+                        map.set(key, item);
+                    }
+                }
+                return Array.from(map.values()).sort((a, b) => (a.top - b.top) || (a.left - b.left));
+            };
+
+            const likelyFeedContainers = (sourceEls) => {
+                const containers = new Set();
+                for (const el of sourceEls) {
+                    const semantic = hasFeedTabSemantics(feedTabClickable(el));
+                    if (!semantic) continue;
+                    let container = el;
+                    for (let depth = 0; container && depth < 4; depth++) {
+                        const rect = container.getBoundingClientRect();
+                        const descriptor = `${container.className || ''} ${container.getAttribute?.('role') || ''}`;
+                        const hasTabHint = /tab|recommend|feed|job-expect|expect/i.test(descriptor);
+                        const plausibleRow = rect.top < 430 && rect.height <= 180 && rect.width >= 80;
+                        if (plausibleRow && (hasTabHint || semantic)) {
+                            containers.add(container);
+                        }
+                        container = container.parentElement;
+                    }
+                }
+                return Array.from(containers);
+            };
+
+            const discoverPreferredFeedTabs = async () => {
+                if (!tools.isPreferredFeedPath() || OPTIONS.preferredFeedMode === 'off') {
+                    return { reliable: true, tabs: [], reason: 'preferred_feed_disabled' };
+                }
+                const sourceEls = Array.from(document.querySelectorAll('a,button,[role="tab"],li,span,div'))
+                    .filter(isVisibleFeedElement);
+                const systemEls = sourceEls.filter(el => tools.isSystemFeedName(feedTabText(el)));
+
+                const candidates = [];
+                for (const systemEl of systemEls.slice(0, 3)) {
+                    let container = systemEl;
+                    for (let depth = 0; container && depth < 6; depth++) {
+                        const rect = container.getBoundingClientRect();
+                        if (rect.top < 430 && rect.height <= 220 && rect.width >= 80) {
+                            container.querySelectorAll('a,button,[role="tab"],li,span,[class*="tab"],[class*="Tab"]').forEach(el => {
+                                candidates.push(feedTabCandidate(el, { allowLoose: true }));
+                            });
+                        }
+                        container = container.parentElement;
+                    }
+                    candidates.push(feedTabCandidate(systemEl));
+                }
+                for (const container of likelyFeedContainers(sourceEls)) {
+                    container.querySelectorAll('a,button,[role="tab"],li,span,[class*="tab"],[class*="Tab"]').forEach(el => {
+                        candidates.push(feedTabCandidate(el));
+                    });
+                }
+                for (const el of sourceEls) {
+                    const ownText = feedTabText(el);
+                    const clickableText = feedTabText(feedTabClickable(el));
+                    if (tools.isStrongCustomFeedName(ownText) || tools.isStrongCustomFeedName(clickableText)) {
+                        candidates.push(feedTabCandidate(el, { allowLoose: true }));
+                    }
+                }
+
+                const allTabs = uniqueFeedTabs(candidates).filter(Boolean);
+                const hasSystem = allTabs.some(tab => tab.isSystem);
+                const customTabs = allTabs.filter(tab => !tab.isSystem);
+                if (!hasSystem && !customTabs.length) {
+                    return {
+                        reliable: true,
+                        tabs: [],
+                        reason: 'custom_tabs_not_found',
+                        candidates: allTabs.map(tab => tab.name),
+                    };
+                }
+                return {
+                    reliable: true,
+                    tabs: customTabs,
+                    reason: customTabs.length
+                        ? (hasSystem ? 'custom_tabs_found' : 'custom_tabs_found_without_system_tab')
+                        : 'custom_tabs_not_found',
+                    candidates: allTabs.map(tab => tab.name),
+                };
+            };
+
+            const selectPreferredFeedTab = async (index) => {
+                const expectedTab = feedTabs[index];
+                if (!expectedTab) return false;
+                const refreshed = await discoverPreferredFeedTabs();
+                const tab = refreshed.reliable
+                    ? refreshed.tabs.find(item => item.name === expectedTab.name)
+                    : null;
+                if (!tab?.element || !document.body.contains(tab.element)) {
+                    await api.event('preferred_feed_tab_missing', `推荐源已失效，跳过: ${expectedTab.name}`, 'script', 'warning', {
+                        name: expectedTab.name,
+                        index,
+                        reason: refreshed.reason || 'detached_tab',
+                    });
+                    return false;
+                }
+                currentFeedTabIndex = index;
+                currentFeedTabName = expectedTab.name;
+                feedTabProcessedCount = 0;
+                feedTabMaxJobs = OPTIONS.preferredFeedMaxJobsPerTab;
+                setSearchAction(`切换自定义推荐源: ${expectedTab.name}`);
+                logger.add(`开始处理推荐源: ${expectedTab.name}`);
+                await api.event('preferred_feed_tab_started', `开始处理推荐源: ${expectedTab.name}`, 'script', 'info', {
+                    name: expectedTab.name,
+                    index,
+                    total: feedTabs.length,
+                    maxJobs: feedTabMaxJobs,
+                });
+                const beforeFingerprint = jobListFingerprint(document);
+                const selectedBefore = isSelectedFeedTab(tab.element);
+                tab.element.click();
+                const verifyStartedAt = Date.now();
+                let selected = selectedBefore;
+                let listChanged = false;
+                while (Date.now() - verifyStartedAt < 8000) {
+                    await tools.asyncSleep(400);
+                    const verifyResult = await discoverPreferredFeedTabs();
+                    const liveTab = verifyResult.tabs?.find(item => item.name === expectedTab.name);
+                    selected = Boolean(liveTab?.selected || isSelectedFeedTab(liveTab?.element));
+                    listChanged = jobListFingerprint(document) !== beforeFingerprint;
+                    if (selected || listChanged) break;
+                }
+                if (!selected && !listChanged) {
+                    await api.event('preferred_feed_tab_switch_unconfirmed', `推荐源切换未确认，跳过: ${expectedTab.name}`, 'script', 'warning', {
+                        name: expectedTab.name,
+                        index,
+                        beforeFingerprint,
+                    });
+                    return false;
+                }
+                resetKeywordState();
+                lastJobListEventKey = '';
+                currentJobSource = 'preferred_feed';
+                await api.event('preferred_feed_tab_switch_confirmed', `推荐源切换已确认: ${expectedTab.name}`, 'script', 'info', {
+                    name: expectedTab.name,
+                    index,
+                    selected,
+                    listChanged,
+                });
+                return true;
+            };
+
+            const finishPreferredFeedsAndOpenKeywordSearch = async (reason = '') => {
+                preferredFeedsDone = true;
+                savePreferredFeedState({
+                    done: true,
+                    reason,
+                    tabs: feedTabs.map(tab => tab.name),
+                });
+                currentJobSource = 'keyword_search';
+                currentFeedTabIndex = -1;
+                currentFeedTabName = '';
+                feedTabProcessedCount = 0;
+                const message = '所有用户推荐源处理完成，进入关键词搜索';
+                logger.add(message);
+                await api.event('preferred_feed_finished', message, 'script', 'info', {
+                    reason,
+                    tabs: feedTabs.map(tab => tab.name),
+                });
+                tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
+            };
+
+            const switchToNextPreferredFeedTab = async (reason = '') => {
+                if (currentJobSource !== 'preferred_feed') return false;
+                let nextIndex = currentFeedTabIndex + 1;
+                while (nextIndex < feedTabs.length) {
+                    if (currentFeedTabName) {
+                        await api.event('preferred_feed_tab_finished', `推荐源 ${currentFeedTabName} 已处理 ${feedTabProcessedCount}/${feedTabMaxJobs || '不限'}，切换下一个推荐源`, 'script', 'info', {
+                            name: currentFeedTabName,
+                            processed: feedTabProcessedCount,
+                            maxJobs: feedTabMaxJobs,
+                            reason,
+                        });
+                    }
+                    if (await selectPreferredFeedTab(nextIndex)) return true;
+                    nextIndex += 1;
+                }
+                await finishPreferredFeedsAndOpenKeywordSearch(reason);
+                return false;
+            };
+
+            const markPreferredFeedJobHandled = async (reason = '') => {
+                if (currentJobSource !== 'preferred_feed') return false;
+                feedTabProcessedCount += 1;
+                if (feedTabMaxJobs > 0 && feedTabProcessedCount >= feedTabMaxJobs) {
+                    await api.event('preferred_feed_tab_limit_reached', `推荐源 ${currentFeedTabName} 已处理 ${feedTabProcessedCount}/${feedTabMaxJobs}，切换下一个推荐源`, 'script', 'info', {
+                        name: currentFeedTabName,
+                        processed: feedTabProcessedCount,
+                        maxJobs: feedTabMaxJobs,
+                        reason,
+                    });
+                    await switchToNextPreferredFeedTab('推荐源处理上限已达');
+                    return true;
+                }
+                return false;
+            };
+
+            const preparePreferredFeeds = async () => {
+                if (!tools.isPreferredFeedPath() || OPTIONS.preferredFeedMode === 'off') return false;
+                currentJobSource = 'preferred_feed';
+                feedSwitchAttempted = true;
+                feedSwitchReason = 'discovering_custom_tabs';
+                const result = await discoverPreferredFeedTabs();
+                if (!result.reliable) {
+                    const message = `无法可靠识别用户自定义推荐 Tab，已跳过推荐源并进入关键词搜索: ${result.reason}`;
+                    logger.add(message);
+                    setSearchAction(message);
+                    await api.event('preferred_feed_unreliable', message, 'script', 'warning', {
+                        reason: result.reason,
+                        candidates: result.candidates || [],
+                    });
+                    await finishPreferredFeedsAndOpenKeywordSearch(`unreliable:${result.reason}`);
+                    return true;
+                }
+                feedTabs = result.tabs;
+                if (!feedTabs.length) {
+                    await api.event('preferred_feed_no_custom_tabs', '未发现用户自定义推荐 Tab，进入关键词搜索', 'script', 'info', {
+                        reason: result.reason,
+                        candidates: result.candidates || [],
+                    });
+                    logger.add('未发现用户自定义推荐 Tab，进入关键词搜索');
+                    await finishPreferredFeedsAndOpenKeywordSearch('no_custom_tabs');
+                    return true;
+                }
+                logger.add(`发现用户自定义推荐 Tab: ${feedTabs.map(tab => tab.name).join('、')}`);
+                await api.event('preferred_feed_tabs_found', `发现用户自定义推荐 Tab: ${feedTabs.map(tab => tab.name).join('、')}`, 'script', 'info', {
+                    tabs: feedTabs.map(tab => tab.name),
+                    reason: result.reason,
+                    candidates: result.candidates || [],
+                });
+                if (await selectPreferredFeedTab(0)) return true;
+                return switchToNextPreferredFeedTab('首个推荐源切换未确认');
             };
 
             const getJobHrefs = async () => {
@@ -2238,22 +2867,31 @@
                         hrefs = collect();
                         newHrefs = hrefs.filter(href => !seenJobHrefs.has(href) && !backendProcessedHrefs.has(href));
                     }
-                    const scrollRounds = Math.max(0, Math.min(2, Number(OPTIONS.searchResultScrollRounds) || 0));
+                    const scrollRounds = Math.max(0, Math.min(5, Number(OPTIONS.searchResultScrollRounds) || 0));
                     for (let scrollRound = 1; !newHrefs.length && scrollRound <= scrollRounds; scrollRound++) {
-                        await scrollSearchResultsOnce(scrollRound);
+                        const scrollWorked = await scrollSearchResultsOnce(scrollRound);
                         hrefs = collect();
                         newHrefs = hrefs.filter(href => !seenJobHrefs.has(href) && !backendProcessedHrefs.has(href));
+                        if (!scrollWorked) break;
                     }
                     const eventKey = `${hrefs.length}:${newHrefs.length}:${hrefs[hrefs.length - 1] || ''}`;
                     if (eventKey !== lastJobListEventKey) {
                         lastJobListEventKey = eventKey;
-                        await api.event('job_list_found', `发现职位链接 ${hrefs.length} 个，新职位 ${newHrefs.length} 个`, 'script', 'info', { count: hrefs.length, newCount: newHrefs.length });
+                        await api.event('job_list_found', `发现职位链接 ${hrefs.length} 个，新职位 ${newHrefs.length} 个`, 'script', 'info', {
+                            count: hrefs.length,
+                            newCount: newHrefs.length,
+                            source: currentJobSource,
+                            feedTabName: currentFeedTabName,
+                            keyword: this.tags[currentTagIdx] || '',
+                        });
                     }
                     if (hrefs.length && !newHrefs.length) {
                         const recentlyProcessedCount = hrefs.filter(href => backendProcessedHrefs.has(href)).length;
                         const seenCount = hrefs.filter(href => seenJobHrefs.has(href)).length;
                         await api.event('all_results_recently_processed', '搜索结果已全部处理或近期跳过', 'script', 'info', {
                             keyword: this.tags[currentTagIdx] || '',
+                            source: currentJobSource,
+                            feedTabName: currentFeedTabName,
                             count: hrefs.length,
                             recentlyProcessedCount,
                             seenCount,
@@ -2275,18 +2913,21 @@
                 let hrefs;
                 [jobHrefs, hrefs] = await getJobHrefs();
                 elsLen = hrefs.length;
-                await resetManualInterventionRecovery('人工校验恢复成功，已读取到正常职位列表');
-                await resetPageFailureRecovery('页面失败恢复成功，已读取到正常职位列表');
                 if (jobHrefs.length > 0) {
                     page++;
                     logger.add(`开始浏览第 ${page} 批`);
                     return true;
                 }
                 const keyword = this.tags[currentTagIdx] || '';
-                logger.add(`当前关键词没有新职位: ${keyword || '-'}`);
-                await api.event('job_list_empty', `当前关键词没有新职位: ${keyword || '-'}`, 'script', 'info', {
+                const sourceLabel = currentJobSource === 'preferred_feed'
+                    ? `推荐源 ${currentFeedTabName || '-'}`
+                    : `当前关键词 ${keyword || '-'}`;
+                logger.add(`${sourceLabel} 没有新职位`);
+                await api.event('job_list_empty', `${sourceLabel} 没有新职位`, 'script', 'info', {
                     page,
                     keyword,
+                    source: currentJobSource,
+                    feedTabName: currentFeedTabName,
                     knownCount: elsLen,
                 });
                 return false;
@@ -2301,15 +2942,19 @@
                 lastJobListEventKey = '';
             };
 
-            const beginSearchRound = async (reason = '') => {
+            const beginSearchRound = async (reason = '', startTagIdx = 0) => {
                 searchRoundId += 1;
                 tagsCheckedThisRound.clear();
                 cooldownUntil = 0;
-                currentTagIdx = 0;
+                currentTagIdx = this.tags.length
+                    ? Math.min(Math.max(0, Number(startTagIdx) || 0), this.tags.length - 1)
+                    : 0;
                 resetKeywordState();
+                saveSearchRoundState();
                 await api.event('search_round_started', `开始第 ${searchRoundId} 轮关键词搜索`, 'script', 'info', {
                     searchRoundId,
                     reason,
+                    startTagIdx: currentTagIdx,
                     tags: this.tags,
                     cooldownMinutes: OPTIONS.searchRoundCooldownMinutes,
                 });
@@ -2318,14 +2963,15 @@
             const markCurrentTagChecked = () => {
                 if (this.tags[currentTagIdx]) {
                     tagsCheckedThisRound.add(currentTagIdx);
+                    saveSearchRoundState();
                 }
             };
 
             const tagSearchDelayMs = () => {
-                const minSeconds = Math.max(3, Number(OPTIONS.tagSearchDelaySeconds) || 10);
+                const minSeconds = Math.max(3, Number(OPTIONS.tagSearchDelaySeconds) || 20);
                 const maxSeconds = Math.max(
                     minSeconds,
-                    Number(OPTIONS.tagSearchDelayMaxSeconds) || 30,
+                    Number(OPTIONS.tagSearchDelayMaxSeconds) || 45,
                 );
                 const randomSeconds = minSeconds + Math.floor(Math.random() * (maxSeconds - minSeconds + 1));
                 return randomSeconds * 1000;
@@ -2349,13 +2995,26 @@
             const searchCurrentKeyword = async (reason = '', waitBefore = false) => {
                 const keyword = this.tags[currentTagIdx];
                 resetKeywordState();
+                const budget = searchBudgetSnapshot();
+                if (budget.blockedReason) {
+                    await enterSearchCooldown(budget.blockedReason, budget.nextAllowedAt);
+                    return false;
+                }
                 if (waitBefore) {
                     await waitBeforeTagSearch(keyword, reason);
                 }
                 setSearchAction(`搜索关键词: ${keyword}`);
                 await search(keyword);
+                const nextBudget = recordSearchSubmission();
                 markCurrentTagChecked();
+                await api.event('search_budget_updated', `关键词搜索预算: 本小时 ${nextBudget.hourlyCount}/${nextBudget.hourlyLimit}，今日 ${nextBudget.dailyCount}/${nextBudget.dailyLimit}`, 'script', 'info', {
+                    hourlyCount: nextBudget.hourlyCount,
+                    hourlyLimit: nextBudget.hourlyLimit,
+                    dailyCount: nextBudget.dailyCount,
+                    dailyLimit: nextBudget.dailyLimit,
+                });
                 await tools.actionSleep(1500);
+                return true;
             };
 
             const switchToNextKeyword = async (reason = '') => {
@@ -2379,7 +3038,7 @@
                         searchRoundId,
                         checkedCount: tagsCheckedThisRound.size,
                     });
-                    await searchCurrentKeyword(reason, true);
+                    if (!(await searchCurrentKeyword(reason, true))) return false;
                     if (await nextPage()) {
                         return true;
                     }
@@ -2395,21 +3054,28 @@
                 return false;
             };
 
-            const enterSearchCooldown = async (reason = '') => {
+            const enterSearchCooldown = async (reason = '', untilOverride = 0) => {
                 if (cooldownTimer) {
                     clearTimeout(cooldownTimer);
                     cooldownTimer = null;
                 }
-                const minutes = Math.max(1, Number(OPTIONS.searchRoundCooldownMinutes) || 30);
-                cooldownUntil = Date.now() + minutes * 60 * 1000;
+                const minutes = Math.max(1, Number(OPTIONS.searchRoundCooldownMinutes) || 60);
+                if (!(Number(untilOverride) > Date.now()) && cooldownUntil > Date.now()) {
+                    untilOverride = cooldownUntil;
+                }
+                cooldownUntil = Number(untilOverride) > Date.now()
+                    ? Number(untilOverride)
+                    : Date.now() + minutes * 60 * 1000;
+                saveSearchRoundState();
                 const untilText = new Date(cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false });
-                const message = `所有关键词本轮暂无新职位，冷却 ${minutes} 分钟后再搜索（预计 ${untilText}）`;
+                const remainingMinutes = Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 60000));
+                const message = `${reason || '所有关键词本轮暂无新职位'}，冷却约 ${remainingMinutes} 分钟后再搜索（预计 ${untilText}）`;
                 setSearchAction(message);
                 logger.add(message);
                 await api.event('search_round_cooldown_started', message, 'script', 'info', {
                     reason,
                     searchRoundId,
-                    cooldownMinutes: minutes,
+                    cooldownMinutes: remainingMinutes,
                     cooldownUntil: new Date(cooldownUntil).toISOString(),
                     checkedCount: tagsCheckedThisRound.size,
                 });
@@ -2432,6 +3098,7 @@
                         }
                         cooldownTimer = null;
                         cooldownUntil = 0;
+                        saveSearchRoundState();
                         if (!(await ensureSearchLease('冷却结束'))) return;
                         if (!(await syncControlFromBackend('搜索冷却结束'))) return;
                         if (this.pause) {
@@ -2439,7 +3106,7 @@
                         }
                         if (!(await ensureGreetLimitsAvailable())) return;
                         await beginSearchRound('cooldown_finished');
-                        await searchCurrentKeyword('冷却结束', false);
+                        if (!(await searchCurrentKeyword('冷却结束', false))) return;
                         if (await nextPage()) {
                             setTimeout(loop, 0);
                             return;
@@ -2659,9 +3326,17 @@
             const openGreetingChat = async (jobInfo, href, reason, attempt = 1) => {
                 if (!jobInfo.chatUrl) throw new Error('缺少聊天页地址');
                 const requestId = tools.newGreetRequestId();
+                const transactionRunId = lastBackendRunId || tools.getGreetSession().backendRunId || tools.getGreetSession().runId;
+                tools.updateGreetTransaction(transactionRunId, href, 'entry_opened', {
+                    requestId,
+                    attempt,
+                    chatUrl: jobInfo.chatUrl,
+                    title: jobInfo.title || '',
+                });
                 startGreetingWait(jobInfo, href, requestId, attempt);
                 tools.saveGreetContext({
                     requestId,
+                    transactionRunId,
                     url: href,
                     chatUrl: jobInfo.chatUrl || '',
                     title: jobInfo.title,
@@ -2720,6 +3395,26 @@
             };
 
             const sendGreetingFromSearch = async (jobInfo, href) => {
+                const transactionRunId = lastBackendRunId || tools.getGreetSession().backendRunId || tools.getGreetSession().runId;
+                const existingTransaction = tools.getGreetTransaction(transactionRunId, href);
+                if (tools.isTerminalGreetTransaction(existingTransaction)) {
+                    const message = `岗位已有不可重复的打招呼事务状态 ${existingTransaction.state}，已跳过: ${jobInfo.title}`;
+                    logger.add(message);
+                    await api.event('greet_transaction_duplicate_blocked', message, 'script', 'warning', {
+                        title: jobInfo.title,
+                        url: href,
+                        state: existingTransaction.state,
+                        transactionId: existingTransaction.id || '',
+                    });
+                    finishJobProgress('打招呼事务去重');
+                    if (await markPreferredFeedJobHandled('打招呼事务去重')) return;
+                    setTimeout(loop, 0);
+                    return;
+                }
+                tools.updateGreetTransaction(transactionRunId, href, 'prepared', {
+                    title: jobInfo.title || '',
+                    company: jobInfo.company || '',
+                });
                 logger.add(`正在给职位 [${jobInfo.title}] 发送打招呼消息`);
                 await api.event('greet_started', `准备打招呼: ${jobInfo.title}`, 'script', 'info', { title: jobInfo.title, score: jobInfo.score });
                 if (!jobInfo.addUrl && !jobInfo.chatUrl) {
@@ -2731,6 +3426,7 @@
                     }, jobInfo, 'completed');
                     await api.event('greet_failed', `缺少打招呼链接: ${jobInfo.title}`, 'script', 'error', { title: jobInfo.title, source: jobInfo.source || 'detail' });
                     finishJobProgress('缺少打招呼入口');
+                    if (await markPreferredFeedJobHandled('缺少打招呼入口')) return;
                     setTimeout(loop, 0);
                     return;
                 }
@@ -2740,6 +3436,7 @@
                     await api.createAction('already_contacted', { reason }, jobInfo, 'completed');
                     await api.event('already_contacted', `${reason}: ${jobInfo.title}`, 'script', 'info', { title: jobInfo.title, url: href, reason });
                     finishJobProgress('已沟通跳过');
+                    if (await markPreferredFeedJobHandled('已沟通跳过')) return;
                     setTimeout(loop, 0);
                     return;
                 }
@@ -2787,6 +3484,7 @@
                         await api.event('greet_failed', `打招呼入口失败且无聊天页兜底: ${e}`, 'script', 'error', { title: jobInfo.title });
                     }
                     finishJobProgress('打招呼失败');
+                    if (await markPreferredFeedJobHandled('打招呼失败')) return;
                     setTimeout(loop, 0);
                 }
             };
@@ -2806,7 +3504,7 @@
                         );
                         return;
                     }
-                    // 鍛婄煡缁撴灉
+                    // 处理聊天页回传的发送结果。
                     await handleGreetingResult(data || {});
                     return;
                 });
@@ -2865,6 +3563,19 @@
                     logger.divider();
 
                     if (jobHrefs.length === 0) {
+                        if (currentJobSource === 'preferred_feed') {
+                            if (feedTabMaxJobs > 0 && feedTabProcessedCount >= feedTabMaxJobs) {
+                                await switchToNextPreferredFeedTab('推荐源处理上限已达');
+                                return;
+                            }
+                            const hasNextFeedJobs = await nextPage();
+                            if (hasNextFeedJobs) {
+                                setTimeout(loop, 0);
+                                return;
+                            }
+                            await switchToNextPreferredFeedTab('推荐源暂无新职位');
+                            return;
+                        }
                         const hasNext = await nextPage();
                         if (hasNext) {
                             setTimeout(loop, 0);
@@ -2901,6 +3612,7 @@
                         await api.createAction('already_contacted', { reason }, jobInfo, 'completed');
                         await api.event('decision_skip', `跳过已沟通职位: ${jobInfo.title}`, 'script', 'info', { title: jobInfo.title, url: href, reason });
                         finishJobProgress('已沟通跳过');
+                        if (await markPreferredFeedJobHandled('已沟通跳过')) return;
                         setTimeout(loop, 0);
                         return;
                     }
@@ -2957,6 +3669,7 @@
                             await api.event('decision_skip', `跳过职位: ${jobInfo.title} / ${score}`, 'script', 'info', { title: jobInfo.title, score, recommendation: analysis.recommendation, reason: analysis.match_reason || analysis.blocked_reason || '' });
                         }
                         finishJobProgress('跳过');
+                        if (await markPreferredFeedJobHandled('跳过')) return;
                         setTimeout(loop, 0);
                     }
                 } catch (e) {
@@ -3001,6 +3714,21 @@
                     applyBackendConfig(bootStatus.config);
                     lastBackendRunId = bootStatus.run_id || lastBackendRunId;
                     await ensureSessionForBackendRun(lastBackendRunId, 'program_start');
+                    if (shouldPreferFeedBeforeKeywordSearch()) {
+                        currentJobSource = 'preferred_feed';
+                        feedSwitchAttempted = true;
+                        feedSwitchReason = 'redirect_to_preferred_feed_before_keyword';
+                        const message = '本轮将优先处理用户自定义推荐 Tab，正在打开推荐页';
+                        logger.add(message);
+                        setSearchAction(message);
+                        await api.event('preferred_feed_redirect', message, 'script', 'info', {
+                            target: SEARCHPATH.preferred,
+                            runKey: preferredFeedRunKey(),
+                        });
+                        await api.heartbeat('search', 'running', message, scriptHeartbeatDetail());
+                        tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
+                        return;
+                    }
                     // 开始广播
                     startBroadcast();
                     // 获取标签
@@ -3032,11 +3760,43 @@
                         await api.heartbeat('search', 'error', '缺少已启用打招呼用语');
                         return;
                     }
-                    logger.add('获取自我介绍成功: ' + this.introduce);
+                    logger.add(`获取已确认打招呼用语成功，长度 ${this.introduce.length} 字`);
+                    if (await preparePreferredFeeds()) {
+                        if (currentJobSource === 'preferred_feed' && !this.pause && feedTabs.length) {
+                            const hasFeedJobs = await nextPage();
+                            if (hasFeedJobs) {
+                                loop();
+                            } else {
+                                await switchToNextPreferredFeedTab('推荐源启动后没有读取到职位列表');
+                            }
+                        }
+                        return;
+                    }
                     // 开始搜索
-                    await beginSearchRound('program_start');
+                    const resumeTagIdx = currentTagIdx;
+                    const restoredRound = restoreSearchRoundState();
+                    if (restoredRound && cooldownUntil > Date.now()) {
+                        await enterSearchCooldown('恢复上次搜索冷却', cooldownUntil);
+                        return;
+                    }
+                    if (!restoredRound) {
+                        await beginSearchRound('program_start', resumeTagIdx);
+                    } else if (this.tags.length) {
+                        currentTagIdx = Math.min(currentTagIdx, this.tags.length - 1);
+                    }
                     setSearchAction(`准备搜索关键词: ${this.tags[currentTagIdx]}`);
-                    await searchCurrentKeyword('首个关键词', false);
+                    if (restoredRound && tagsCheckedThisRound.has(currentTagIdx)) {
+                        const existingJobs = await nextPage();
+                        if (existingJobs) {
+                            loop();
+                            return;
+                        }
+                        const moved = await switchToNextKeyword('刷新后继续未完成轮次');
+                        if (moved) loop();
+                        else await enterSearchCooldown('恢复轮次后所有关键词无新职位');
+                        return;
+                    }
+                    if (!(await searchCurrentKeyword('首个关键词', false))) return;
                     const hasJobs = await nextPage();
                     if (!hasJobs) {
                         const hasNextKeyword = await switchToNextKeyword('搜索后没有读取到职位列表');
@@ -3306,7 +4066,7 @@
                 };
             };
 
-            const sendMsg = (text) => {
+            const sendMsg = (text, greetContext = {}) => {
                 return new Promise(async (resolve, reject) => {
                     try {
                         const platformLimit = tools.detectPlatformLimit();
@@ -3314,7 +4074,7 @@
                         const interruption = tools.detectManualInterruption();
                         if (interruption) throw new Error(`需要人工处理: ${interruption}`);
                         if (!String(text || '').trim()) throw new Error('发送内容为空');
-                        await pageApi.event('message_send_started', `准备发送消息: ${String(text).slice(0, 40)}`, 'script', 'info', { preview: String(text).slice(0, 120) });
+                        await pageApi.event('message_send_started', '准备发送已确认的打招呼消息', 'script', 'info', { length: String(text).length });
                         const ipt = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.CHATINPUT);
                         const actualText = tools.inputEditableText(ipt, text);
                         if (!actualText || !actualText.includes(String(text).slice(0, 10))) {
@@ -3343,10 +4103,21 @@
                             throw error;
                         }
                         const beforeSnapshot = getSelfMessageSnapshot();
+                        tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'send_clicked', {
+                            requestId: greetContext.requestId || '',
+                            attempt: Number(greetContext.attempt || 1),
+                            clickedAt: Date.now(),
+                        });
                         btn.click();
                         const confirmation = await waitForMessageSendConfirmed(text, ipt, beforeSnapshot);
                         if (!confirmation.confirmed) {
-                            const error = new Error('message_send_unconfirmed');
+                            tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'unknown', {
+                                requestId: greetContext.requestId || '',
+                                attempt: Number(greetContext.attempt || 1),
+                                error: 'message_send_unconfirmed',
+                            });
+                            const error = new Error('greet_delivery_unknown: message_send_unconfirmed');
+                            error.deliveryUnknown = true;
                             error.detail = {
                                 button: tools.elementBrief(btn),
                                 input: tools.elementBrief(ipt),
@@ -3354,6 +4125,11 @@
                             };
                             throw error;
                         }
+                        tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'confirmed', {
+                            requestId: greetContext.requestId || '',
+                            attempt: Number(greetContext.attempt || 1),
+                            confirmedAt: Date.now(),
+                        });
                         await pageApi.event('message_send_finished', '消息已点击发送', 'script', 'info', {
                             button: tools.elementBrief(btn),
                             input: tools.elementBrief(ipt),
@@ -3429,7 +4205,7 @@
                     if (!introduce) throw new Error('未启用打招呼用语');
                     await tools.actionSleep();
                     ensureCurrentGreetRequest();
-                    await sendMsg(introduce);
+                    await sendMsg(introduce, claimedContext);
                     const greetContext = claimedContext || {};
                     await pageApi.createAction('greet', {
                         message: introduce,
@@ -3460,6 +4236,21 @@
                     });
                 } catch (e) {
                     heartbeatActive = false;
+                    const transaction = tools.getGreetTransaction(claimedContext.transactionRunId, claimedContext.url);
+                    const deliveryUnknown = Boolean(e.deliveryUnknown)
+                        || ['send_clicked', 'unknown'].includes(String(transaction.state || ''));
+                    if (deliveryUnknown) {
+                        tools.updateGreetTransaction(claimedContext.transactionRunId, claimedContext.url, 'unknown', {
+                            requestId: greetRequestId,
+                            attempt: greetAttempt,
+                            error: String(e),
+                        });
+                        try {
+                            await pageApi.control('pause');
+                        } catch (pauseError) {
+                            await pageApi.event('greet_unknown_pause_failed', `发送结果未知后暂停失败: ${pauseError}`, 'script', 'error');
+                        }
+                    }
                     await pageApi.heartbeat('chat_greet', 'error', String(e));
                     await pageApi.event('greet_failed', `打招呼失败: ${e}`, 'script', 'error');
                     this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {
@@ -3467,12 +4258,18 @@
                         error: String(e),
                         greetRequestId,
                         attempt: greetAttempt,
-                        retryable: !(tools.isPlatformLimitError(e) || tools.isManualInterruptionError(e)),
+                        deliveryUnknown,
+                        retryable: !deliveryUnknown && !(tools.isPlatformLimitError(e) || tools.isManualInterruptionError(e)),
                     }).catch(async (sendError) => {
                         await pageApi.event('broadcast_send_failed', `打招呼失败结果回传失败: ${sendError}`, 'script', 'error');
                     }).finally(() => {
                         this.broadcast.destroy();
-                        closeTemporaryChatPage(greetRequestId);
+                        if (deliveryUnknown) {
+                            tools.releaseGreetClaim(greetRequestId);
+                            banner('发送结果无法确认，自动化已暂停，请人工检查此页面');
+                        } else {
+                            closeTemporaryChatPage(greetRequestId);
+                        }
                     });
                 }
             };
@@ -3491,8 +4288,16 @@
                 }
                 const contextChatUrl = tools.normalUrl(greetContext.chatUrl || '');
                 const currentChatUrl = tools.normalUrl(location.href) || location.href;
+                const chatIdentity = (value) => {
+                    try {
+                        const parsed = new URL(value, location.origin);
+                        return `${parsed.origin}${parsed.pathname}`;
+                    } catch (e) {
+                        return String(value || '').split(/[?#]/)[0];
+                    }
+                };
                 const isLikelySameChat = contextChatUrl
-                    ? currentChatUrl.split('#')[0] === contextChatUrl.split('#')[0]
+                    ? chatIdentity(currentChatUrl) === chatIdentity(contextChatUrl)
                     : Boolean(greetContext.url || greetContext.title || greetContext.greeting);
                 const isRecentGreetWindow = greetAge !== null && greetAge < OPTIONS.timestampTimeout;
                 const hasGreetContext = Boolean(greetContext && (
@@ -3536,11 +4341,29 @@
                         });
                     }
                     if (!isLikelySameChat) {
-                        await pageApi.event('greet_chat_url_mismatch', '打招呼聊天页 URL 与打开时 URL 不一致，已按 requestId 继续', 'script', 'warning', {
+                        tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'failed', {
+                            requestId: greetContext.requestId || '',
+                            error: 'greet_chat_url_mismatch',
+                        });
+                        await pageApi.event('greet_chat_url_mismatch', '打招呼聊天页路径与目标不一致，已暂停且不会发送', 'script', 'error', {
                             requestId: greetContext.requestId || '',
                             contextChatUrl,
                             currentChatUrl,
                         });
+                        await pageApi.control('pause').catch(() => null);
+                        this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {
+                            success: false,
+                            error: 'greet_chat_url_mismatch',
+                            greetRequestId: greetContext.requestId || '',
+                            attempt: Number(greetContext.attempt || 1),
+                            retryable: false,
+                            pauseRequired: true,
+                            preservePage: true,
+                        }).catch(async (sendError) => {
+                            await pageApi.event('broadcast_send_failed', `聊天页身份异常回传失败: ${sendError}`, 'script', 'error');
+                        });
+                        banner('聊天页与目标不一致，自动化已暂停，请人工检查');
+                        return;
                     }
                     sayHi(effectiveClaim);
                 }
@@ -3586,25 +4409,39 @@
                 }
                 api.event('script_city_home_redirect', `城市首页自动进入职位搜索页: ${path}`, 'script', 'info', {
                     path,
-                    target: SEARCHPATH.zhipin,
+                    target: SEARCHPATH.preferred,
                 });
                 const logger = new Logger(() => {
-                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
+                    tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
                 });
-                logger.add(`当前是城市首页 ${path}，即将进入职位搜索页`);
+                logger.add(`当前是城市首页 ${path}，即将进入推荐岗位页`);
                 setTimeout(() => {
-                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
+                    tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
                 }, 800);
             }
             // 其他未知页面只提示，不盲目操作。
             else {
                 new Api().event('script_page_unmatched', `未匹配页面路径: ${path}`, 'script', 'info', { path });
                 new Logger(() => {
-                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
+                    tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
                 });
             }
         }
     }
 
-    const chatbotZhou = new Zhipin().run();
+    if (globalThis.__JOB_SEEKER_TEST_MODE__) {
+        globalThis.__JOB_SEEKER_TEST_HOOKS__ = Object.freeze({
+            detectInterruptionText: (text) => tools.detectInterruptionText(text),
+            detectPlatformLimitText: (text) => tools.detectPlatformLimitText(text),
+            detectQuotaWarningText: (text) => tools.detectQuotaWarningText(text),
+            isSystemFeedName: (text) => tools.isSystemFeedName(text),
+            isIgnoredFeedName: (text) => tools.isIgnoredFeedName(text),
+            isCompositeFeedName: (text) => tools.isCompositeFeedName(text),
+            isLikelyCustomFeedName: (text) => tools.isLikelyCustomFeedName(text),
+            isStrongCustomFeedName: (text) => tools.isStrongCustomFeedName(text),
+        });
+        return;
+    }
+
+    new Zhipin().run();
 })();
