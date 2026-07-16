@@ -93,9 +93,37 @@
                 JOBLISTCTN: '.job-list-container', // 职位列表容器
                 JOBLIST: '.rec-job-list', // 职位列表
                 JOBHREFS: '.job-card-box .job-name', // 职位链接
-                JOBLIST_CANDIDATES: ['.rec-job-list', '.job-list-box', '.job-list-container', '.search-job-result'],
-                JOB_SCROLL_CANDIDATES: ['.job-list-container', '.job-list-box', '.search-job-result', '.rec-job-list'],
-                JOBHREFS_CANDIDATES: ['.job-card-box .job-name', '.job-card-wrapper .job-title a', 'a[href*="/job_detail/"]'],
+                JOBLIST_CANDIDATES: [
+                    '.rec-job-list',
+                    '.job-list-box',
+                    '.job-list-container',
+                    '.search-job-result',
+                    '.recommend-job-list',
+                    '.job-recommend-list',
+                    '.job-card-list',
+                    '[class*="job-list"]',
+                    '[class*="recommend-list"]',
+                ],
+                JOB_SCROLL_CANDIDATES: [
+                    '.job-list-container',
+                    '.job-list-box',
+                    '.search-job-result',
+                    '.rec-job-list',
+                    '.recommend-job-list',
+                    '.job-recommend-list',
+                    '.job-card-list',
+                    '[class*="job-list"]',
+                    '[class*="recommend-list"]',
+                    '[class*="job-recommend"]',
+                ],
+                JOBHREFS_CANDIDATES: [
+                    '.job-card-box .job-name',
+                    '.job-card-wrapper .job-title a',
+                    '[class*="job-card"] a[href*="/job_detail/"]',
+                    '[class*="job-list"] a[href*="/job_detail/"]',
+                    '[class*="recommend"] a[href*="/job_detail/"]',
+                    'a[href*="/job_detail/"]',
+                ],
             },
             DETAIL: {
                 STARTCHAT: [
@@ -924,6 +952,18 @@
         isElementMissingError(value) {
             const content = String(value || '');
             return content.includes('未找到目标元素') || content.includes('target element') || content.includes('not found');
+        },
+        isChatEntryRejectedError(value) {
+            const content = String(value || '');
+            const patterns = [
+                '无法进行沟通',
+                '不能进行沟通',
+                '暂无法沟通',
+                '沟通失败',
+                '打招呼入口失败',
+                'BOSS 拒绝打招呼入口请求',
+            ];
+            return patterns.some(pattern => content.includes(pattern));
         },
         contactedReasonFromElement(el) {
             if (!el) return '';
@@ -1914,6 +1954,12 @@
                 }
                 const previous = { ...session };
                 const next = tools.startGreetSession(true, backendRunId);
+                preferredFeedsDone = false;
+                feedTabs = [];
+                currentFeedTabIndex = -1;
+                currentFeedTabName = '';
+                feedTabProcessedCount = 0;
+                localStorage.removeItem(preferredFeedStateKey);
                 resetProgress();
                 const message = `本轮计数已按后端运行重置: ${previous.count || 0} -> 0`;
                 logger.add(message);
@@ -2030,7 +2076,8 @@
                         success: false,
                         error: 'greet_window_timeout',
                         failureCode: 'greet_timeout',
-                        retryable: false,
+                        retryable: true,
+                        attempt: Math.max(1, Number(attempt || 1)),
                         requestId,
                     });
                     return;
@@ -2444,25 +2491,63 @@
             // 获取职位链接
             const searchResultScrollDelayMs = () => 3000 + Math.floor(Math.random() * 2000);
 
+            const jobLinkSelector = () => SELECTORS.ZHIPIN.SEARCH.JOBHREFS_CANDIDATES.join(',');
+
+            const elementDescriptorText = (el) => `${el?.id || ''} ${el?.className || ''} ${el?.getAttribute?.('role') || ''}`;
+
+            const jobLinkCount = (el) => el?.querySelectorAll?.(jobLinkSelector()).length || 0;
+
+            const jobCardCount = (el) => el?.querySelectorAll?.('[class*="job-card"], [class*="jobCard"], [class*="job-item"], [class*="jobItem"]').length || 0;
+
+            const isDetailLikeContainer = (el) => {
+                const descriptor = elementDescriptorText(el);
+                return /job[-_ ]?detail|detail[-_ ]?container|job[-_ ]?banner|job[-_ ]?sec|sider|side|company|chat/i.test(descriptor);
+            };
+
+            const isLikelyLeftJobArea = (el) => {
+                if (!el || el === document.body || el === document.documentElement) return false;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 180 || rect.height < 180) return false;
+                if (rect.left > window.innerWidth * 0.72) return false;
+                if (rect.bottom < 120 || rect.top > window.innerHeight - 120) return false;
+                return true;
+            };
+
+            const elementHasJobSignal = (el) => {
+                if (!el) return false;
+                const descriptor = elementDescriptorText(el);
+                const hasJobLinks = jobLinkCount(el) >= 2;
+                const hasJobCard = jobCardCount(el) >= 2;
+                const classSignal = /job[-_ ]?(list|result|recommend|rec|card)|recommend[-_ ]?list|rec[-_ ]?job|list|card/i.test(descriptor);
+                return hasJobLinks || hasJobCard || classSignal;
+            };
+
             const isScrollableJobContainer = (el) => {
                 if (!el || el === document.body || el === document.documentElement) return false;
+                if (isDetailLikeContainer(el) && jobLinkCount(el) < 3 && jobCardCount(el) < 3) return false;
                 const style = window.getComputedStyle(el);
                 const overflowY = `${style.overflowY || ''} ${style.overflow || ''}`;
                 const allowsScroll = /(auto|scroll|overlay)/i.test(overflowY);
-                const hasJobLinks = Boolean(el.querySelector('a[href*="/job_detail/"]'));
-                const classSignal = /job[-_ ]?(list|result|recommend|rec)/i.test(`${el.id || ''} ${el.className || ''}`);
-                return el.scrollHeight > el.clientHeight + 40 && (allowsScroll || hasJobLinks || classSignal);
+                const canScroll = el.scrollHeight > el.clientHeight + 40;
+                return canScroll && isLikelyLeftJobArea(el) && (allowsScroll || elementHasJobSignal(el));
             };
 
             const jobContainerScore = (el) => {
                 if (!isScrollableJobContainer(el)) return -1;
                 const rect = el.getBoundingClientRect();
-                const descriptor = `${el.id || ''} ${el.className || ''}`;
-                const linkCount = el.querySelectorAll('a[href*="/job_detail/"]').length;
+                const descriptor = elementDescriptorText(el);
+                const linkCount = jobLinkCount(el);
+                const cardCount = jobCardCount(el);
                 let score = 0;
-                if (/job[-_ ]?(list|result|recommend|rec)/i.test(descriptor)) score += 200;
-                if (linkCount >= 3) score += 120;
+                if (isDetailLikeContainer(el)) score -= 500;
+                if (/job[-_ ]?(list|result|recommend|rec|card)|recommend[-_ ]?list|rec[-_ ]?job|list/i.test(descriptor)) score += 220;
+                if (linkCount >= 10) score += 260;
+                else if (linkCount >= 3) score += 140;
                 else if (linkCount > 0) score += 40;
+                if (cardCount >= 10) score += 220;
+                else if (cardCount >= 3) score += 120;
+                else if (cardCount > 0) score += 35;
+                if (/(auto|scroll|overlay)/i.test(`${window.getComputedStyle(el).overflowY || ''} ${window.getComputedStyle(el).overflow || ''}`)) score += 60;
                 if (rect.width >= 240 && rect.width <= 900) score += 80;
                 if (rect.height >= 300) score += 40;
                 if (rect.left < window.innerWidth * 0.65) score += 30;
@@ -2487,7 +2572,31 @@
                 return parts.join('');
             };
 
-            const findJobListScrollContainer = () => {
+            const scrollCandidateDebug = () => Array.from(document.querySelectorAll('div,section,main,ul,ol'))
+                .filter(el => el && el !== document.body && el !== document.documentElement)
+                .map(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return {
+                        target: describeScrollTarget(el),
+                        left: Math.round(rect.left),
+                        top: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        scrollHeight: Math.round(el.scrollHeight || 0),
+                        clientHeight: Math.round(el.clientHeight || 0),
+                        overflowY: style.overflowY || '',
+                        links: jobLinkCount(el),
+                        cards: jobCardCount(el),
+                        detailLike: isDetailLikeContainer(el),
+                        score: jobContainerScore(el),
+                    };
+                })
+                .filter(item => item.scrollHeight > item.clientHeight + 40 || item.links > 0 || item.score >= 0)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 8);
+
+            const findJobListScrollCandidates = () => {
                 const candidates = [];
                 const pushCandidate = (el) => {
                     if (el && !candidates.includes(el)) candidates.push(el);
@@ -2497,18 +2606,101 @@
                     document.querySelectorAll(selector).forEach(pushCandidate);
                 }
 
-                const firstJobLink = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBHREFS_CANDIDATES.join(','));
-                let cursor = firstJobLink ? firstJobLink.parentElement : null;
-                while (cursor && cursor !== document.body && cursor !== document.documentElement) {
-                    pushCandidate(cursor);
-                    cursor = cursor.parentElement;
+                const jobAnchors = Array.from(document.querySelectorAll(jobLinkSelector())).slice(0, 8);
+                for (const jobLink of jobAnchors) {
+                    let cursor = jobLink ? jobLink.parentElement : null;
+                    while (cursor && cursor !== document.body && cursor !== document.documentElement) {
+                        pushCandidate(cursor);
+                        cursor = cursor.parentElement;
+                    }
+                }
+
+                document.querySelectorAll('div,section,main,ul,ol').forEach((el) => {
+                    if (!isLikelyLeftJobArea(el)) return;
+                    if (el.scrollHeight <= el.clientHeight + 40) return;
+                    if (!elementHasJobSignal(el)) return;
+                    pushCandidate(el);
+                });
+
+                for (const candidate of Array.from(candidates)) {
+                    let cursor = candidate.parentElement;
+                    for (let depth = 0; cursor && depth < 4 && cursor !== document.body && cursor !== document.documentElement; depth++) {
+                        pushCandidate(cursor);
+                        cursor = cursor.parentElement;
+                    }
                 }
 
                 const scrollable = candidates
                     .map(el => ({ el, score: jobContainerScore(el) }))
                     .filter(item => item.score >= 0)
                     .sort((a, b) => b.score - a.score);
-                return scrollable[0]?.el || null;
+                return scrollable.map(item => item.el);
+            };
+
+            const findJobListScrollContainer = () => {
+                return findJobListScrollCandidates()[0] || null;
+            };
+
+            const dispatchJobListWheel = (container, distance) => {
+                const rect = container.getBoundingClientRect();
+                const eventInit = {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    deltaY: distance,
+                    deltaMode: 0,
+                    clientX: Math.round(rect.left + Math.min(rect.width - 8, Math.max(8, rect.width / 2))),
+                    clientY: Math.round(rect.top + Math.min(rect.height - 8, Math.max(8, rect.height / 2))),
+                };
+                try {
+                    container.dispatchEvent(new WheelEvent('wheel', eventInit));
+                } catch (e) {
+                    // 旧环境不支持 WheelEvent 时，直接滚动仍可作为兜底。
+                }
+            };
+
+            const performJobListScroll = async (container, distance) => {
+                const before = container.scrollTop;
+                const beforeFingerprint = jobListFingerprint(container);
+                const beforeDocumentFingerprint = jobListFingerprint(document);
+                try {
+                    container.focus?.({ preventScroll: true });
+                } catch (e) {
+                    try { container.focus?.(); } catch (ignore) {}
+                }
+                dispatchJobListWheel(container, distance);
+                if (typeof container.scrollBy === 'function') {
+                    container.scrollBy({ top: distance, behavior: 'auto' });
+                } else {
+                    container.scrollTop = before + distance;
+                }
+                try {
+                    container.dispatchEvent(new Event('scroll', { bubbles: true }));
+                } catch (e) {}
+
+                const deadline = Date.now() + 8000;
+                let after = container.scrollTop;
+                let afterFingerprint = jobListFingerprint(container);
+                let afterDocumentFingerprint = jobListFingerprint(document);
+                while (Date.now() < deadline) {
+                    await tools.asyncSleep(500);
+                    after = container.scrollTop;
+                    afterFingerprint = jobListFingerprint(container);
+                    afterDocumentFingerprint = jobListFingerprint(document);
+                    const moved = Math.abs(after - before) >= 5;
+                    const changed = afterFingerprint !== beforeFingerprint || afterDocumentFingerprint !== beforeDocumentFingerprint;
+                    if (moved || changed) break;
+                }
+                return {
+                    before,
+                    after,
+                    beforeFingerprint,
+                    afterFingerprint,
+                    beforeDocumentFingerprint,
+                    afterDocumentFingerprint,
+                    moved: Math.abs(after - before) >= 5,
+                    changed: afterFingerprint !== beforeFingerprint || afterDocumentFingerprint !== beforeDocumentFingerprint,
+                };
             };
 
             const scrollSearchResultsOnce = async (round) => {
@@ -2524,51 +2716,74 @@
                 const keyword = currentJobSource === 'preferred_feed'
                     ? (currentFeedTabName || '自定义推荐')
                     : (this.tags[currentTagIdx] || '');
-                const container = findJobListScrollContainer();
-                if (!container) {
+                const containers = findJobListScrollCandidates().slice(0, 5);
+                if (!containers.length) {
                     await api.event('search_scroll_target_missing', `未找到可验证的左侧岗位列表滚动容器: ${keyword}`, 'script', 'warning', {
                         keyword,
                         source: currentJobSource,
                         round,
+                        candidates: scrollCandidateDebug(),
                     });
                     return false;
                 }
                 const distance = Math.max(420, Math.floor(window.innerHeight * 0.75));
                 setSearchAction(`低频滚动读取: ${keyword}`);
                 logger.add(`低频滚动读取搜索结果: ${keyword} (${round}/${OPTIONS.searchResultScrollRounds})`);
-                await api.event('search_result_scroll', `低频滚动读取搜索结果: ${keyword}`, 'script', 'info', {
-                    keyword,
-                    source: currentJobSource,
-                    round,
-                    maxRounds: OPTIONS.searchResultScrollRounds,
-                    searchRoundId,
-                    target: describeScrollTarget(container),
-                });
-                const before = container.scrollTop;
-                const beforeFingerprint = jobListFingerprint(container);
-                if (typeof container.scrollBy === 'function') {
-                    container.scrollBy({ top: distance, behavior: 'smooth' });
-                } else {
-                    container.scrollTop = before + distance;
+                const tried = [];
+                for (const container of containers) {
+                    const targetDetail = {
+                        target: describeScrollTarget(container),
+                        targetLinks: jobLinkCount(container),
+                        targetCards: jobCardCount(container),
+                        targetDetailLike: isDetailLikeContainer(container),
+                        scrollTop: Math.round(container.scrollTop || 0),
+                        scrollMax: Math.max(0, Math.round((container.scrollHeight || 0) - (container.clientHeight || 0))),
+                    };
+                    await api.event('search_result_scroll', `低频滚动读取搜索结果: ${keyword}`, 'script', 'info', {
+                        keyword,
+                        source: currentJobSource,
+                        round,
+                        maxRounds: OPTIONS.searchResultScrollRounds,
+                        searchRoundId,
+                        ...targetDetail,
+                    });
+                    const result = await performJobListScroll(container, distance);
+                    const moved = result.moved;
+                    const changed = result.changed;
+                    tried.push({
+                        ...targetDetail,
+                        before: result.before,
+                        after: result.after,
+                        moved,
+                        changed,
+                    });
+                    await api.event('search_result_scroll_verified', `岗位列表滚动验证: ${keyword} / ${moved ? '已移动' : '未移动'} / ${changed ? '列表有变化' : '列表未变化'}`, 'script', moved || changed ? 'info' : 'warning', {
+                        keyword,
+                        source: currentJobSource,
+                        round,
+                        ...targetDetail,
+                        before: result.before,
+                        after: result.after,
+                        maxScroll: Math.max(0, Math.round((container.scrollHeight || 0) - (container.clientHeight || 0))),
+                        beforeFingerprint: result.beforeFingerprint,
+                        afterFingerprint: result.afterFingerprint,
+                        beforeDocumentFingerprint: result.beforeDocumentFingerprint,
+                        afterDocumentFingerprint: result.afterDocumentFingerprint,
+                        moved,
+                        changed,
+                    });
+                    if (moved || changed) {
+                        await tools.asyncSleep(searchResultScrollDelayMs());
+                        return true;
+                    }
                 }
-                await tools.asyncSleep(searchResultScrollDelayMs());
-                const after = container.scrollTop;
-                const afterFingerprint = jobListFingerprint(container);
-                const moved = Math.abs(after - before) >= 5;
-                const changed = afterFingerprint !== beforeFingerprint;
-                await api.event('search_result_scroll_verified', `岗位列表滚动验证: ${keyword} / ${moved ? '已移动' : '未移动'} / ${changed ? '列表有变化' : '列表未变化'}`, 'script', moved || changed ? 'info' : 'warning', {
+                await api.event('search_result_scroll_all_targets_failed', `候选岗位列表均未滚动: ${keyword}`, 'script', 'warning', {
                     keyword,
                     source: currentJobSource,
                     round,
-                    target: describeScrollTarget(container),
-                    before,
-                    after,
-                    beforeFingerprint,
-                    afterFingerprint,
-                    moved,
-                    changed,
+                    tried,
                 });
-                return moved || changed;
+                return false;
             };
 
             const isVisibleFeedElement = (el) => {
@@ -2601,15 +2816,59 @@
 
             const isSelectedFeedTab = (el) => {
                 if (!el) return false;
-                const nodes = [el, el.parentElement].filter(Boolean);
+                const nodes = [];
+                let node = el;
+                for (let depth = 0; node && depth < 4; depth++) {
+                    nodes.push(node);
+                    node = node.parentElement;
+                }
                 return nodes.some(node => {
                     const ariaSelected = String(node.getAttribute?.('aria-selected') || '').toLowerCase();
                     const ariaCurrent = String(node.getAttribute?.('aria-current') || '').toLowerCase();
-                    const descriptor = `${node.className || ''}`;
+                    const descriptor = `${node.className || ''} ${node.getAttribute?.('class') || ''}`;
                     return ariaSelected === 'true'
                         || ['page', 'true'].includes(ariaCurrent)
+                        || node.getAttribute?.('data-selected') === 'true'
+                        || node.getAttribute?.('data-active') === 'true'
                         || /(^|[\s_-])(active|selected|checked|current)([\s_-]|$)/i.test(descriptor);
                 });
+            };
+
+            const clickPreferredFeedElement = async (el) => {
+                if (!el || !document.body.contains(el)) return false;
+                try {
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                } catch (e) {
+                    // scrollIntoView 在少数旧浏览器环境可能不可用，不影响后续点击。
+                }
+                await tools.asyncSleep(120);
+                try {
+                    el.focus?.({ preventScroll: true });
+                } catch (e) {
+                    try { el.focus?.(); } catch (ignore) {}
+                }
+                const rect = el.getBoundingClientRect();
+                const eventInit = {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: Math.round(rect.left + rect.width / 2),
+                    clientY: Math.round(rect.top + rect.height / 2),
+                    button: 0,
+                };
+                for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                    try {
+                        el.dispatchEvent(new MouseEvent(type, eventInit));
+                    } catch (e) {
+                        // 某些节点不接受合成鼠标事件时，后面仍会走原生 click。
+                    }
+                }
+                try {
+                    el.click();
+                } catch (e) {
+                    return false;
+                }
+                return true;
             };
 
             const feedTabCandidate = (el, options = {}) => {
@@ -2758,27 +3017,62 @@
                     total: feedTabs.length,
                     maxJobs: feedTabMaxJobs,
                 });
-                const beforeFingerprint = jobListFingerprint(document);
-                const selectedBefore = isSelectedFeedTab(tab.element);
-                tab.element.click();
-                const verifyStartedAt = Date.now();
-                let selected = selectedBefore;
+                let beforeFingerprint = jobListFingerprint(document);
+                let beforeHref = location.href;
+                let selected = isSelectedFeedTab(tab.element);
                 let listChanged = false;
-                while (Date.now() - verifyStartedAt < 8000) {
-                    await tools.asyncSleep(400);
-                    const verifyResult = await discoverPreferredFeedTabs();
-                    const liveTab = verifyResult.tabs?.find(item => item.name === expectedTab.name);
-                    selected = Boolean(liveTab?.selected || isSelectedFeedTab(liveTab?.element));
-                    listChanged = jobListFingerprint(document) !== beforeFingerprint;
-                    if (selected || listChanged) break;
-                }
-                if (!selected && !listChanged) {
-                    await api.event('preferred_feed_tab_switch_unconfirmed', `推荐源切换未确认，跳过: ${expectedTab.name}`, 'script', 'warning', {
+                let urlChanged = false;
+                let clicked = false;
+                let liveTab = tab;
+                const maxSwitchAttempts = 3;
+                for (let attempt = 1; attempt <= maxSwitchAttempts; attempt++) {
+                    const latest = await discoverPreferredFeedTabs();
+                    liveTab = latest.tabs?.find(item => item.name === expectedTab.name) || liveTab;
+                    if (!liveTab?.element || !document.body.contains(liveTab.element)) {
+                        await api.event('preferred_feed_tab_missing_after_retry', `推荐源重试定位失败: ${expectedTab.name}`, 'script', 'warning', {
+                            name: expectedTab.name,
+                            index,
+                            attempt,
+                            reason: latest.reason || 'detached_tab',
+                        });
+                        return false;
+                    }
+                    selected = Boolean(liveTab.selected || isSelectedFeedTab(liveTab.element));
+                    if (!selected) {
+                        clicked = await clickPreferredFeedElement(liveTab.element);
+                    } else {
+                        clicked = true;
+                    }
+                    const verifyStartedAt = Date.now();
+                    while (Date.now() - verifyStartedAt < 5000) {
+                        await tools.asyncSleep(350);
+                        const verifyResult = await discoverPreferredFeedTabs();
+                        liveTab = verifyResult.tabs?.find(item => item.name === expectedTab.name) || liveTab;
+                        selected = Boolean(liveTab?.selected || isSelectedFeedTab(liveTab?.element));
+                        listChanged = jobListFingerprint(document) !== beforeFingerprint;
+                        urlChanged = location.href !== beforeHref;
+                        if (selected || listChanged || urlChanged) break;
+                    }
+                    if (selected || listChanged || urlChanged) break;
+                    await api.event('preferred_feed_tab_switch_retry', `推荐源切换未确认，重试 ${attempt}/${maxSwitchAttempts}: ${expectedTab.name}`, 'script', 'warning', {
                         name: expectedTab.name,
                         index,
+                        attempt,
+                        clicked,
                         beforeFingerprint,
+                        currentFingerprint: jobListFingerprint(document),
                     });
-                    return false;
+                    beforeFingerprint = jobListFingerprint(document);
+                    beforeHref = location.href;
+                }
+                if (!selected && !listChanged && !urlChanged) {
+                    await api.event('preferred_feed_tab_switch_assumed', `推荐源已点击但页面未暴露选中态，按目标源继续: ${expectedTab.name}`, 'script', 'warning', {
+                        name: expectedTab.name,
+                        index,
+                        clicked,
+                        beforeFingerprint,
+                        currentFingerprint: jobListFingerprint(document),
+                    });
                 }
                 resetKeywordState();
                 lastJobListEventKey = '';
@@ -2788,6 +3082,8 @@
                     index,
                     selected,
                     listChanged,
+                    urlChanged,
+                    assumed: !selected && !listChanged && !urlChanged,
                 });
                 return true;
             };
@@ -2849,6 +3145,21 @@
 
             const preparePreferredFeeds = async () => {
                 if (!tools.isPreferredFeedPath() || OPTIONS.preferredFeedMode === 'off') return false;
+                if (preferredFeedsDone || hasPreferredFeedCompletedForRun()) {
+                    preferredFeedsDone = true;
+                    currentJobSource = 'keyword_search';
+                    currentFeedTabIndex = -1;
+                    currentFeedTabName = '';
+                    feedTabProcessedCount = 0;
+                    const message = '用户推荐源本轮已处理完成，继续关键词搜索';
+                    logger.add(message);
+                    setSearchAction(message);
+                    await api.event('preferred_feed_already_finished', message, 'script', 'info', {
+                        runKey: preferredFeedRunKey(),
+                    });
+                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
+                    return true;
+                }
                 currentJobSource = 'preferred_feed';
                 feedSwitchAttempted = true;
                 feedSwitchReason = 'discovering_custom_tabs';
@@ -3521,6 +3832,30 @@
                     if (tools.isPlatformLimitError(e)) {
                         finishGreetingWait();
                         await handlePageFailure(tools.platformLimitReason(e), 'platform_limit', 'chat_greet');
+                        return;
+                    }
+                    if (tools.isChatEntryRejectedError(e)) {
+                        finishGreetingWait();
+                        tools.updateGreetTransaction(transactionRunId, href, 'failed', {
+                            title: jobInfo.title || '',
+                            company: jobInfo.company || '',
+                            error: String(e),
+                            rejectedAt: Date.now(),
+                        });
+                        const message = `打招呼入口被平台拒绝，系统已暂停: ${jobInfo.title || href} / ${e}`;
+                        logger.add(message);
+                        setSearchAction(message);
+                        await api.event('greet_entry_rejected', message, 'script', 'error', {
+                            title: jobInfo.title || '',
+                            url: href,
+                            chatUrl: jobInfo.chatUrl || '',
+                            error: String(e),
+                        });
+                        await api.heartbeat('search', 'paused', message, scriptHeartbeatDetail());
+                        this.pause = true;
+                        logger.setPaused(true);
+                        await api.control('pause').catch(() => null);
+                        lastBackendControl = 'paused';
                         return;
                     }
                     if (tools.isElementMissingError(e)) {
@@ -4583,6 +4918,7 @@
             detectQuotaWarningText: (text) => tools.detectQuotaWarningText(text),
             isQuotaReminderText: (text) => tools.isQuotaReminderText(text),
             quotaReminderReasonFromValue: (value) => tools.quotaReminderReasonFromValue(value),
+            isChatEntryRejectedError: (value) => tools.isChatEntryRejectedError(value),
             isSystemFeedName: (text) => tools.isSystemFeedName(text),
             isIgnoredFeedName: (text) => tools.isIgnoredFeedName(text),
             isCompositeFeedName: (text) => tools.isCompositeFeedName(text),

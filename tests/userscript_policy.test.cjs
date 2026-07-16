@@ -34,6 +34,18 @@ test('search safety state persists across refreshes', () => {
 test('job list scrolling is verified and never falls back to window scrolling', () => {
   assert.match(source, /jobListFingerprint/);
   assert.match(source, /search_result_scroll_verified/);
+  assert.match(source, /isLikelyLeftJobArea/);
+  assert.match(source, /elementHasJobSignal/);
+  assert.match(source, /isDetailLikeContainer/);
+  assert.match(source, /targetDetailLike/);
+  assert.match(source, /findJobListScrollCandidates/);
+  assert.match(source, /dispatchJobListWheel/);
+  assert.match(source, /new WheelEvent\('wheel'/);
+  assert.match(source, /search_result_scroll_all_targets_failed/);
+  assert.match(source, /scrollCandidateDebug/);
+  assert.match(source, /recommend-job-list/);
+  assert.match(source, /\[class\*="job-recommend"\]/);
+  assert.match(source, /jobLinkCount\(el\) < 3 && jobCardCount\(el\) < 3/);
   assert.doesNotMatch(source, /window\.scrollBy\s*\(/);
 });
 
@@ -70,6 +82,32 @@ test('feed tabs are rediscovered and map-like controls are excluded', () => {
   assert.equal(hooks.isStrongCustomFeedName('早九晚六点半/企业客服审核员/不加班'), false);
 });
 
+test('finished preferred feed phase does not restart from the first tab', () => {
+  assert.match(source, /preferred_feed_already_finished/);
+  assert.match(source, /hasPreferredFeedCompletedForRun\(\)/);
+  const prepareBranch = source.indexOf('const preparePreferredFeeds = async () => {');
+  const completedGuard = source.indexOf('if (preferredFeedsDone || hasPreferredFeedCompletedForRun())', prepareBranch);
+  const rediscover = source.indexOf('const result = await discoverPreferredFeedTabs();', prepareBranch);
+  assert.ok(prepareBranch >= 0 && completedGuard > prepareBranch);
+  assert.ok(rediscover > completedGuard, 'completed preferred feeds must be guarded before rediscovery');
+  const resetBranch = source.indexOf('localStorage.removeItem(preferredFeedStateKey)');
+  const sessionReset = source.indexOf("api.event('session_counter_reset'");
+  assert.ok(resetBranch >= 0 && sessionReset > resetBranch, 'new backend runs should clear the previous preferred-feed completion state');
+});
+
+test('preferred feed tab switching retries instead of skipping target tabs', () => {
+  assert.match(source, /clickPreferredFeedElement/);
+  assert.match(source, /preferred_feed_tab_switch_retry/);
+  assert.match(source, /preferred_feed_tab_switch_assumed/);
+  assert.doesNotMatch(source, /preferred_feed_tab_switch_unconfirmed/);
+  assert.doesNotMatch(source, /推荐源切换未确认，跳过/);
+  const switchBranch = source.indexOf('const selectPreferredFeedTab = async (index) => {');
+  const retryBranch = source.indexOf('for (let attempt = 1; attempt <= maxSwitchAttempts; attempt++)', switchBranch);
+  const confirmBranch = source.indexOf("api.event('preferred_feed_tab_switch_confirmed'", switchBranch);
+  assert.ok(switchBranch >= 0 && retryBranch > switchBranch);
+  assert.ok(confirmBranch > retryBranch, 'feed tab switching should confirm after retry loop');
+});
+
 test('send-clicked unknown results are skipped without reopening chat', () => {
   assert.match(source, /send_clicked/);
   assert.match(source, /greet_delivery_unknown/);
@@ -89,6 +127,27 @@ test('chat send retries stay in the same page and search does not reopen chat on
   assert.match(source, /retryable:\s*false/);
   assert.match(source, /打招呼连续 \$\{maxAttempts\} 次失败，系统已暂停/);
   assert.match(source, /api\.control\('pause'\)/);
+});
+
+test('greeting window timeout retries before final pause', () => {
+  const timeoutBranch = source.indexOf("error: 'greet_window_timeout'");
+  assert.ok(timeoutBranch >= 0);
+  const retryableTrue = source.indexOf('retryable: true', timeoutBranch);
+  const handleResultEnd = source.indexOf('});', timeoutBranch);
+  assert.ok(retryableTrue > timeoutBranch && retryableTrue < handleResultEnd);
+  assert.match(source, /greet_retry_scheduled/);
+  assert.match(source, /openGreetingChat\(jobInfo, href, `retry_after_\$\{error\}`, nextAttempt\)/);
+});
+
+test('chat entry rejection pauses instead of falling back into an unusable chat page', () => {
+  assert.equal(hooks.isChatEntryRejectedError('Error: 无法进行沟通'), true);
+  assert.equal(hooks.isChatEntryRejectedError('Error: BOSS 网络响应异常: 502'), false);
+  assert.match(source, /greet_entry_rejected/);
+  const rejectedBranch = source.indexOf('if (tools.isChatEntryRejectedError(e))');
+  const fallbackBranch = source.indexOf('if (jobInfo.chatUrl)', rejectedBranch);
+  const rejectedReturn = source.indexOf('return;', rejectedBranch);
+  assert.ok(rejectedBranch >= 0 && rejectedReturn > rejectedBranch);
+  assert.ok(fallbackBranch > rejectedReturn, 'entry rejection must return before chatUrl fallback');
 });
 
 test('boss quota reminder is confirmed instead of treated as a hard limit', () => {
