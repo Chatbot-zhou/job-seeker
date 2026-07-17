@@ -36,7 +36,7 @@
         tagSearchDelayMaxSeconds: 45,
         maxSearchSubmissionsPerHour: 6,
         maxSearchSubmissionsPerDay: 30,
-        searchResultScrollRounds: 10,
+        searchResultScrollRounds: 20,
         preferredFeedMode: 'all_custom_tabs',
         preferredFeedMaxJobsPerTab: 0,
         actionDelayMs: 2500,
@@ -1602,6 +1602,7 @@
             let tagsCheckedThisRound = new Set();
             let cooldownUntil = 0;
             let cooldownTimer = null;
+            let cooldownStartedEventKey = '';
             let currentJobSource = tools.isPreferredFeedPath() ? 'preferred_feed' : 'keyword_search';
             let feedTabs = [];
             let currentFeedTabIndex = -1;
@@ -1629,6 +1630,7 @@
             const pageFailureStateKey = '__job_seeker_page_failure_recovery';
             let pageFailureRetryCount = 0;
             const preferredFeedStateKey = '__job_seeker_preferred_feed_state';
+            const preferredFeedCooldownStateKey = '__job_seeker_preferred_feed_cooldown_state';
             const searchBudgetStateKey = '__job_seeker_search_budget';
             const searchRoundStateKey = '__job_seeker_search_round_state';
 
@@ -1755,6 +1757,36 @@
             const hasPreferredFeedCompletedForRun = () => {
                 const state = loadPreferredFeedState();
                 return Boolean(state.done && state.runKey === preferredFeedRunKey());
+            };
+
+            const preferredFeedCooldownKey = () => (
+                `${preferredFeedRunKey()}::${searchRoundId || 0}::${Math.floor(Number(cooldownUntil || 0) / 1000)}`
+            );
+
+            const loadPreferredFeedCooldownState = () => {
+                const state = tools.readJson(preferredFeedCooldownStateKey, {});
+                if (!state.timestamp || Date.now() - Number(state.timestamp) > 24 * 60 * 60 * 1000) return {};
+                return state;
+            };
+
+            const savePreferredFeedCooldownState = (state) => {
+                tools.writeJson(preferredFeedCooldownStateKey, {
+                    ...state,
+                    key: preferredFeedCooldownKey(),
+                    runKey: preferredFeedRunKey(),
+                    searchRoundId,
+                    cooldownUntil,
+                    timestamp: Date.now(),
+                });
+            };
+
+            const preferredFeedCooldownStateMatches = (state = loadPreferredFeedCooldownState()) => (
+                Boolean(state.key && state.key === preferredFeedCooldownKey())
+            );
+
+            const hasPreferredFeedCooldownCycleStarted = () => {
+                const state = loadPreferredFeedCooldownState();
+                return preferredFeedCooldownStateMatches(state) && ['started', 'done'].includes(String(state.status || ''));
             };
 
             const shouldPreferFeedBeforeKeywordSearch = () => (
@@ -2052,7 +2084,12 @@
                     if (!(await ensureSearchLease('定时运行检查'))) return;
                     if (!started && !booting) {
                         main();
-                    } else if (started && !booting && !waitingForGreeting) {
+                    } else if (
+                        started
+                        && !booting
+                        && !waitingForGreeting
+                        && !(cooldownUntil && Date.now() < cooldownUntil)
+                    ) {
                         loop();
                     }
                 }
@@ -2501,7 +2538,7 @@
 
             const isDetailLikeContainer = (el) => {
                 const descriptor = elementDescriptorText(el);
-                return /job[-_ ]?detail|detail[-_ ]?container|job[-_ ]?banner|job[-_ ]?sec|sider|side|company|chat/i.test(descriptor);
+                return /job[-_ ]?detail|detail[-_ ]?container|job[-_ ]?banner|job[-_ ]?sec|company|chat/i.test(descriptor);
             };
 
             const isLikelyLeftJobArea = (el) => {
@@ -2911,7 +2948,20 @@
                         map.set(key, item);
                     }
                 }
-                return Array.from(map.values()).sort((a, b) => (a.top - b.top) || (a.left - b.left));
+                const tabs = Array.from(map.values()).sort((a, b) => (a.top - b.top) || (a.left - b.left));
+                return tabs.filter((tab) => {
+                    if (tab.isSystem) return true;
+                    const name = tools.normalizeFeedTabText(tab.name);
+                    const nameHasCitySuffix = /[（(][^）)]{1,10}[）)]$/.test(name);
+                    if (nameHasCitySuffix) return true;
+                    return !tabs.some((other) => {
+                        if (other === tab || other.isSystem) return false;
+                        const otherName = tools.normalizeFeedTabText(other.name);
+                        return otherName !== name
+                            && otherName.startsWith(name)
+                            && /[（(][^）)]{1,10}[）)]$/.test(otherName);
+                    });
+                });
             };
 
             const likelyFeedContainers = (sourceEls) => {
@@ -3099,6 +3149,22 @@
                 currentFeedTabIndex = -1;
                 currentFeedTabName = '';
                 feedTabProcessedCount = 0;
+                if (cooldownUntil > Date.now()) {
+                    savePreferredFeedCooldownState({
+                        status: 'done',
+                        reason,
+                        tabs: feedTabs.map(tab => tab.name),
+                    });
+                    const cooldownMessage = '冷却期用户推荐源处理完成，继续等待关键词搜索冷却';
+                    logger.add(cooldownMessage);
+                    await api.event('preferred_feed_cooldown_cycle_finished', cooldownMessage, 'script', 'info', {
+                        reason,
+                        tabs: feedTabs.map(tab => tab.name),
+                        cooldownUntil: new Date(cooldownUntil).toISOString(),
+                    });
+                    await enterSearchCooldown('冷却期用户推荐源已处理完成', cooldownUntil);
+                    return;
+                }
                 const message = '所有用户推荐源处理完成，进入关键词搜索';
                 logger.add(message);
                 await api.event('preferred_feed_finished', message, 'script', 'info', {
@@ -3157,8 +3223,7 @@
                     await api.event('preferred_feed_already_finished', message, 'script', 'info', {
                         runKey: preferredFeedRunKey(),
                     });
-                    tools.openTabNSetTimestamp(SEARCHPATH.zhipin, this.targets.search, true);
-                    return true;
+                    return false;
                 }
                 currentJobSource = 'preferred_feed';
                 feedSwitchAttempted = true;
@@ -3308,6 +3373,7 @@
                 searchRoundId += 1;
                 tagsCheckedThisRound.clear();
                 cooldownUntil = 0;
+                cooldownStartedEventKey = '';
                 currentTagIdx = this.tags.length
                     ? Math.min(Math.max(0, Number(startTagIdx) || 0), this.tags.length - 1)
                     : 0;
@@ -3432,16 +3498,47 @@
                 const untilText = new Date(cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false });
                 const remainingMinutes = Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 60000));
                 const message = `${reason || '所有关键词本轮暂无新职位'}，冷却约 ${remainingMinutes} 分钟后再搜索（预计 ${untilText}）`;
+                const cooldownEventKey = String(Math.floor(cooldownUntil / 1000));
+                const alreadyReportedCooldown = cooldownStartedEventKey === cooldownEventKey;
                 setSearchAction(message);
-                logger.add(message);
-                await api.event('search_round_cooldown_started', message, 'script', 'info', {
-                    reason,
-                    searchRoundId,
-                    cooldownMinutes: remainingMinutes,
-                    cooldownUntil: new Date(cooldownUntil).toISOString(),
-                    checkedCount: tagsCheckedThisRound.size,
-                });
+                if (!alreadyReportedCooldown) {
+                    cooldownStartedEventKey = cooldownEventKey;
+                    logger.add(message);
+                    await api.event('search_round_cooldown_started', message, 'script', 'info', {
+                        reason,
+                        searchRoundId,
+                        cooldownMinutes: remainingMinutes,
+                        cooldownUntil: new Date(cooldownUntil).toISOString(),
+                        checkedCount: tagsCheckedThisRound.size,
+                    });
+                }
                 await api.heartbeat('search', 'cooldown', message, scriptHeartbeatDetail());
+
+                if (
+                    OPTIONS.preferredFeedMode !== 'off'
+                    && !tools.isPreferredFeedPath()
+                    && !hasPreferredFeedCooldownCycleStarted()
+                ) {
+                    savePreferredFeedCooldownState({ status: 'started', reason });
+                    preferredFeedsDone = false;
+                    feedTabs = [];
+                    currentFeedTabIndex = -1;
+                    currentFeedTabName = '';
+                    feedTabProcessedCount = 0;
+                    currentJobSource = 'preferred_feed';
+                    localStorage.removeItem(preferredFeedStateKey);
+                    const feedMessage = `${message}，冷却期间先补充扫描用户自定义推荐源`;
+                    logger.add(feedMessage);
+                    setSearchAction(feedMessage);
+                    await api.event('preferred_feed_during_search_cooldown', feedMessage, 'script', 'info', {
+                        reason,
+                        searchRoundId,
+                        cooldownUntil: new Date(cooldownUntil).toISOString(),
+                    });
+                    await api.heartbeat('search', 'running', feedMessage, scriptHeartbeatDetail());
+                    tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
+                    return;
+                }
 
                 const cooldownTick = async () => {
                     try {
@@ -3460,6 +3557,7 @@
                         }
                         cooldownTimer = null;
                         cooldownUntil = 0;
+                        cooldownStartedEventKey = '';
                         saveSearchRoundState();
                         if (!(await ensureSearchLease('冷却结束'))) return;
                         if (!(await syncControlFromBackend('搜索冷却结束'))) return;

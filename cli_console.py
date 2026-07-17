@@ -397,7 +397,7 @@ def configure_search_safety_settings() -> None:
         ),
         "search_result_scroll_rounds": ask_int(
             "每个推荐源或标签最多低频滚动读取次数 0-20",
-            int(current.get("search_result_scroll_rounds", 10)),
+            int(current.get("search_result_scroll_rounds", 20)),
         ),
         "preferred_feed_max_jobs_per_tab": ask_int(
             "每个自定义推荐 Tab 最多处理新岗位数（0 表示不限制）",
@@ -845,7 +845,7 @@ def setup_quick_start() -> None:
         ),
         "search_result_scroll_rounds": ensure_range_int(
             "每个推荐源或标签最多低频滚动读取次数 0-20",
-            int(current.get("search_result_scroll_rounds", 10)),
+            int(current.get("search_result_scroll_rounds", 20)),
             0,
             20,
         ),

@@ -37,6 +37,7 @@ test('job list scrolling is verified and never falls back to window scrolling', 
   assert.match(source, /isLikelyLeftJobArea/);
   assert.match(source, /elementHasJobSignal/);
   assert.match(source, /isDetailLikeContainer/);
+  assert.doesNotMatch(source, /job\[-_ \]\?sec\|sider\|side\|company\|chat/);
   assert.match(source, /targetDetailLike/);
   assert.match(source, /findJobListScrollCandidates/);
   assert.match(source, /dispatchJobListWheel/);
@@ -60,6 +61,7 @@ test('feed tabs are rediscovered and map-like controls are excluded', () => {
   assert.match(source, /discoverPreferredFeedTabs/);
   assert.match(source, /切换自定义推荐源/);
   assert.match(source, /地图/);
+  assert.match(source, /otherName\.startsWith\(name\)/);
   assert.match(source, /role[^\n]{0,80}tab|tabSemantics/i);
   assert.equal(hooks.isSystemFeedName('推荐'), true);
   assert.equal(hooks.isLikelyCustomFeedName('地图'), false);
@@ -85,11 +87,18 @@ test('feed tabs are rediscovered and map-like controls are excluded', () => {
 test('finished preferred feed phase does not restart from the first tab', () => {
   assert.match(source, /preferred_feed_already_finished/);
   assert.match(source, /hasPreferredFeedCompletedForRun\(\)/);
+  assert.match(source, /preferredFeedCooldownStateKey/);
+  assert.match(source, /cooldownStartedEventKey/);
+  assert.match(source, /!\(cooldownUntil && Date\.now\(\) < cooldownUntil\)/);
+  assert.match(source, /preferred_feed_during_search_cooldown/);
+  assert.match(source, /preferred_feed_cooldown_cycle_finished/);
   const prepareBranch = source.indexOf('const preparePreferredFeeds = async () => {');
   const completedGuard = source.indexOf('if (preferredFeedsDone || hasPreferredFeedCompletedForRun())', prepareBranch);
   const rediscover = source.indexOf('const result = await discoverPreferredFeedTabs();', prepareBranch);
+  const completedReturn = source.indexOf('return false;', completedGuard);
   assert.ok(prepareBranch >= 0 && completedGuard > prepareBranch);
   assert.ok(rediscover > completedGuard, 'completed preferred feeds must be guarded before rediscovery');
+  assert.ok(completedReturn > completedGuard && completedReturn < rediscover, 'completed preferred feeds should fall through to keyword search instead of reopening pages');
   const resetBranch = source.indexOf('localStorage.removeItem(preferredFeedStateKey)');
   const sessionReset = source.indexOf("api.event('session_counter_reset'");
   assert.ok(resetBranch >= 0 && sessionReset > resetBranch, 'new backend runs should clear the previous preferred-feed completion state');

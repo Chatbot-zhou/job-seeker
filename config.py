@@ -37,7 +37,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tag_search_delay_max_seconds": 45,
     "max_search_submissions_per_hour": 6,
     "max_search_submissions_per_day": 30,
-    "search_result_scroll_rounds": 10,
+    "search_result_scroll_rounds": 20,
     "preferred_feed_mode": "all_custom_tabs",
     "preferred_feed_max_jobs_per_tab": 0,
     "max_contacts_per_company": 1,

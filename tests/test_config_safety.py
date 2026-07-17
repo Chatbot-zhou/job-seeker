@@ -33,7 +33,7 @@ def test_search_safety_defaults_are_conservative() -> None:
     assert DEFAULT_CONFIG["tag_search_delay_max_seconds"] == 45
     assert DEFAULT_CONFIG["max_search_submissions_per_hour"] == 6
     assert DEFAULT_CONFIG["max_search_submissions_per_day"] == 30
-    assert DEFAULT_CONFIG["search_result_scroll_rounds"] == 10
+    assert DEFAULT_CONFIG["search_result_scroll_rounds"] == 20
     assert DEFAULT_CONFIG["preferred_feed_max_jobs_per_tab"] == 0
     assert "session_greet_limit" not in DEFAULT_CONFIG
     assert "daily_greet_safe_limit" not in DEFAULT_CONFIG
