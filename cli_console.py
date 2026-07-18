@@ -981,6 +981,15 @@ def print_status_panel() -> None:
     script = runtime_state.script_snapshot()
     script_ok = script.get("connected", False)
     script_detail = script.get("detail") or {}
+    _, expected_script_version = read_script_versions()
+    browser_script_version = str(script_detail.get("version") or "")
+    script_version_label = browser_script_version or "未上报"
+    if (
+        browser_script_version
+        and expected_script_version not in {"未知", "未找到"}
+        and browser_script_version != expected_script_version
+    ):
+        script_version_label = f"{browser_script_version} -> 请更新 {expected_script_version}"
     control = runtime_state.control
 
     scoring_think = "开启" if not Config.disable_model_thinking else "关闭"
@@ -1030,6 +1039,7 @@ def print_status_panel() -> None:
         print(f"- 阈值与统计: {Config.score_threshold} 分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}")
         print(f"- 搜索策略: {search_strategy_label}")
         print(f"- 岗位来源: {source_label}")
+        print(f"- 油猴脚本版本: {script_version_label}")
         print(f"- 定时启动: {schedule_label}")
         print(f"- 准备状态: 简历 {_icon(resume_ok)} / 画像 {_icon(profile_ok)} / 话术 {_icon(greeting_ok)} / 脚本 {_icon(script_ok)} / 控制 {control}")
         return
@@ -1056,6 +1066,7 @@ def print_status_panel() -> None:
 ║  打招呼语    {_icon(greeting_ok)} {'已确认' if greeting_ok else '未确认'}{' ' * 42}║
 ╠══════════════════════════════════════════════════════════════╣
 ║  脚本连接    {_icon(script_ok)} {'已连接' if script_ok else '等待中...'}{' ' * 42}║
+║  脚本版本    {script_version_label[:48]:<48}║
 ║  控制状态    {'running' if control == 'running' else control}{' ' * 40}║
 ╚══════════════════════════════════════════════════════════════╝"""
 
@@ -1068,6 +1079,7 @@ def print_status_panel() -> None:
 │  本轮成功: {script_detail.get('sessionGreetCount', 0)} │ 今日成功: {script_detail.get('dailyGreetCount', 0)} │ 定时启动: {schedule_label[:30]:<30} │
 │  搜索: {search_strategy_label[:54]:<54} │
 │  来源: {source_label[:54]:<54} │
+│  脚本版本: {script_version_label[:47]:<47} │
 │  模型: {model_status[:50]} │ 评分令牌: {Config.job_score_num_predict_think_off}/{Config.job_score_num_predict_think_on} │
 │  简历: {_icon(resume_ok)} 画像: {_icon(profile_ok)} 话术: {_icon(greeting_ok)} │ 脚本: {_icon(script_ok)} │ {control} │
 └──────────────────────────────────────────────────────────────┘"""
@@ -1614,8 +1626,15 @@ def show_doctor() -> None:
     if script.get("heartbeat_age_seconds") is not None:
         print(f"  最近心跳: {script.get('heartbeat_age_seconds')} 秒前")
     detail = script.get("detail") or {}
+    meta_script_version, expected_script_version = read_script_versions()
+    print(f"  本地脚本版本: @version {meta_script_version} / runtime {expected_script_version}")
     if detail.get("version"):
         print(f"  版本/阈值: {detail.get('version')} / {detail.get('threshold') or '-'}")
+        if expected_script_version not in {"未知", "未找到"} and detail.get("version") != expected_script_version:
+            issues.append((
+                f"浏览器油猴脚本版本过旧: {detail.get('version')}",
+                "输入 script，打开脚本安装地址，在 Tampermonkey 中点击更新，然后刷新 BOSS 页面",
+            ))
     if detail:
         print(
             f"  运行标识: 后端 {runtime_state.run_id} / "
@@ -1655,10 +1674,41 @@ def show_doctor() -> None:
         import database
 
         db_stats = database.database_stats()
+        recent_counts = database.recent_event_counts(
+            24,
+            (
+                "model_failed",
+                "model_timeout",
+                "model_score_degraded_pause",
+                "search_scroll_target_missing",
+                "search_result_scroll_all_targets_failed",
+                "loop_failed",
+                "backend_unavailable_pause",
+                "job_detail_popup_blocked",
+            ),
+        )
         print(
             f"- 本地数据库: {db_stats.get('size_mb', 0):.1f} MB / "
             f"事件 {db_stats.get('event_count', 0)} 条 / schema v{db_stats.get('schema_version', 0)}"
         )
+        if recent_counts:
+            print(
+                "- 最近24小时关键异常: "
+                f"模型失败 {recent_counts.get('model_failed', 0)} / "
+                f"模型暂停 {recent_counts.get('model_score_degraded_pause', 0)} / "
+                f"滚动定位失败 {recent_counts.get('search_scroll_target_missing', 0)} / "
+                f"滚动候选失败 {recent_counts.get('search_result_scroll_all_targets_failed', 0)} / "
+                f"后端中断 {recent_counts.get('backend_unavailable_pause', 0) + recent_counts.get('loop_failed', 0)} / "
+                f"弹窗拦截 {recent_counts.get('job_detail_popup_blocked', 0)}"
+            )
+        if recent_counts.get("job_detail_popup_blocked", 0):
+            issues.append(("浏览器可能拦截了详情页弹窗", "允许 zhipin.com 弹出窗口，或保持 BOSS 页面为当前浏览器的正常标签"))
+        if recent_counts.get("search_scroll_target_missing", 0) or recent_counts.get("search_result_scroll_all_targets_failed", 0):
+            issues.append(("最近出现岗位列表滚动失败", "先更新油猴脚本并刷新 BOSS 页面；若仍失败，贴 doctor 中的滚动日志"))
+        if recent_counts.get("backend_unavailable_pause", 0) or recent_counts.get("loop_failed", 0):
+            issues.append(("脚本运行期间后端曾断开", "保持 CLI/自动启动器窗口运行；关闭服务前先 pause 或 stop"))
+        if recent_counts.get("model_failed", 0) or recent_counts.get("model_score_degraded_pause", 0):
+            issues.append(("最近出现模型评分失败", "运行 doctor 查看真实生成检查，确认模型名、Base URL、Key 和网络代理"))
         if db_stats.get("size_mb", 0) >= 100 or db_stats.get("event_count", 0) >= 100000:
             issues.append(("本地运行日志较大", "重启服务会执行低频日志清理；建议先运行 backup 备份重要历史"))
     except Exception as exc:

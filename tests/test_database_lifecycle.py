@@ -111,3 +111,36 @@ def test_v3_runs_table_with_status_is_migrated_and_writable(tmp_path, monkeypatc
     assert row == ("running", "running")
     assert version == database.SCHEMA_VERSION
     assert list((tmp_path / "backups").glob("legacy-runs-schema-v3-*.db"))
+
+
+def test_repair_invalid_company_names_clears_title_salary_pollution(tmp_path, monkeypatch) -> None:
+    import database
+    from config import Config
+
+    monkeypatch.setattr(Config, "app_db_name", str(tmp_path / "company.db"))
+    database._INITIALIZED_PATHS.clear()
+    database.init_db()
+    database.upsert_job(
+        {
+            "url": "https://example.test/job/1",
+            "title": "AI研发工程师",
+            "company": "AI研发工程师\n15-25K",
+            "salary": "15-25K",
+            "detail": "test",
+        }
+    )
+    database.upsert_job(
+        {
+            "url": "https://example.test/job/2",
+            "title": "AI研发工程师",
+            "company": "杭州示例科技有限公司",
+            "salary": "15-25K",
+            "detail": "test",
+        }
+    )
+
+    result = database.repair_invalid_company_names()
+
+    assert result["repaired"] == 1
+    assert database.get_job("https://example.test/job/1")["company"] == ""
+    assert database.get_job("https://example.test/job/2")["company"] == "杭州示例科技有限公司"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import threading
@@ -490,6 +491,87 @@ def summarize_run(run_id: str) -> dict[str, Any]:
         "paused": counts.get("manual_intervention_pause", 0) + counts.get("platform_limit_pause", 0),
         "event_types": counts,
     }
+
+
+_SALARY_LIKE_RE = re.compile(
+    r"(?:\d+(?:\.\d+)?\s*[-~至]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*以上|\d+(?:\.\d+)?\s*以下)\s*[kK千万]?|面议|薪资open",
+    re.IGNORECASE,
+)
+
+
+def _plain_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def is_invalid_legacy_company_name(company: Any, title: Any = "", salary: Any = "") -> bool:
+    """Detect old records where a job title/salary block was stored as company."""
+    company_text = _plain_text(company)
+    if not company_text:
+        return False
+    title_text = _plain_text(title)
+    salary_text = _plain_text(salary)
+    if title_text and salary_text and title_text in company_text and salary_text in company_text:
+        return True
+    if title_text and company_text == title_text and (_SALARY_LIKE_RE.search(company_text) or _SALARY_LIKE_RE.search(salary_text)):
+        return True
+    if title_text and title_text in company_text and _SALARY_LIKE_RE.search(company_text):
+        return True
+    return False
+
+
+def repair_invalid_company_names(limit: int = 20000) -> dict[str, int]:
+    """Clear polluted historical company fields without touching personal data."""
+    init_db()
+    checked = 0
+    repaired = 0
+    current_time = now_iso()
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, company, salary
+            FROM jobs
+            WHERE company IS NOT NULL AND TRIM(company) != ''
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        checked = len(rows)
+        bad_ids = [
+            int(row["id"])
+            for row in rows
+            if is_invalid_legacy_company_name(row["company"], row["title"], row["salary"])
+        ]
+        if bad_ids:
+            conn.executemany(
+                "UPDATE jobs SET company = '', updated_at = ? WHERE id = ?",
+                [(current_time, job_id) for job_id in bad_ids],
+            )
+            conn.commit()
+            repaired = len(bad_ids)
+    return {"checked": checked, "repaired": repaired}
+
+
+def recent_event_counts(hours: int = 24, event_types: list[str] | tuple[str, ...] | None = None) -> dict[str, int]:
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))).isoformat()
+    params: list[Any] = [cutoff]
+    where = "created_at >= ?"
+    if event_types:
+        placeholders = ",".join("?" for _ in event_types)
+        where += f" AND event_type IN ({placeholders})"
+        params.extend(event_types)
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT event_type, COUNT(*) AS count
+            FROM events
+            WHERE {where}
+            GROUP BY event_type
+            """,
+            tuple(params),
+        ).fetchall()
+    return {str(row["event_type"]): int(row["count"]) for row in rows}
 
 
 def prune_old_events(*, normal_days: int = 7, important_days: int = 30) -> dict[str, int]:

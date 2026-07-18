@@ -220,6 +220,27 @@ def _is_nonretryable_model_config_error(error_text: str) -> bool:
     return any(marker.lower() in text for marker in markers)
 
 
+def _is_model_connectivity_error(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    markers = (
+        "连接失败",
+        "connection refused",
+        "actively refused",
+        "目标计算机积极拒绝",
+        "winerror 10061",
+        "failed to establish a new connection",
+        "connection aborted",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+    )
+    return any(marker.lower() in text for marker in markers)
+
+
+def _should_stop_score_strategy_retries(error_text: str) -> bool:
+    return _is_nonretryable_model_config_error(error_text) or _is_model_connectivity_error(error_text)
+
+
 def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int] | None, str]:
     """单次岗位评分：模型输出三项分数，系统负责加权。
 
@@ -253,8 +274,8 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
         )
     except Exception as exc:
         last_call_error = str(exc)
-        if _is_nonretryable_model_config_error(last_call_error):
-            runtime_state.log(f"评分模型配置不可用: {exc}，本岗位停止评分重试", source="model")
+        if _should_stop_score_strategy_retries(last_call_error):
+            runtime_state.log(f"评分模型当前不可用: {exc}，本岗位停止评分重试", source="model")
             return None, f"模型调用失败: {last_call_error}"
         runtime_state.log(f"评分第1次调用异常: {exc}，进入第2次重试（关闭思考）…", source="model")
         content = ""
@@ -276,8 +297,8 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
         )
     except Exception as exc:
         last_call_error = str(exc)
-        if _is_nonretryable_model_config_error(last_call_error):
-            runtime_state.log(f"评分模型配置不可用: {exc}，本岗位停止评分重试", source="model")
+        if _should_stop_score_strategy_retries(last_call_error):
+            runtime_state.log(f"评分模型当前不可用: {exc}，本岗位停止评分重试", source="model")
             return None, f"模型调用失败: {last_call_error}"
         runtime_state.log(f"评分第2次调用异常: {exc}，进入第3次重试（关闭思考+调整温度）…", source="model")
         content = ""

@@ -76,11 +76,14 @@ def shutdown_model_executor() -> None:
 async def lifespan(app: FastAPI):
     Config.load()
     database.init_db()
+    company_repair = database.repair_invalid_company_names()
     database.upsert_run(runtime_state.run_id, control=runtime_state.control, started_at=runtime_state.started_at)
     cleanup = database.prune_old_events(normal_days=7, important_days=30)
     cache.load()
     runtime_state.log("Job Seeker 服务已启动")
     runtime_state.log(f"岗位评分版本: {SCORING_VERSION}")
+    if company_repair.get("repaired"):
+        runtime_state.log(f"已修复历史错误公司字段 {company_repair['repaired']} 条", source="database")
     if cleanup.get("deleted"):
         runtime_state.log(f"已清理过期运行事件 {cleanup['deleted']} 条", source="database")
     try:
@@ -306,6 +309,21 @@ async def status():
     result = runtime_state.as_dict(cache.status(), cache.cache_status())
     result["database"] = database.database_stats()
     result["run_summary"] = database.summarize_run(runtime_state.run_id)
+    result["diagnostics"] = {
+        "recent_event_counts_24h": database.recent_event_counts(
+            24,
+            (
+                "model_failed",
+                "model_score_degraded_pause",
+                "model_timeout",
+                "search_scroll_target_missing",
+                "search_result_scroll_all_targets_failed",
+                "loop_failed",
+                "backend_unavailable_pause",
+                "job_detail_popup_blocked",
+            ),
+        )
+    }
     greeting = greeting_service.get_greeting()
     result["greeting"] = {
         "confirmed": bool(greeting.get("confirmed")),

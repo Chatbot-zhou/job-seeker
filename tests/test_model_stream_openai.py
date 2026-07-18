@@ -226,3 +226,24 @@ def test_job_score_stops_retrying_on_model_config_error(monkeypatch) -> None:
     assert "模型调用失败" in reply
     assert len(calls) == 1
     assert any("本岗位停止评分重试" in message for message in logs)
+
+
+def test_job_score_stops_retrying_on_connection_refused(monkeypatch) -> None:
+    import core
+
+    calls: list[str] = []
+    logs: list[str] = []
+
+    def fail_stream(*args, **kwargs):
+        calls.append(str(kwargs.get("model", "")))
+        raise RuntimeError("OpenAI 连接失败: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>")
+
+    monkeypatch.setattr(core, "_stream_messages", fail_stream)
+    monkeypatch.setattr(core.runtime_state, "log", lambda message, **kwargs: logs.append(message))
+
+    scores, reply = core.calculate_job_score("岗位", "用户画像")
+
+    assert scores is None
+    assert "模型调用失败" in reply
+    assert len(calls) == 1
+    assert any("评分模型当前不可用" in message for message in logs)

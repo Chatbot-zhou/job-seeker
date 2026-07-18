@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.23
+// @version      2026.06.26.24
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06.26.23',
+        scriptVersion: '2026.06.26.24',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -791,6 +791,46 @@
         normalizedText(node) {
             return String(node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
         },
+        normalizePlainText(value) {
+            return String(value || '').replace(/\s+/g, ' ').trim();
+        },
+        sanitizeCompanyName(value, title = '', salary = '') {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            const titleText = this.normalizePlainText(title);
+            const salaryText = this.normalizePlainText(salary);
+            const salaryLike = /(?:\d+(?:\.\d+)?\s*[-~至]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*以上|\d+(?:\.\d+)?\s*以下)\s*[kK千万]?|面议|薪资open/i;
+            const badFragments = /职位|岗位|经验|学历|立即沟通|收藏|举报/;
+            const parts = raw
+                .split(/\r?\n|\t| {2,}/)
+                .map(text => this.normalizePlainText(text))
+                .filter(Boolean);
+            const candidates = parts.length ? parts : [this.normalizePlainText(raw)];
+            for (const candidate of candidates) {
+                if (!candidate || candidate.length > 80) continue;
+                if (titleText && candidate === titleText) continue;
+                if (salaryText && candidate.includes(salaryText)) continue;
+                if (salaryLike.test(candidate)) continue;
+                if (titleText && candidate.includes(titleText) && (salaryLike.test(candidate) || candidate.length > titleText.length + 4)) continue;
+                if (badFragments.test(candidate) && titleText && candidate.includes(titleText)) continue;
+                return candidate;
+            }
+            return '';
+        },
+        isBackendUnavailableError(value) {
+            const text = String(value?.message || value || '').toLowerCase();
+            if (!text) return false;
+            if (text.includes('background shutdown')) return true;
+            if (text.includes('后端未连接') || text.includes('api 服务未连接')) return true;
+            if (text.includes('failed to fetch') || text.includes('networkerror')) return true;
+            if (text.includes('econnrefused') || text.includes('connection refused') || text.includes('winerror 10061')) return true;
+            return text.includes('/jobs/analyze') && (
+                text.includes('请求出错')
+                || text.includes('请求失败')
+                || text.includes('network')
+                || text.includes('refused')
+            );
+        },
         jsonVisibleText(value, maxItems = 80) {
             const parts = [];
             const walk = (item, depth = 0) => {
@@ -1020,6 +1060,7 @@
                 '打招呼入口失败',
                 'BOSS 拒绝打招呼入口请求',
                 'chat_entry_quota_reminder_unconfirmed',
+                'chat_entry_quota_reminder_no_chat_url',
                 'chat_entry_quota_reminder_repeated',
             ];
             return patterns.some(pattern => content.includes(pattern));
@@ -1340,7 +1381,15 @@
                 const handleResponse = (resp) => {
                     if (resp.status != 200) {
                         banner(`请求失败: ${resp.status}`);
-                        reject(resp.status);
+                        const raw = resp.responseText ?? resp.response ?? '';
+                        let detail = '';
+                        try {
+                            const parsed = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw;
+                            detail = parsed?.detail || parsed?.message || '';
+                        } catch (e) {
+                            detail = String(raw || '').slice(0, 240);
+                        }
+                        reject(`请求失败: ${path} HTTP ${resp.status}${detail ? ` ${detail}` : ''}`);
                         return;
                     }
                     try {
@@ -1825,6 +1874,50 @@
                 return Boolean(state.done && state.runKey === preferredFeedRunKey());
             };
 
+            const preferredFeedTabNames = () => feedTabs.map(tab => tab.name);
+
+            const savePreferredFeedProgress = (status = 'active', extra = {}) => {
+                if (currentJobSource !== 'preferred_feed') return;
+                savePreferredFeedState({
+                    done: false,
+                    active: true,
+                    status,
+                    tabs: preferredFeedTabNames(),
+                    currentFeedTabIndex,
+                    currentFeedTabName,
+                    feedTabProcessedCount,
+                    feedTabMaxJobs,
+                    pageInstanceId: PAGE_INSTANCE_ID,
+                    ...extra,
+                });
+            };
+
+            const restorePreferredFeedProgress = () => {
+                const state = loadPreferredFeedState();
+                if (!state || state.runKey !== preferredFeedRunKey() || state.done || !state.active) {
+                    return null;
+                }
+                const savedName = tools.normalizeFeedTabText(state.currentFeedTabName || '');
+                let index = -1;
+                if (savedName) {
+                    index = feedTabs.findIndex(tab => tools.normalizeFeedTabText(tab.name) === savedName);
+                }
+                const savedIndex = Number(state.currentFeedTabIndex);
+                if (index < 0 && Number.isFinite(savedIndex) && savedIndex >= 0 && savedIndex < feedTabs.length) {
+                    if (!savedName || tools.normalizeFeedTabText(feedTabs[savedIndex].name) === savedName) {
+                        index = savedIndex;
+                    }
+                }
+                if (index < 0) return null;
+                const processed = Number(state.feedTabProcessedCount);
+                return {
+                    index,
+                    name: feedTabs[index].name,
+                    feedTabProcessedCount: Number.isFinite(processed) ? Math.max(0, Math.floor(processed)) : 0,
+                    status: String(state.status || ''),
+                };
+            };
+
             const preferredFeedCooldownKey = () => (
                 `${preferredFeedRunKey()}::${searchRoundId || 0}::${Math.floor(Number(cooldownUntil || 0) / 1000)}`
             );
@@ -2183,6 +2276,29 @@
                     return true;
                 }
                 return !this.pause;
+            };
+
+            const handleBackendUnavailable = async (reason, sourcePage = 'search') => {
+                const message = `后端不可用，脚本已暂停: ${reason}`;
+                console.warn(message);
+                logger.add(message);
+                setSearchAction(message);
+                this.pause = true;
+                started = false;
+                booting = false;
+                logger.setPaused(true);
+                finishGreetingWait();
+                finishJobProgress('后端不可用暂停');
+                releaseSearchLease();
+                noteBackendOffline(message);
+                await api.event('backend_unavailable_pause', message, 'script', 'error', {
+                    reason: String(reason || ''),
+                    sourcePage,
+                    pageInstanceId: PAGE_INSTANCE_ID,
+                    action: getSearchAction(),
+                }).catch(() => null);
+                await api.heartbeat('search', 'error', message, scriptHeartbeatDetail()).catch(() => null);
+                return true;
             };
 
             setInterval(async () => {
@@ -2675,6 +2791,81 @@
 
             const pageHasJobSignal = () => jobLinkCount(document) >= 1 || jobCardCount(document) >= 1;
 
+            const visibleJobSignalBounds = () => {
+                const nodes = Array.from(document.querySelectorAll(`${jobLinkSelector()}, [class*="job-card"], [class*="jobCard"], [class*="job-item"], [class*="jobItem"]`))
+                    .filter(node => tools.isVisible(node))
+                    .slice(0, 20);
+                if (!nodes.length) return null;
+                const rects = nodes
+                    .map(node => node.getBoundingClientRect())
+                    .filter(rect => rect.width > 20 && rect.height > 20);
+                if (!rects.length) return null;
+                return rects.reduce((acc, rect) => ({
+                    left: Math.min(acc.left, rect.left),
+                    top: Math.min(acc.top, rect.top),
+                    right: Math.max(acc.right, rect.right),
+                    bottom: Math.max(acc.bottom, rect.bottom),
+                }), {
+                    left: rects[0].left,
+                    top: rects[0].top,
+                    right: rects[0].right,
+                    bottom: rects[0].bottom,
+                });
+            };
+
+            const overlapsJobSignalArea = (el) => {
+                const bounds = visibleJobSignalBounds();
+                if (!bounds || !el) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.left <= bounds.right + 40
+                    && rect.right >= bounds.left - 40
+                    && rect.top <= bounds.bottom + 80
+                    && rect.bottom >= bounds.top - 80;
+            };
+
+            const isLeftScrollableGeometryFallback = (el) => {
+                if (!el || el === document.body || el === document.documentElement) return false;
+                if (isJobSeekerOverlay(el) || isFilterLikeContainer(el) || isDetailLikeContainer(el)) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const canScroll = el.scrollHeight > el.clientHeight + 40;
+                const overflowY = `${style.overflowY || ''} ${style.overflow || ''}`;
+                const allowsScroll = /(auto|scroll|overlay)/i.test(overflowY);
+                const leftColumn = rect.left < window.innerWidth * 0.42
+                    && rect.width >= 240
+                    && rect.width <= Math.max(520, window.innerWidth * 0.45)
+                    && rect.height >= 300;
+                return canScroll && allowsScroll && leftColumn && pageHasJobSignal() && overlapsJobSignalArea(el);
+            };
+
+            const nearestScrollableAncestor = (el) => {
+                let cursor = el?.parentElement || null;
+                while (cursor && cursor !== document.body && cursor !== document.documentElement) {
+                    if (isScrollableJobContainer(cursor) || isLeftScrollableGeometryFallback(cursor)) return cursor;
+                    cursor = cursor.parentElement;
+                }
+                return null;
+            };
+
+            const jobListRootCandidates = () => {
+                const roots = new Set();
+                const nodes = Array.from(document.querySelectorAll(`${jobLinkSelector()}, [class*="job-card"], [class*="jobCard"], [class*="job-item"], [class*="jobItem"]`)).slice(0, 24);
+                for (const node of nodes) {
+                    let cursor = node;
+                    for (let depth = 0; cursor && depth < 8 && cursor !== document.body && cursor !== document.documentElement; depth++) {
+                        if (!isJobSeekerOverlay(cursor) && !isFilterLikeContainer(cursor) && !isDetailLikeContainer(cursor)) {
+                            if (jobLinkCount(cursor) >= 2 || jobCardCount(cursor) >= 2 || isLeftScrollableGeometryFallback(cursor)) {
+                                roots.add(cursor);
+                            }
+                        }
+                        const scrollable = nearestScrollableAncestor(cursor);
+                        if (scrollable) roots.add(scrollable);
+                        cursor = cursor.parentElement;
+                    }
+                }
+                return Array.from(roots);
+            };
+
             const isScrollableJobContainer = (el) => {
                 if (!el || el === document.body || el === document.documentElement) return false;
                 if (isJobSeekerOverlay(el)) return false;
@@ -2688,8 +2879,9 @@
                 const leftScrollableFallback = allowsScroll
                     && pageHasJobSignal()
                     && rect.left < window.innerWidth * 0.5
-                    && rect.width <= Math.max(760, window.innerWidth * 0.62);
-                return canScroll && isLikelyLeftJobArea(el) && (elementHasJobSignal(el) || leftScrollableFallback);
+                    && rect.width <= Math.max(760, window.innerWidth * 0.62)
+                    && overlapsJobSignalArea(el);
+                return canScroll && isLikelyLeftJobArea(el) && (elementHasJobSignal(el) || leftScrollableFallback || isLeftScrollableGeometryFallback(el));
             };
 
             const jobContainerScore = (el) => {
@@ -2769,8 +2961,12 @@
                     document.querySelectorAll(selector).forEach(pushCandidate);
                 }
 
+                jobListRootCandidates().forEach(pushCandidate);
+
                 const jobAnchors = Array.from(document.querySelectorAll(jobLinkSelector())).slice(0, 8);
                 for (const jobLink of jobAnchors) {
+                    const scrollable = nearestScrollableAncestor(jobLink);
+                    if (scrollable) pushCandidate(scrollable);
                     let cursor = jobLink ? jobLink.parentElement : null;
                     while (cursor && cursor !== document.body && cursor !== document.documentElement) {
                         pushCandidate(cursor);
@@ -2794,6 +2990,9 @@
                         const style = window.getComputedStyle(el);
                         if (!/(auto|scroll|overlay)/i.test(`${style.overflowY || ''} ${style.overflow || ''}`)) return;
                         pushCandidate(el);
+                    });
+                    document.querySelectorAll('div,section,main,ul,ol').forEach((el) => {
+                        if (isLeftScrollableGeometryFallback(el)) pushCandidate(el);
                     });
                 }
 
@@ -2845,16 +3044,24 @@
 
             const dispatchJobListWheel = (container, distance) => {
                 const rect = container.getBoundingClientRect();
+                const clientX = Math.round(rect.left + Math.min(rect.width - 8, Math.max(8, rect.width / 2)));
+                const clientY = Math.round(rect.top + Math.min(rect.height - 8, Math.max(8, rect.height / 2)));
+                const pointTarget = document.elementFromPoint(clientX, clientY);
+                const firstJobSignal = container.querySelector?.(`${jobLinkSelector()}, [class*="job-card"], [class*="jobCard"], [class*="job-item"], [class*="jobItem"]`);
+                const target = pointTarget && container.contains(pointTarget)
+                    ? pointTarget
+                    : (firstJobSignal || container);
                 const eventInit = {
                     bubbles: true,
                     cancelable: true,
                     view: window,
                     deltaY: distance,
                     deltaMode: 0,
-                    clientX: Math.round(rect.left + Math.min(rect.width - 8, Math.max(8, rect.width / 2))),
-                    clientY: Math.round(rect.top + Math.min(rect.height - 8, Math.max(8, rect.height / 2))),
+                    clientX,
+                    clientY,
                 };
                 try {
+                    target.dispatchEvent(new WheelEvent('wheel', eventInit));
                     container.dispatchEvent(new WheelEvent('wheel', eventInit));
                 } catch (e) {
                     // 旧环境不支持 WheelEvent 时，直接滚动仍可作为兜底。
@@ -2886,6 +3093,7 @@
                 let after = container.scrollTop;
                 let afterFingerprint = jobListFingerprint(container);
                 let afterDocumentFingerprint = jobListFingerprint(document);
+                let firstMovedAt = 0;
                 while (Date.now() < deadline) {
                     await tools.asyncSleep(500);
                     after = container.scrollTop;
@@ -2893,7 +3101,9 @@
                     afterDocumentFingerprint = jobListFingerprint(document);
                     const moved = Math.abs(after - before) >= 5;
                     const changed = afterFingerprint !== beforeFingerprint || afterDocumentFingerprint !== beforeDocumentFingerprint;
-                    if (moved || changed) break;
+                    if (moved && !firstMovedAt) firstMovedAt = Date.now();
+                    if (changed) break;
+                    if (moved && Date.now() - firstMovedAt >= 2500) break;
                     if (!forcedAgain && Date.now() + 7500 < deadline) {
                         forcedAgain = true;
                         dispatchJobListWheel(container, distance);
@@ -3215,7 +3425,7 @@
                 };
             };
 
-            const selectPreferredFeedTab = async (index) => {
+            const selectPreferredFeedTab = async (index, options = {}) => {
                 const expectedTab = feedTabs[index];
                 if (!expectedTab) return false;
                 const refreshed = await discoverPreferredFeedTabs();
@@ -3232,15 +3442,26 @@
                 }
                 currentFeedTabIndex = index;
                 currentFeedTabName = expectedTab.name;
-                feedTabProcessedCount = 0;
+                const restoredProcessed = Number(options.feedTabProcessedCount);
+                feedTabProcessedCount = Number.isFinite(restoredProcessed)
+                    ? Math.max(0, Math.floor(restoredProcessed))
+                    : 0;
                 feedTabMaxJobs = OPTIONS.preferredFeedMaxJobsPerTab;
+                savePreferredFeedProgress(options.restore ? 'restoring' : 'switching', {
+                    switchReason: options.reason || '',
+                });
                 setSearchAction(`切换自定义推荐源: ${expectedTab.name}`);
-                logger.add(`开始处理推荐源: ${expectedTab.name}`);
-                await api.event('preferred_feed_tab_started', `开始处理推荐源: ${expectedTab.name}`, 'script', 'info', {
+                const startMessage = options.restore
+                    ? `恢复处理推荐源: ${expectedTab.name}（已处理 ${feedTabProcessedCount}/${feedTabMaxJobs || '不限'}）`
+                    : `开始处理推荐源: ${expectedTab.name}`;
+                logger.add(startMessage);
+                await api.event('preferred_feed_tab_started', startMessage, 'script', 'info', {
                     name: expectedTab.name,
                     index,
                     total: feedTabs.length,
                     maxJobs: feedTabMaxJobs,
+                    processed: feedTabProcessedCount,
+                    restored: Boolean(options.restore),
                 });
                 let beforeFingerprint = jobListFingerprint(document);
                 let beforeHref = location.href;
@@ -3302,6 +3523,12 @@
                 resetKeywordState();
                 lastJobListEventKey = '';
                 currentJobSource = 'preferred_feed';
+                savePreferredFeedProgress('active', {
+                    selected,
+                    listChanged,
+                    urlChanged,
+                    assumed: !selected && !listChanged && !urlChanged,
+                });
                 await api.event('preferred_feed_tab_switch_confirmed', `推荐源切换已确认: ${expectedTab.name}`, 'script', 'info', {
                     name: expectedTab.name,
                     index,
@@ -3371,6 +3598,10 @@
             const markPreferredFeedJobHandled = async (reason = '') => {
                 if (currentJobSource !== 'preferred_feed') return false;
                 feedTabProcessedCount += 1;
+                savePreferredFeedProgress('active', {
+                    lastHandledReason: reason,
+                    lastHandledAt: Date.now(),
+                });
                 if (feedTabMaxJobs > 0 && feedTabProcessedCount >= feedTabMaxJobs) {
                     await api.event('preferred_feed_tab_limit_reached', `推荐源 ${currentFeedTabName} 已处理 ${feedTabProcessedCount}/${feedTabMaxJobs}，切换下一个推荐源`, 'script', 'info', {
                         name: currentFeedTabName,
@@ -3431,8 +3662,26 @@
                     reason: result.reason,
                     candidates: result.candidates || [],
                 });
-                if (await selectPreferredFeedTab(0)) return true;
-                return switchToNextPreferredFeedTab('首个推荐源切换未确认');
+                const restored = restorePreferredFeedProgress();
+                const startIndex = restored ? restored.index : 0;
+                if (restored) {
+                    const message = `恢复上次推荐源进度: ${restored.name} / 已处理 ${restored.feedTabProcessedCount}/${OPTIONS.preferredFeedMaxJobsPerTab || '不限'}`;
+                    logger.add(message);
+                    await api.event('preferred_feed_progress_restored', message, 'script', 'info', {
+                        name: restored.name,
+                        index: restored.index,
+                        processed: restored.feedTabProcessedCount,
+                        status: restored.status,
+                    });
+                }
+                if (await selectPreferredFeedTab(startIndex, {
+                    restore: Boolean(restored),
+                    feedTabProcessedCount: restored?.feedTabProcessedCount || 0,
+                    reason: restored ? 'restore_after_refresh' : 'start_first_custom_feed',
+                })) return true;
+                currentFeedTabIndex = startIndex;
+                currentFeedTabName = feedTabs[startIndex]?.name || '';
+                return switchToNextPreferredFeedTab(restored ? '恢复推荐源切换失败' : '首个推荐源切换未确认');
             };
 
             const getJobHrefs = async () => {
@@ -3830,7 +4079,11 @@
                 const title = tools.textOf(SELECTORS.ZHIPIN.DETAIL.JOBNAME_CANDIDATES, doc);
                 const salary = tools.textOf(SELECTORS.ZHIPIN.DETAIL.SALARY_CANDIDATES, doc);
                 const detail = tools.textOf(SELECTORS.ZHIPIN.DETAIL.DETAIL_CANDIDATES, doc);
-                const company = tools.textOf(SELECTORS.ZHIPIN.DETAIL.COMPANY_CANDIDATES, doc);
+                const company = tools.sanitizeCompanyName(
+                    tools.textOf(SELECTORS.ZHIPIN.DETAIL.COMPANY_CANDIDATES, doc),
+                    title,
+                    salary
+                );
                 const city = tools.textOf(SELECTORS.ZHIPIN.DETAIL.CITY_CANDIDATES, doc);
                 const chatUrl = chatBtn && (chatBtn.getAttribute(SELECTORS.ZHIPIN.DETAIL.CHATURL) || chatBtn.getAttribute('href') || chatBtn.dataset.redirectUrl);
                 const addUrl = chatBtn && (chatBtn.dataset.url || chatBtn.getAttribute('data-url') || chatBtn.getAttribute('href'));
@@ -4015,28 +4268,40 @@
                     let data = await fetchEntry(false);
                     let quotaReason = tools.quotaReminderReasonFromValue(data);
                     if (quotaReason) {
+                        let redirectedChatUrl = tools.findChatUrlDeep(data);
                         await api.event('quota_reminder_response_detected', `打招呼入口返回额度提醒: ${quotaReason}`, 'script', 'warning', {
                             reason: quotaReason,
+                            hasRedirect: Boolean(redirectedChatUrl),
                         });
-                        const confirmed = await waitForQuotaReminderConfirmation('chat_entry_response', 8000);
-                        if (!confirmed) {
-                            await api.event('quota_reminder_not_rendered', `接口返回额度提醒，但页面未发现可确认弹窗，已停止本次打招呼入口流程: ${quotaReason}`, 'script', 'error', {
+                        if (redirectedChatUrl) {
+                            await api.event('quota_reminder_response_proceed', `接口返回额度提醒但已给出聊天入口，继续打开聊天页: ${quotaReason}`, 'script', 'info', {
                                 reason: quotaReason,
+                                chatUrl: redirectedChatUrl,
                             });
-                            throw new Error(`chat_entry_quota_reminder_unconfirmed: ${quotaReason}`);
-                        }
-                        data = await fetchEntry(true);
-                        quotaReason = tools.quotaReminderReasonFromValue(data);
-                        if (quotaReason) {
-                            await api.event('quota_reminder_response_repeated', `温馨提示确认后入口仍返回提醒，已停止本次打招呼入口流程: ${quotaReason}`, 'script', 'error', {
-                                reason: quotaReason,
-                            });
-                            throw new Error(`chat_entry_quota_reminder_repeated: ${quotaReason}`);
+                        } else {
+                            const confirmed = await waitForQuotaReminderConfirmation('chat_entry_response', 8000);
+                            if (!confirmed) {
+                                await api.event('quota_reminder_not_rendered', `接口返回额度提醒且没有聊天入口，页面也未发现可确认弹窗，已停止本次打招呼入口流程: ${quotaReason}`, 'script', 'error', {
+                                    reason: quotaReason,
+                                });
+                                throw new Error(`chat_entry_quota_reminder_no_chat_url: ${quotaReason}`);
+                            }
+                            data = await fetchEntry(true);
+                            quotaReason = tools.quotaReminderReasonFromValue(data);
+                            redirectedChatUrl = tools.findChatUrlDeep(data);
+                            if (quotaReason && !redirectedChatUrl) {
+                                await api.event('quota_reminder_response_repeated', `温馨提示确认后入口仍返回提醒且没有聊天入口，已停止本次打招呼入口流程: ${quotaReason}`, 'script', 'error', {
+                                    reason: quotaReason,
+                                });
+                                throw new Error(`chat_entry_quota_reminder_repeated: ${quotaReason}`);
+                            }
                         }
                     }
-                    if (data.code === 0) {
-                        await api.event('chat_entry_request_finished', '打招呼入口请求成功', 'script', 'info', {
-                            hasRedirect: Boolean(tools.findChatUrlDeep(data)),
+                    const finalRedirectChatUrl = tools.findChatUrlDeep(data);
+                    if (data.code === 0 || finalRedirectChatUrl) {
+                        await api.event('chat_entry_request_finished', finalRedirectChatUrl ? '打招呼入口已返回聊天入口' : '打招呼入口请求成功', 'script', 'info', {
+                            hasRedirect: Boolean(finalRedirectChatUrl),
+                            code: data?.code,
                         });
                         return data;
                     }
@@ -4406,6 +4671,10 @@
                         setTimeout(loop, 0);
                     }
                 } catch (e) {
+                    if (tools.isBackendUnavailableError(e)) {
+                        await handleBackendUnavailable(String(e), 'search');
+                        return;
+                    }
                     if (tools.isPlatformLimitError(e)) {
                         await handlePageFailure(tools.platformLimitReason(e), 'platform_limit', 'search');
                         return;
@@ -4543,6 +4812,10 @@
                     // 开始循环
                     loop();
                 } catch (e) {
+                    if (tools.isBackendUnavailableError(e)) {
+                        await handleBackendUnavailable(String(e), 'search_startup');
+                        return;
+                    }
                     if (tools.isPlatformLimitError(e)) {
                         await handlePageFailure(tools.platformLimitReason(e), 'platform_limit', 'search');
                         return;
@@ -4626,7 +4899,11 @@
                 const title = tools.textOf(SELECTORS.ZHIPIN.DETAIL.JOBNAME_CANDIDATES);
                 const salary = tools.textOf(SELECTORS.ZHIPIN.DETAIL.SALARY_CANDIDATES);
                 const detail = tools.textOf(SELECTORS.ZHIPIN.DETAIL.DETAIL_CANDIDATES);
-                const company = tools.textOf(SELECTORS.ZHIPIN.DETAIL.COMPANY_CANDIDATES);
+                const company = tools.sanitizeCompanyName(
+                    tools.textOf(SELECTORS.ZHIPIN.DETAIL.COMPANY_CANDIDATES),
+                    title,
+                    salary
+                );
                 const city = tools.textOf(SELECTORS.ZHIPIN.DETAIL.CITY_CANDIDATES);
                 if (!title) throw new Error('未找到职位名称');
                 if (!salary) throw new Error('未找到职位薪资');
@@ -5274,6 +5551,8 @@
             isCompositeFeedName: (text) => tools.isCompositeFeedName(text),
             isLikelyCustomFeedName: (text) => tools.isLikelyCustomFeedName(text),
             isStrongCustomFeedName: (text) => tools.isStrongCustomFeedName(text),
+            sanitizeCompanyName: (value, title, salary) => tools.sanitizeCompanyName(value, title, salary),
+            isBackendUnavailableError: (value) => tools.isBackendUnavailableError(value),
         });
         return;
     }

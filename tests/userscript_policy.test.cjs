@@ -53,6 +53,11 @@ test('job list scrolling is verified and never falls back to window scrolling', 
   assert.match(source, /data-job-seeker-overlay/);
   assert.match(source, /pageHasJobSignal/);
   assert.match(source, /leftScrollableFallback/);
+  assert.match(source, /nearestScrollableAncestor/);
+  assert.match(source, /jobListRootCandidates/);
+  assert.match(source, /isLeftScrollableGeometryFallback/);
+  assert.match(source, /overlapsJobSignalArea/);
+  assert.match(source, /pointTarget/);
   assert.match(source, /jobLinkCount\(el\) < 3 && jobCardCount\(el\) < 3/);
   assert.doesNotMatch(source, /window\.scrollBy\s*\(/);
 });
@@ -123,13 +128,27 @@ test('finished preferred feed phase does not restart from the first tab', () => 
   assert.ok(resetBranch >= 0 && sessionReset > resetBranch, 'new backend runs should clear the previous preferred-feed completion state');
 });
 
+test('active preferred feed progress is saved and restored after refresh', () => {
+  assert.match(source, /savePreferredFeedProgress/);
+  assert.match(source, /restorePreferredFeedProgress/);
+  assert.match(source, /preferred_feed_progress_restored/);
+  assert.match(source, /restore_after_refresh/);
+  const prepareBranch = source.indexOf('const preparePreferredFeeds = async () => {');
+  const rediscover = source.indexOf('const result = await discoverPreferredFeedTabs();', prepareBranch);
+  const restoreBranch = source.indexOf('const restored = restorePreferredFeedProgress();', prepareBranch);
+  const selectBranch = source.indexOf('selectPreferredFeedTab(startIndex', prepareBranch);
+  assert.ok(prepareBranch >= 0 && rediscover > prepareBranch);
+  assert.ok(restoreBranch > rediscover, 'preferred feed state should be restored after current DOM tabs are rediscovered');
+  assert.ok(selectBranch > restoreBranch, 'restored custom tab should be selected before reading jobs');
+});
+
 test('preferred feed tab switching retries instead of skipping target tabs', () => {
   assert.match(source, /clickPreferredFeedElement/);
   assert.match(source, /preferred_feed_tab_switch_retry/);
   assert.match(source, /preferred_feed_tab_switch_assumed/);
   assert.doesNotMatch(source, /preferred_feed_tab_switch_unconfirmed/);
   assert.doesNotMatch(source, /推荐源切换未确认，跳过/);
-  const switchBranch = source.indexOf('const selectPreferredFeedTab = async (index) => {');
+  const switchBranch = source.indexOf('const selectPreferredFeedTab = async (index');
   const retryBranch = source.indexOf('for (let attempt = 1; attempt <= maxSwitchAttempts; attempt++)', switchBranch);
   const confirmBranch = source.indexOf("api.event('preferred_feed_tab_switch_confirmed'", switchBranch);
   assert.ok(switchBranch >= 0 && retryBranch > switchBranch);
@@ -186,9 +205,28 @@ test('boss quota reminder is confirmed instead of treated as a hard limit', () =
   assert.match(source, /confirmQuotaReminderDialog/);
   assert.match(source, /clickLikeUser/);
   assert.match(source, /quota_reminder_confirmed/);
+  assert.match(source, /quota_reminder_response_proceed/);
+  assert.match(source, /接口返回额度提醒但已给出聊天入口，继续打开聊天页/);
   assert.match(source, /chat_entry_quota_reminder_unconfirmed/);
   assert.doesNotMatch(source, /继续当前流程: \$\{quotaReason\}/);
   assert.doesNotMatch(source, /dailyGreetSafeLimit|sessionGreetLimit/);
+});
+
+test('company extraction does not mistake title and salary for company', () => {
+  assert.equal(hooks.sanitizeCompanyName('AI研发工程师\n15-25K', 'AI研发工程师', '15-25K'), '');
+  assert.equal(hooks.sanitizeCompanyName('AI研发工程师 15-25K', 'AI研发工程师', '15-25K'), '');
+  assert.equal(hooks.sanitizeCompanyName('杭州示例科技有限公司\nD轮及以上', 'AI研发工程师', '15-25K'), '杭州示例科技有限公司');
+});
+
+test('backend shutdown pauses search loop instead of retrying forever', () => {
+  assert.equal(hooks.isBackendUnavailableError('请求失败: /jobs/analyze HTTP 500 background shutdown'), true);
+  assert.equal(hooks.isBackendUnavailableError('OpenAI 请求失败: HTTP 404'), false);
+  assert.match(source, /handleBackendUnavailable/);
+  assert.match(source, /backend_unavailable_pause/);
+  assert.match(source, /后端不可用，脚本已暂停/);
+  const catchBranch = source.indexOf('if (tools.isBackendUnavailableError(e))');
+  const loopFailedBranch = source.indexOf("api.event('loop_failed'", catchBranch);
+  assert.ok(catchBranch >= 0 && loopFailedBranch > catchBranch, 'backend unavailable should be checked before generic loop_failed');
 });
 
 test('background tabs remain non-active', () => {
