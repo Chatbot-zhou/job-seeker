@@ -389,6 +389,7 @@ class RuntimeState:
             "cache": cache_status,
             "limits": {
                 "score_threshold": Config.score_threshold,
+                "search_round_cooldown_min_minutes": Config.search_round_cooldown_min_minutes,
                 "search_round_cooldown_minutes": Config.search_round_cooldown_minutes,
                 "tag_search_delay_seconds": Config.tag_search_delay_seconds,
                 "tag_search_delay_max_seconds": Config.tag_search_delay_max_seconds,

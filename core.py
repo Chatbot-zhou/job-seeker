@@ -199,6 +199,27 @@ def _score_options(*, think: bool, temperature: float = 0.2) -> dict[str, Any]:
     }
 
 
+def _is_nonretryable_model_config_error(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    markers = (
+        "模型或 endpoint 不存在/无权限",
+        "invalidendpointormodel",
+        "model or endpoint",
+        "does not exist",
+        "do not have access",
+        "not have access",
+        "no access",
+        "unauthorized",
+        "forbidden",
+        "permission",
+        "api key",
+        "401",
+        "403",
+        "404",
+    )
+    return any(marker.lower() in text for marker in markers)
+
+
 def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int] | None, str]:
     """单次岗位评分：模型输出三项分数，系统负责加权。
 
@@ -220,6 +241,8 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
     # 令牌无限制：early_stop 会在检测到完整三行/JSON 后主动截断，无需令牌限长
     first_think = not bool(getattr(Config, "disable_model_thinking", True))
 
+    last_call_error = ""
+
     # ── 第 1 次：使用用户配置的思考设置 ──
     try:
         content = _stream_messages(
@@ -229,6 +252,10 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
             early_stop="job_score",
         )
     except Exception as exc:
+        last_call_error = str(exc)
+        if _is_nonretryable_model_config_error(last_call_error):
+            runtime_state.log(f"评分模型配置不可用: {exc}，本岗位停止评分重试", source="model")
+            return None, f"模型调用失败: {last_call_error}"
         runtime_state.log(f"评分第1次调用异常: {exc}，进入第2次重试（关闭思考）…", source="model")
         content = ""
     reply = extract_llm_reply(content)
@@ -248,6 +275,10 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
             model=Config.think_model, options=options_2, early_stop="job_score",
         )
     except Exception as exc:
+        last_call_error = str(exc)
+        if _is_nonretryable_model_config_error(last_call_error):
+            runtime_state.log(f"评分模型配置不可用: {exc}，本岗位停止评分重试", source="model")
+            return None, f"模型调用失败: {last_call_error}"
         runtime_state.log(f"评分第2次调用异常: {exc}，进入第3次重试（关闭思考+调整温度）…", source="model")
         content = ""
     reply = extract_llm_reply(content)
@@ -267,9 +298,12 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
             model=Config.think_model, options=options_3, early_stop="job_score",
         )
     except Exception as exc:
+        last_call_error = str(exc)
         runtime_state.log(f"评分第3次调用异常: {exc}，已无更多重试", source="model")
-        return None, ""
+        return None, f"模型调用失败: {last_call_error}"
     reply = extract_llm_reply(content)
+    if not reply and last_call_error:
+        return None, f"模型调用失败: {last_call_error}"
     return _parse_score_breakdown(reply), reply
 
 
@@ -295,13 +329,14 @@ def analyze_job(
                 summary = reply_text[:180]
             else:
                 summary = "模型没有返回内容（已重试3次，建议增大评分令牌数或关闭模型思考）"
+            model_risk = "模型调用失败" if summary.startswith("模型调用失败") else "模型评分格式错误"
             return _analysis_from_weighted_score(
                 0,
                 0,
                 0,
                 greeting=greeting,
-                match_reason=f"模型评分格式错误，已跳过。模型原始输出: {summary}",
-                risks=["模型评分格式错误"],
+                match_reason=f"{model_risk}，已跳过。模型原始输出: {summary}",
+                risks=[model_risk],
             )
         return _analysis_from_weighted_score(
             scores["学历专业"],

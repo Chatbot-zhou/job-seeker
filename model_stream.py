@@ -9,7 +9,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from config import Config
+from config import Config, openai_compatible_config_hint
 from runtime_state import runtime_state
 
 
@@ -24,6 +24,8 @@ JOB_SCORE_TIMEOUT_SECONDS = 120
 MODEL_MAX_RETRIES = 3
 
 JOB_SCORE_EARLY_STOP_LABELS = {"计算职位匹配度"}
+OPENAI_THINKING_CONTROL_UNSUPPORTED: set[str] = set()
+OPENAI_THINKING_CONTROL_LOCK = threading.Lock()
 
 
 class ModelRepetitionError(RuntimeError):
@@ -153,6 +155,63 @@ def unsupported_openai_parameter(payload: dict[str, Any], error_body: str) -> st
     return ""
 
 
+def openai_thinking_control_parameter(payload: dict[str, Any]) -> str:
+    for key in ("enable_thinking", "thinking", "reasoning"):
+        if key in payload:
+            return key
+    return ""
+
+
+def openai_thinking_control_unsupported(payload: dict[str, Any], error_body: str) -> bool:
+    key = openai_thinking_control_parameter(payload)
+    if not key:
+        return False
+    text = (error_body or "").lower()
+    parameter_tokens = {key.lower()}
+    if key == "enable_thinking":
+        parameter_tokens.add("thinking")
+    control_markers = (
+        "unsupported",
+        "not support",
+        "not supported",
+        "unknown",
+        "unrecognized",
+        "unexpected",
+        "invalid parameter",
+        "unknown parameter",
+        "unknown field",
+        "invalid field",
+        "unrecognized request argument",
+        "extra_forbidden",
+        "not permitted",
+    )
+    return any(token in text for token in parameter_tokens) and any(marker in text for marker in control_markers)
+
+
+def openai_model_or_endpoint_error(status_code: int, error_body: str) -> bool:
+    text = (error_body or "").lower()
+    markers = (
+        "invalidendpointormodel",
+        "model or endpoint",
+        "does not exist",
+        "do not have access",
+        "not have access",
+        "no access",
+        "unauthorized",
+        "forbidden",
+        "permission",
+    )
+    return status_code in {401, 403, 404} or any(marker in text for marker in markers)
+
+
+def openai_http_error_message(status_code: int, error_body: str) -> str:
+    hint = openai_compatible_config_hint(Config.openai_api_base, Config.think_model)
+    suffix = f"；配置提示：{hint}" if hint else ""
+    if openai_model_or_endpoint_error(status_code, error_body):
+        return f"OpenAI 模型或 endpoint 不存在/无权限: HTTP {status_code} {error_body[:500]}{suffix}"
+    return f"OpenAI 请求失败: HTTP {status_code} {error_body[:500]}{suffix}"
+
+
 def should_disable_thinking(options: dict[str, Any] | None) -> bool:
     options = options or {}
     if "think" in options:
@@ -180,8 +239,38 @@ def ollama_think_parameter_unsupported(error_text: str) -> bool:
     )
 
 
-def apply_openai_thinking_control(payload: dict[str, Any], disable_thinking: bool) -> bool:
+def openai_thinking_control_key(model: str | None = None) -> str:
+    return "|".join(
+        [
+            str(getattr(Config, "openai_api_base", "")),
+            str(getattr(Config, "external_model_profile", "generic")),
+            str(model or payload_model_name()),
+        ]
+    )
+
+
+def payload_model_name() -> str:
+    return str(getattr(Config, "think_model", ""))
+
+
+def is_openai_thinking_control_unsupported(model: str | None = None) -> bool:
+    key = openai_thinking_control_key(model)
+    with OPENAI_THINKING_CONTROL_LOCK:
+        return key in OPENAI_THINKING_CONTROL_UNSUPPORTED
+
+
+def mark_openai_thinking_control_unsupported(model: str | None = None) -> bool:
+    key = openai_thinking_control_key(model)
+    with OPENAI_THINKING_CONTROL_LOCK:
+        already = key in OPENAI_THINKING_CONTROL_UNSUPPORTED
+        OPENAI_THINKING_CONTROL_UNSUPPORTED.add(key)
+    return not already
+
+
+def apply_openai_thinking_control(payload: dict[str, Any], disable_thinking: bool, model: str | None = None) -> bool:
     if not disable_thinking:
+        return False
+    if is_openai_thinking_control_unsupported(model or str(payload.get("model") or "")):
         return False
     profile = str(getattr(Config, "external_model_profile", "generic"))
     if profile == "qwen":
@@ -209,7 +298,7 @@ def iter_openai_chat_chunks(
         "stream": True,
     }
     payload.update(openai_payload_options(options))
-    thinking_control_applied = apply_openai_thinking_control(payload, should_disable_thinking(options))
+    thinking_control_applied = apply_openai_thinking_control(payload, should_disable_thinking(options), model)
     request = Request(
         openai_chat_url(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -261,12 +350,15 @@ def iter_openai_chat_chunks(
                     yield content
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
-        if thinking_control_applied:
-            runtime_state.emit(
-                "model_thinking_control_retry",
-                "OpenAI 模型不支持当前思考控制参数，已移除后重试",
-                source="model",
-            )
+        if thinking_control_applied and openai_thinking_control_unsupported(payload, body):
+            first_time = mark_openai_thinking_control_unsupported(model)
+            if first_time:
+                runtime_state.emit(
+                    "model_thinking_control_retry",
+                    "OpenAI 模型不支持当前思考控制参数，已移除后重试；后续同模型将直接跳过该参数",
+                    source="model",
+                    detail={"model": model, "profile": getattr(Config, "external_model_profile", "generic")},
+                )
             retry_options = dict(options or {})
             retry_options["disable_thinking"] = False
             yield from iter_openai_chat_chunks(messages, model, retry_options)
@@ -283,7 +375,7 @@ def iter_openai_chat_chunks(
             retry_options.pop(unsupported_key, None)
             yield from iter_openai_chat_chunks(messages, model, retry_options)
             return
-        raise RuntimeError(f"OpenAI 请求失败: HTTP {exc.code} {body[:500]}") from exc
+        raise RuntimeError(openai_http_error_message(exc.code, body)) from exc
     except URLError as exc:
         raise RuntimeError(f"OpenAI 连接失败: {exc}") from exc
 
@@ -602,6 +694,7 @@ def stream_ollama_chat(
     # 评分调用有上层 calculate_job_score 的三层策略重试，内部不重试
     total_attempts = 1 if early_stop == "job_score" else MODEL_MAX_RETRIES + 1
     timeout_seconds = JOB_SCORE_TIMEOUT_SECONDS if early_stop == "job_score" else MODEL_CALL_TIMEOUT_SECONDS
+    max_internal_retries = max(0, total_attempts - 1)
 
     def start_worker(
         result_queue: queue.Queue[tuple[str, Any]],
@@ -626,8 +719,8 @@ def stream_ollama_chat(
 
     def retry_message(reason: str, attempt: int, error: Any | None = None) -> None:
         retry_no = attempt
-        if retry_no <= MODEL_MAX_RETRIES:
-            message = f"模型调用{reason}: {label}，第 {retry_no}/{MODEL_MAX_RETRIES} 次重试"
+        if retry_no <= max_internal_retries:
+            message = f"模型调用{reason}: {label}，第 {retry_no}/{max_internal_retries} 次重试"
             runtime_state.emit(
                 "model_retry",
                 message,
@@ -638,7 +731,7 @@ def stream_ollama_chat(
                     "provider": Config.model_provider,
                     "model": selected_model,
                     "attempt": attempt,
-                    "max_retries": MODEL_MAX_RETRIES,
+                    "max_retries": max_internal_retries,
                     "timeout_seconds": timeout_seconds,
                     "error": str(error or ""),
                 },
@@ -716,7 +809,7 @@ def stream_ollama_chat(
                         "provider": Config.model_provider,
                         "model": selected_model,
                         "attempt": attempt,
-                        "max_retries": MODEL_MAX_RETRIES,
+                        "max_retries": max_internal_retries,
                         "timeout_seconds": timeout_seconds,
                         "has_chunk": has_chunk,
                         "content_length": len(content),
@@ -813,7 +906,11 @@ def stream_ollama_chat(
             runtime_state.emit("model_finished", f"{label} 完成", source="model")
             return content
 
-    message = f"模型调用失败: {label}，已达到最大重试次数"
+    message = (
+        f"模型调用失败: {label}，已达到最大重试次数"
+        if max_internal_retries
+        else f"模型调用失败: {label}，本次调用未成功"
+    )
     runtime_state.emit(
         "model_failed",
         f"{message}: {last_error}",
@@ -823,7 +920,7 @@ def stream_ollama_chat(
             "label": label,
             "provider": Config.model_provider,
             "model": selected_model,
-            "max_retries": MODEL_MAX_RETRIES,
+            "max_retries": max_internal_retries,
             "timeout_seconds": timeout_seconds,
             "error": str(last_error or ""),
         },
@@ -855,12 +952,12 @@ def model_warmup_check() -> dict[str, Any]:
             "stream": False,
         }
         payload.update(openai_payload_options({"num_predict": 8, "temperature": 0.0}))
-        apply_openai_thinking_control(payload, True)
+        thinking_control_applied = apply_openai_thinking_control(payload, True, Config.think_model)
         started = time.monotonic()
-        try:
+        def post_payload(request_payload: dict[str, Any]) -> str:
             request = Request(
                 openai_chat_url(),
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
                 headers={
                     "Authorization": f"Bearer {Config.openai_api_key}",
                     "Content-Type": "application/json",
@@ -868,7 +965,10 @@ def model_warmup_check() -> dict[str, Any]:
                 method="POST",
             )
             with urlopen(request, timeout=30) as response:
-                raw = response.read().decode("utf-8", errors="ignore")
+                return response.read().decode("utf-8", errors="ignore")
+
+        try:
+            raw = post_payload(payload)
             data = json.loads(raw or "{}")
             if not data.get("choices"):
                 raise RuntimeError(f"响应中没有 choices: {raw[:200]}")
@@ -876,8 +976,26 @@ def model_warmup_check() -> dict[str, Any]:
             result["latency_seconds"] = round(time.monotonic() - started, 3)
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
+            if thinking_control_applied and openai_thinking_control_unsupported(payload, body):
+                mark_openai_thinking_control_unsupported(Config.think_model)
+                retry_payload = dict(payload)
+                for key in ("enable_thinking", "thinking", "reasoning"):
+                    retry_payload.pop(key, None)
+                try:
+                    raw = post_payload(retry_payload)
+                    data = json.loads(raw or "{}")
+                    if not data.get("choices"):
+                        raise RuntimeError(f"响应中没有 choices: {raw[:200]}")
+                    result["status"] = "ready"
+                    result["latency_seconds"] = round(time.monotonic() - started, 3)
+                    return result
+                except HTTPError as fallback_exc:
+                    body = fallback_exc.read().decode("utf-8", errors="ignore")
+                    result["status"] = "error"
+                    result["error"] = openai_http_error_message(fallback_exc.code, body)
+                    return result
             result["status"] = "error"
-            result["error"] = f"HTTP {exc.code}: {body[:200]}"
+            result["error"] = openai_http_error_message(exc.code, body)
         except (json.JSONDecodeError, RuntimeError, URLError, TimeoutError, OSError) as exc:
             result["status"] = "error"
             result["error"] = str(exc)

@@ -32,7 +32,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openai_api_key": "",
     "think_model": "qwen3:1.7b",
     "score_threshold": 70,
-    "search_round_cooldown_minutes": 60,
+    "search_round_cooldown_min_minutes": 1,
+    "search_round_cooldown_minutes": 5,
     "tag_search_delay_seconds": 20,
     "tag_search_delay_max_seconds": 45,
     "max_search_submissions_per_hour": 6,
@@ -117,16 +118,55 @@ def _as_hhmm(value: Any, default: str = "09:00") -> str:
 
 def _detect_external_model_profile(data: dict[str, Any]) -> str:
     profile = str(data.get("external_model_profile") or "generic").strip().lower()
-    if profile and profile != "generic":
-        return profile
     text = f"{data.get('openai_api_base', '')} {data.get('think_model', '')}".lower()
-    if "ark.cn" in text or "volces" in text or "doubao" in text:
-        return "doubao"
-    if "dashscope" in text or "qwen" in text or "通义" in text:
-        return "qwen"
+    # 模型名比网关域名更可靠：火山 Ark 也可能承载 DeepSeek/Qwen。
     if "deepseek" in text:
         return "deepseek"
+    if "dashscope" in text or "qwen" in text or "通义" in text:
+        return "qwen"
+    if "doubao" in text:
+        return "doubao"
+    if profile and profile != "generic":
+        return profile
+    if "ark.cn" in text or "volces" in text:
+        return "doubao"
     return "generic"
+
+
+def openai_compatible_config_hint(api_base: str, model: str) -> str:
+    base = str(api_base or "").strip().lower().rstrip("/")
+    model_name = str(model or "").strip()
+    model_lower = model_name.lower()
+    if "ark.cn-beijing.volces.com" not in base and "volces.com" not in base:
+        return ""
+    if "/api/coding" in base:
+        if "-251201" in model_lower or "-260" in model_lower:
+            return (
+                "当前像是在使用火山 Coding Plan，但模型名像按量在线推理 ID。"
+                "Coding Plan 的 OpenAI Base URL 通常是 https://ark.cn-beijing.volces.com/api/coding/v3，"
+                "DeepSeek 模型名通常写 deepseek-v3.2 或 ark-code-latest。"
+            )
+        return (
+            "当前使用火山 Coding Plan Base URL。请确认该 Key 来自 Coding Plan，"
+            "模型名使用套餐支持的名称，例如 deepseek-v3.2 或 ark-code-latest。"
+        )
+    if "/api/v3" in base:
+        if "." in model_lower and ("deepseek" in model_lower or "doubao" in model_lower or "glm" in model_lower):
+            return (
+                "当前像是在使用火山按量在线推理 Base URL，但模型名像 Coding Plan 名称。"
+                "如果使用 Coding Plan，请改为 https://ark.cn-beijing.volces.com/api/coding/v3；"
+                "如果使用按量在线推理，请使用对应 Model ID 或已开通的 Endpoint ID。"
+            )
+        return (
+            "当前使用火山按量在线推理 Base URL。/models 能列出模型不代表该 Key 已有 chat 调用权限；"
+            "请确认模型服务/Endpoint 已开通、账户有权限且余额可用。"
+            "如果你开通的是 Coding Plan，请改用 https://ark.cn-beijing.volces.com/api/coding/v3，"
+            "模型名用 deepseek-v3.2 或 ark-code-latest。"
+        )
+    return (
+        "当前像是火山 Ark 兼容接口。请确认 Base URL 与模型名属于同一接入方式："
+        "按量在线推理通常用 /api/v3，Coding Plan 通常用 /api/coding/v3。"
+    )
 
 
 def _env_openai_api_key() -> str:
@@ -151,6 +191,7 @@ class Config:
     openai_api_key = DEFAULT_CONFIG["openai_api_key"]
     think_model = DEFAULT_CONFIG["think_model"]
     score_threshold = DEFAULT_CONFIG["score_threshold"]
+    search_round_cooldown_min_minutes = DEFAULT_CONFIG["search_round_cooldown_min_minutes"]
     search_round_cooldown_minutes = DEFAULT_CONFIG["search_round_cooldown_minutes"]
     tag_search_delay_seconds = DEFAULT_CONFIG["tag_search_delay_seconds"]
     tag_search_delay_max_seconds = DEFAULT_CONFIG["tag_search_delay_max_seconds"]
@@ -222,10 +263,16 @@ class Config:
         data["show_model_reasoning"] = _as_bool(data.get("show_model_reasoning"))
         data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
         data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
+        data["search_round_cooldown_min_minutes"] = _as_int(
+            data.get("search_round_cooldown_min_minutes"),
+            DEFAULT_CONFIG["search_round_cooldown_min_minutes"],
+            1,
+            240,
+        )
         data["search_round_cooldown_minutes"] = _as_int(
             data.get("search_round_cooldown_minutes"),
             DEFAULT_CONFIG["search_round_cooldown_minutes"],
-            1,
+            data["search_round_cooldown_min_minutes"],
             240,
         )
         data["tag_search_delay_seconds"] = _as_int(

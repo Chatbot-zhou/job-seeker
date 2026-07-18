@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.21
+// @version      2026.06.26.23
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06.26.21',
+        scriptVersion: '2026.06.26.23',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -31,7 +31,8 @@
         timestampTimeout: 120000, // 页面跳转来源标记有效期，单位毫秒
         jobInfoResponseTimeout: 90000, // 详情页回传职位信息的最长等待时间
         onlyGreet: true, // 仅辅助打招呼，不自动扫描普通聊天页
-        searchRoundCooldownMinutes: 60,
+        searchRoundCooldownMinMinutes: 1,
+        searchRoundCooldownMinutes: 5,
         tagSearchDelaySeconds: 20,
         tagSearchDelayMaxSeconds: 45,
         maxSearchSubmissionsPerHour: 6,
@@ -57,6 +58,11 @@
         }
         if (Number.isFinite(Number(config.search_round_cooldown_minutes))) {
             OPTIONS.searchRoundCooldownMinutes = Math.max(1, Math.min(240, Number(config.search_round_cooldown_minutes)));
+        }
+        if (Number.isFinite(Number(config.search_round_cooldown_min_minutes))) {
+            OPTIONS.searchRoundCooldownMinMinutes = Math.max(1, Math.min(OPTIONS.searchRoundCooldownMinutes, Number(config.search_round_cooldown_min_minutes)));
+        } else {
+            OPTIONS.searchRoundCooldownMinMinutes = Math.min(OPTIONS.searchRoundCooldownMinMinutes, OPTIONS.searchRoundCooldownMinutes);
         }
         if (Number.isFinite(Number(config.tag_search_delay_seconds))) {
             OPTIONS.tagSearchDelaySeconds = Math.max(3, Math.min(60, Number(config.tag_search_delay_seconds)));
@@ -392,6 +398,54 @@
                 || classText.includes('forbid')
                 || parentClassText.includes('disabled')
                 || parentClassText.includes('forbid');
+        },
+        clickableAncestor(el, boundary = null) {
+            if (!el) return null;
+            const selector = [
+                'button',
+                'a',
+                '[role="button"]',
+                '.btn',
+                '[class*="btn"]',
+                '[class*="button"]',
+                '[class*="confirm"]',
+                '[class*="ok"]',
+            ].join(',');
+            const closest = el.closest?.(selector);
+            if (closest && (!boundary || boundary === closest || boundary.contains(closest))) {
+                return closest;
+            }
+            return el;
+        },
+        clickLikeUser(el) {
+            const target = this.clickableAncestor(el) || el;
+            if (!target) return null;
+            try {
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+            } catch (e) {}
+            try {
+                target.focus?.({ preventScroll: true });
+            } catch (e) {
+                try { target.focus?.(); } catch (ignore) {}
+            }
+            const rect = target.getBoundingClientRect();
+            const eventInit = {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                button: 0,
+                clientX: Math.round(rect.left + Math.max(1, rect.width / 2)),
+                clientY: Math.round(rect.top + Math.max(1, rect.height / 2)),
+            };
+            for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                try {
+                    target.dispatchEvent(new MouseEvent(type, eventInit));
+                } catch (e) {}
+            }
+            try {
+                target.click();
+            } catch (e) {}
+            return target;
         },
         asyncSleep(ms) {
             return new Promise((resolve) => setTimeout(resolve, ms));
@@ -803,13 +857,15 @@
             }
             textMatched.sort((a, b) => a.area - b.area);
             for (const item of textMatched) {
-                const buttons = Array.from(item.node.querySelectorAll('button,a,[role="button"],.btn,[class*="btn"],span,div'))
+                const buttons = Array.from(item.node.querySelectorAll('button,a,[role="button"],.btn,[class*="btn"],[class*="button"],[class*="confirm"],[class*="ok"],span,div'))
                     .filter(el => this.isVisible(el) && !this.isDisabled(el));
-                const confirmButton = buttons.find(el => /^(好|确定|知道了|我知道了)$/.test(this.normalizedText(el)));
+                const confirmButton = buttons.find(el => /^(好|确定|确认|知道了|我知道了)$/.test(this.normalizedText(el)));
                 if (confirmButton) {
+                    const clickable = this.clickableAncestor(confirmButton, item.node) || confirmButton;
                     return {
                         dialog: item.node,
-                        button: confirmButton,
+                        button: clickable,
+                        textElement: confirmButton,
                         text: item.text.slice(0, 160),
                     };
                 }
@@ -819,11 +875,11 @@
         async confirmQuotaReminderDialog() {
             const found = this.findQuotaReminderDialog();
             if (!found) return null;
-            found.button.click();
-            const deadline = Date.now() + 2000;
+            const clicked = this.clickLikeUser(found.button) || found.button;
+            const deadline = Date.now() + 5000;
             let stillVisible = true;
             while (Date.now() < deadline) {
-                await this.asyncSleep(200);
+                await this.asyncSleep(250);
                 if (!this.findQuotaReminderDialog()) {
                     stillVisible = false;
                     break;
@@ -832,8 +888,9 @@
             return {
                 confirmed: !stillVisible,
                 text: found.text,
-                button: this.normalizedText(found.button),
+                button: this.normalizedText(found.textElement || found.button),
                 dialog: this.elementBrief(found.dialog),
+                clicked: this.elementBrief(clicked),
             };
         },
         compactPageText(maxLength = 1800) {
@@ -962,6 +1019,8 @@
                 '沟通失败',
                 '打招呼入口失败',
                 'BOSS 拒绝打招呼入口请求',
+                'chat_entry_quota_reminder_unconfirmed',
+                'chat_entry_quota_reminder_repeated',
             ];
             return patterns.some(pattern => content.includes(pattern));
         },
@@ -1431,6 +1490,8 @@
             const runBtn = document.createElement('div');
             const foldBtn = document.createElement('div');
             const msgList = document.createElement('div');
+            ctn.dataset.jobSeekerOverlay = '1';
+            msgList.dataset.jobSeekerOverlay = '1';
             ctn.style.cssText = `
                 position: fixed;
                 bottom: 16px;
@@ -1603,6 +1664,7 @@
             let cooldownUntil = 0;
             let cooldownTimer = null;
             let cooldownStartedEventKey = '';
+            let cooldownResumeRedirecting = false;
             let currentJobSource = tools.isPreferredFeedPath() ? 'preferred_feed' : 'keyword_search';
             let feedTabs = [];
             let currentFeedTabIndex = -1;
@@ -1631,6 +1693,7 @@
             let pageFailureRetryCount = 0;
             const preferredFeedStateKey = '__job_seeker_preferred_feed_state';
             const preferredFeedCooldownStateKey = '__job_seeker_preferred_feed_cooldown_state';
+            const cooldownResumeStateKey = '__job_seeker_search_cooldown_resume_state';
             const searchBudgetStateKey = '__job_seeker_search_budget';
             const searchRoundStateKey = '__job_seeker_search_round_state';
 
@@ -1705,11 +1768,14 @@
                 return state;
             };
 
-            const recordSearchSubmission = () => {
+            const reserveSearchSubmission = () => {
                 const state = searchBudgetSnapshot();
+                if (state.blockedReason) {
+                    return { ok: false, state };
+                }
                 state.submissions.push(Date.now());
                 tools.writeJson(searchBudgetStateKey, { date: state.date, submissions: state.submissions });
-                return searchBudgetSnapshot();
+                return { ok: true, state: searchBudgetSnapshot() };
             };
 
             const saveSearchRoundState = () => {
@@ -1763,6 +1829,10 @@
                 `${preferredFeedRunKey()}::${searchRoundId || 0}::${Math.floor(Number(cooldownUntil || 0) / 1000)}`
             );
 
+            const cooldownResumeLockKey = () => (
+                `${preferredFeedRunKey()}::${Math.floor(Number(cooldownUntil || 0) / 1000)}`
+            );
+
             const loadPreferredFeedCooldownState = () => {
                 const state = tools.readJson(preferredFeedCooldownStateKey, {});
                 if (!state.timestamp || Date.now() - Number(state.timestamp) > 24 * 60 * 60 * 1000) return {};
@@ -1787,6 +1857,36 @@
             const hasPreferredFeedCooldownCycleStarted = () => {
                 const state = loadPreferredFeedCooldownState();
                 return preferredFeedCooldownStateMatches(state) && ['started', 'done'].includes(String(state.status || ''));
+            };
+
+            const cooldownResumeState = () => tools.readJson(cooldownResumeStateKey, {});
+
+            const tryAcquireCooldownResumeLock = () => {
+                const lockKey = cooldownResumeLockKey();
+                if (!lockKey || lockKey.endsWith('::0')) return false;
+                const current = cooldownResumeState();
+                const fresh = current.updatedAt && Date.now() - Number(current.updatedAt) < 2 * 60 * 1000;
+                if (current.key === lockKey && current.owner && current.owner !== PAGE_INSTANCE_ID && fresh) {
+                    return false;
+                }
+                tools.writeJson(cooldownResumeStateKey, {
+                    key: lockKey,
+                    owner: PAGE_INSTANCE_ID,
+                    status: 'resuming',
+                    updatedAt: Date.now(),
+                });
+                const confirmed = cooldownResumeState();
+                return confirmed.key === lockKey && confirmed.owner === PAGE_INSTANCE_ID;
+            };
+
+            const markCooldownResumeDone = (status = 'done') => {
+                const current = cooldownResumeState();
+                if (current.owner !== PAGE_INSTANCE_ID) return;
+                tools.writeJson(cooldownResumeStateKey, {
+                    ...current,
+                    status,
+                    updatedAt: Date.now(),
+                });
             };
 
             const shouldPreferFeedBeforeKeywordSearch = () => (
@@ -1821,11 +1921,16 @@
                     localSessionRunId: session.runId,
                     backendRunId: session.backendRunId || lastBackendRunId,
                     sessionEnded: Boolean(session.ended),
+                    pageInstanceId: PAGE_INSTANCE_ID,
                     searchRoundId,
                     currentTagIndex: currentTagIdx,
                     tagsCheckedThisRound: tagsCheckedThisRound.size,
                     cooldownUntil: cooldownUntil ? new Date(cooldownUntil).toISOString() : '',
+                    cooldownMinMinutes: OPTIONS.searchRoundCooldownMinMinutes,
                     cooldownMinutes: OPTIONS.searchRoundCooldownMinutes,
+                    cooldownLockKey: cooldownUntil ? cooldownResumeLockKey() : '',
+                    cooldownResumeState: cooldownResumeState(),
+                    activeSearchOwner: readSearchLease().owner || '',
                     searchBudgetHourlyCount: searchBudget.hourlyCount,
                     searchBudgetHourlyLimit: searchBudget.hourlyLimit,
                     searchBudgetDailyCount: searchBudget.dailyCount,
@@ -2033,9 +2138,10 @@
             };
 
             const syncControlFromBackend = async (action = '') => {
+                const isCooling = Boolean(cooldownUntil && Date.now() < cooldownUntil);
                 const res = await api.heartbeat(
                     'search',
-                    this.pause ? 'paused' : 'running',
+                    this.pause ? 'paused' : (isCooling ? 'cooldown' : 'running'),
                     action || getSearchAction(),
                     scriptHeartbeatDetail()
                 );
@@ -2088,6 +2194,7 @@
                         started
                         && !booting
                         && !waitingForGreeting
+                        && !cooldownResumeRedirecting
                         && !(cooldownUntil && Date.now() < cooldownUntil)
                     ) {
                         loop();
@@ -2536,6 +2643,13 @@
 
             const jobCardCount = (el) => el?.querySelectorAll?.('[class*="job-card"], [class*="jobCard"], [class*="job-item"], [class*="jobItem"]').length || 0;
 
+            const isJobSeekerOverlay = (el) => Boolean(el?.closest?.('[data-job-seeker-overlay="1"]'));
+
+            const isFilterLikeContainer = (el) => {
+                const descriptor = elementDescriptorText(el);
+                return /filter|dropdown|select|condition|salary|degree|experience|industry/i.test(descriptor);
+            };
+
             const isDetailLikeContainer = (el) => {
                 const descriptor = elementDescriptorText(el);
                 return /job[-_ ]?detail|detail[-_ ]?container|job[-_ ]?banner|job[-_ ]?sec|company|chat/i.test(descriptor);
@@ -2559,14 +2673,23 @@
                 return hasJobLinks || hasJobCard || classSignal;
             };
 
+            const pageHasJobSignal = () => jobLinkCount(document) >= 1 || jobCardCount(document) >= 1;
+
             const isScrollableJobContainer = (el) => {
                 if (!el || el === document.body || el === document.documentElement) return false;
+                if (isJobSeekerOverlay(el)) return false;
+                if (isFilterLikeContainer(el)) return false;
                 if (isDetailLikeContainer(el) && jobLinkCount(el) < 3 && jobCardCount(el) < 3) return false;
                 const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
                 const overflowY = `${style.overflowY || ''} ${style.overflow || ''}`;
                 const allowsScroll = /(auto|scroll|overlay)/i.test(overflowY);
                 const canScroll = el.scrollHeight > el.clientHeight + 40;
-                return canScroll && isLikelyLeftJobArea(el) && (allowsScroll || elementHasJobSignal(el));
+                const leftScrollableFallback = allowsScroll
+                    && pageHasJobSignal()
+                    && rect.left < window.innerWidth * 0.5
+                    && rect.width <= Math.max(760, window.innerWidth * 0.62);
+                return canScroll && isLikelyLeftJobArea(el) && (elementHasJobSignal(el) || leftScrollableFallback);
             };
 
             const jobContainerScore = (el) => {
@@ -2584,6 +2707,7 @@
                 if (cardCount >= 10) score += 220;
                 else if (cardCount >= 3) score += 120;
                 else if (cardCount > 0) score += 35;
+                if (!linkCount && !cardCount && pageHasJobSignal() && rect.left < window.innerWidth * 0.5) score += 90;
                 if (/(auto|scroll|overlay)/i.test(`${window.getComputedStyle(el).overflowY || ''} ${window.getComputedStyle(el).overflow || ''}`)) score += 60;
                 if (rect.width >= 240 && rect.width <= 900) score += 80;
                 if (rect.height >= 300) score += 40;
@@ -2625,7 +2749,9 @@
                         overflowY: style.overflowY || '',
                         links: jobLinkCount(el),
                         cards: jobCardCount(el),
+                        ownOverlay: isJobSeekerOverlay(el),
                         detailLike: isDetailLikeContainer(el),
+                        filterLike: isFilterLikeContainer(el),
                         score: jobContainerScore(el),
                     };
                 })
@@ -2654,10 +2780,49 @@
 
                 document.querySelectorAll('div,section,main,ul,ol').forEach((el) => {
                     if (!isLikelyLeftJobArea(el)) return;
+                    if (isJobSeekerOverlay(el)) return;
                     if (el.scrollHeight <= el.clientHeight + 40) return;
                     if (!elementHasJobSignal(el)) return;
                     pushCandidate(el);
                 });
+
+                if (pageHasJobSignal()) {
+                    document.querySelectorAll('div,section,main,ul,ol,[class*="scroll"],[class*="list"],[class*="List"]').forEach((el) => {
+                        if (!isLikelyLeftJobArea(el)) return;
+                        if (isJobSeekerOverlay(el) || isFilterLikeContainer(el) || isDetailLikeContainer(el)) return;
+                        if (el.scrollHeight <= el.clientHeight + 40) return;
+                        const style = window.getComputedStyle(el);
+                        if (!/(auto|scroll|overlay)/i.test(`${style.overflowY || ''} ${style.overflow || ''}`)) return;
+                        pushCandidate(el);
+                    });
+                }
+
+                const pointYs = [
+                    Math.round(Math.min(window.innerHeight - 80, Math.max(180, window.innerHeight * 0.46))),
+                    Math.round(Math.min(window.innerHeight - 80, Math.max(220, window.innerHeight * 0.62))),
+                ];
+                for (const y of pointYs) {
+                    for (const x of [80, 180, 320]) {
+                        const elements = typeof document.elementsFromPoint === 'function'
+                            ? document.elementsFromPoint(x, y)
+                            : [document.elementFromPoint(x, y)].filter(Boolean);
+                        elements.forEach((el) => {
+                            let cursor = el;
+                            for (let depth = 0; cursor && depth < 5 && cursor !== document.body && cursor !== document.documentElement; depth++) {
+                                if (
+                                    isLikelyLeftJobArea(cursor)
+                                    && !isJobSeekerOverlay(cursor)
+                                    && !isFilterLikeContainer(cursor)
+                                    && !isDetailLikeContainer(cursor)
+                                    && cursor.scrollHeight > cursor.clientHeight + 40
+                                ) {
+                                    pushCandidate(cursor);
+                                }
+                                cursor = cursor.parentElement;
+                            }
+                        });
+                    }
+                }
 
                 for (const candidate of Array.from(candidates)) {
                     let cursor = candidate.parentElement;
@@ -2706,16 +2871,18 @@
                     try { container.focus?.(); } catch (ignore) {}
                 }
                 dispatchJobListWheel(container, distance);
+                const maxScroll = Math.max(0, (container.scrollHeight || 0) - (container.clientHeight || 0));
+                const targetTop = Math.min(maxScroll, before + distance);
                 if (typeof container.scrollBy === 'function') {
                     container.scrollBy({ top: distance, behavior: 'auto' });
-                } else {
-                    container.scrollTop = before + distance;
                 }
+                container.scrollTop = targetTop;
                 try {
                     container.dispatchEvent(new Event('scroll', { bubbles: true }));
                 } catch (e) {}
 
-                const deadline = Date.now() + 8000;
+                let forcedAgain = false;
+                const deadline = Date.now() + 10000;
                 let after = container.scrollTop;
                 let afterFingerprint = jobListFingerprint(container);
                 let afterDocumentFingerprint = jobListFingerprint(document);
@@ -2727,6 +2894,14 @@
                     const moved = Math.abs(after - before) >= 5;
                     const changed = afterFingerprint !== beforeFingerprint || afterDocumentFingerprint !== beforeDocumentFingerprint;
                     if (moved || changed) break;
+                    if (!forcedAgain && Date.now() + 7500 < deadline) {
+                        forcedAgain = true;
+                        dispatchJobListWheel(container, distance);
+                        container.scrollTop = targetTop;
+                        try {
+                            container.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        } catch (e) {}
+                    }
                 }
                 return {
                     before,
@@ -3369,21 +3544,23 @@
                 lastJobListEventKey = '';
             };
 
-            const beginSearchRound = async (reason = '', startTagIdx = 0) => {
+            const beginSearchRound = async (reason = '', startTagIdx = 0, messageOverride = '') => {
                 searchRoundId += 1;
                 tagsCheckedThisRound.clear();
                 cooldownUntil = 0;
                 cooldownStartedEventKey = '';
+                cooldownResumeRedirecting = false;
                 currentTagIdx = this.tags.length
                     ? Math.min(Math.max(0, Number(startTagIdx) || 0), this.tags.length - 1)
                     : 0;
                 resetKeywordState();
                 saveSearchRoundState();
-                await api.event('search_round_started', `开始第 ${searchRoundId} 轮关键词搜索`, 'script', 'info', {
+                await api.event('search_round_started', messageOverride || `开始第 ${searchRoundId} 轮关键词搜索`, 'script', 'info', {
                     searchRoundId,
                     reason,
                     startTagIdx: currentTagIdx,
                     tags: this.tags,
+                    cooldownMinMinutes: OPTIONS.searchRoundCooldownMinMinutes,
                     cooldownMinutes: OPTIONS.searchRoundCooldownMinutes,
                 });
             };
@@ -3423,23 +3600,22 @@
             const searchCurrentKeyword = async (reason = '', waitBefore = false) => {
                 const keyword = this.tags[currentTagIdx];
                 resetKeywordState();
-                const budget = searchBudgetSnapshot();
-                if (budget.blockedReason) {
-                    await enterSearchCooldown(budget.blockedReason, budget.nextAllowedAt);
-                    return false;
-                }
                 if (waitBefore) {
                     await waitBeforeTagSearch(keyword, reason);
                 }
+                const reserved = reserveSearchSubmission();
+                if (!reserved.ok) {
+                    await enterSearchCooldown(reserved.state.blockedReason, reserved.state.nextAllowedAt);
+                    return false;
+                }
                 setSearchAction(`搜索关键词: ${keyword}`);
                 await search(keyword);
-                const nextBudget = recordSearchSubmission();
                 markCurrentTagChecked();
-                await api.event('search_budget_updated', `关键词搜索预算: 本小时 ${nextBudget.hourlyCount}/${nextBudget.hourlyLimit}，今日 ${nextBudget.dailyCount}/${nextBudget.dailyLimit}`, 'script', 'info', {
-                    hourlyCount: nextBudget.hourlyCount,
-                    hourlyLimit: nextBudget.hourlyLimit,
-                    dailyCount: nextBudget.dailyCount,
-                    dailyLimit: nextBudget.dailyLimit,
+                await api.event('search_budget_updated', `关键词搜索预算: 本小时 ${reserved.state.hourlyCount}/${reserved.state.hourlyLimit}，今日 ${reserved.state.dailyCount}/${reserved.state.dailyLimit}`, 'script', 'info', {
+                    hourlyCount: reserved.state.hourlyCount,
+                    hourlyLimit: reserved.state.hourlyLimit,
+                    dailyCount: reserved.state.dailyCount,
+                    dailyLimit: reserved.state.dailyLimit,
                 });
                 await tools.actionSleep(1500);
                 return true;
@@ -3482,18 +3658,31 @@
                 return false;
             };
 
+            const cooldownRangeMinutes = () => {
+                const maxMinutes = Math.max(1, Number(OPTIONS.searchRoundCooldownMinutes) || 5);
+                const minMinutes = Math.max(1, Math.min(maxMinutes, Number(OPTIONS.searchRoundCooldownMinMinutes) || 1));
+                return { minMinutes, maxMinutes };
+            };
+
+            const chooseRandomCooldownUntil = () => {
+                const { minMinutes, maxMinutes } = cooldownRangeMinutes();
+                const minutes = minMinutes + Math.floor(Math.random() * (maxMinutes - minMinutes + 1));
+                return Date.now() + minutes * 60 * 1000;
+            };
+
             const enterSearchCooldown = async (reason = '', untilOverride = 0) => {
                 if (cooldownTimer) {
                     clearTimeout(cooldownTimer);
                     cooldownTimer = null;
                 }
-                const minutes = Math.max(1, Number(OPTIONS.searchRoundCooldownMinutes) || 60);
-                if (!(Number(untilOverride) > Date.now()) && cooldownUntil > Date.now()) {
-                    untilOverride = cooldownUntil;
-                }
-                cooldownUntil = Number(untilOverride) > Date.now()
+                const randomUntil = chooseRandomCooldownUntil();
+                const requestedUntil = Number(untilOverride) > Date.now()
                     ? Number(untilOverride)
-                    : Date.now() + minutes * 60 * 1000;
+                    : (cooldownUntil > Date.now() ? cooldownUntil : 0);
+                // Even when a search budget says "wait longer", re-check in the configured short random window.
+                cooldownUntil = requestedUntil
+                    ? Math.min(requestedUntil, randomUntil)
+                    : randomUntil;
                 saveSearchRoundState();
                 const untilText = new Date(cooldownUntil).toLocaleTimeString('zh-CN', { hour12: false });
                 const remainingMinutes = Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 60000));
@@ -3535,7 +3724,7 @@
                         searchRoundId,
                         cooldownUntil: new Date(cooldownUntil).toISOString(),
                     });
-                    await api.heartbeat('search', 'running', feedMessage, scriptHeartbeatDetail());
+                    await api.heartbeat('search', 'cooldown', feedMessage, scriptHeartbeatDetail());
                     tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
                     return;
                 }
@@ -3555,13 +3744,50 @@
                             cooldownTimer = setTimeout(cooldownTick, Math.min(30000, remainingMs));
                             return;
                         }
+                        if (!tryAcquireCooldownResumeLock()) {
+                            cooldownTimer = null;
+                            setSearchAction('搜索冷却已到点，等待持有锁的搜索页恢复');
+                            await api.heartbeat('search', 'cooldown', '搜索冷却已到点，等待持有锁的搜索页恢复', {
+                                ...scriptHeartbeatDetail(),
+                                cooldownResumeSkipped: true,
+                            });
+                            return;
+                        }
                         cooldownTimer = null;
-                        cooldownUntil = 0;
-                        cooldownStartedEventKey = '';
-                        saveSearchRoundState();
-                        if (!(await ensureSearchLease('冷却结束'))) return;
-                        if (!(await syncControlFromBackend('搜索冷却结束'))) return;
+                        if (!(await ensureSearchLease('冷却结束'))) {
+                            markCooldownResumeDone('lease_failed');
+                            return;
+                        }
+                        if (!(await syncControlFromBackend('搜索冷却结束'))) {
+                            markCooldownResumeDone('control_blocked');
+                            return;
+                        }
                         if (this.pause) {
+                            markCooldownResumeDone('paused');
+                            return;
+                        }
+                        if (OPTIONS.preferredFeedMode !== 'off') {
+                            await beginSearchRound(
+                                'cooldown_finished_preferred_first',
+                                0,
+                                `搜索冷却结束，准备第 ${searchRoundId + 1} 轮：先处理用户自定义推荐源`,
+                            );
+                            preferredFeedsDone = false;
+                            feedTabs = [];
+                            currentFeedTabIndex = -1;
+                            currentFeedTabName = '';
+                            feedTabProcessedCount = 0;
+                            currentJobSource = 'preferred_feed';
+                            cooldownResumeRedirecting = true;
+                            localStorage.removeItem(preferredFeedStateKey);
+                            localStorage.removeItem(preferredFeedCooldownStateKey);
+                            await api.event('preferred_feed_after_cooldown_started', '搜索冷却结束，优先处理用户自定义推荐源', 'script', 'info', {
+                                searchRoundId,
+                                runKey: preferredFeedRunKey(),
+                            });
+                            await api.heartbeat('search', 'running', '搜索冷却结束，优先处理用户自定义推荐源', scriptHeartbeatDetail());
+                            markCooldownResumeDone('redirect_preferred');
+                            tools.openTabNSetTimestamp(SEARCHPATH.preferred, this.targets.search, true);
                             return;
                         }
                         await beginSearchRound('cooldown_finished');
@@ -3575,8 +3801,10 @@
                             setTimeout(loop, 0);
                             return;
                         }
+                        markCooldownResumeDone('done');
                         await enterSearchCooldown('冷却后仍无新职位');
                     } catch (e) {
+                        markCooldownResumeDone('failed');
                         if (tools.isPlatformLimitError(e)) {
                             await handlePageFailure(tools.platformLimitReason(e), 'platform_limit', 'search');
                             return;
@@ -3594,7 +3822,7 @@
                     }
                 };
 
-                cooldownTimer = setTimeout(cooldownTick, Math.min(30000, minutes * 60 * 1000));
+                cooldownTimer = setTimeout(cooldownTick, Math.min(30000, Math.max(1000, cooldownUntil - Date.now())));
             };
 
             const extractJobInfoFromDocument = (doc, href, source = 'document') => {
@@ -3765,21 +3993,45 @@
                 try {
                     await confirmQuotaReminderIfPresent('chat_entry_before_request');
                     await api.event('chat_entry_request_started', `请求打招呼入口: ${url}`, 'script', 'info', { url });
-                    const resp = await fetch(url, { credentials: 'include' });
-                    if (!(resp.ok && resp.status === 200)) {
-                        throw new Error(`BOSS 网络响应异常: ${resp.status}`);
-                    }
-                    const data = await resp.json();
-                    const quotaReason = tools.quotaReminderReasonFromValue(data);
+                    const fetchEntry = async (confirmedReminder = false) => {
+                        const resp = await fetch(url, { credentials: 'include' });
+                        if (!(resp.ok && resp.status === 200)) {
+                            throw new Error(`BOSS 网络响应异常: ${resp.status}`);
+                        }
+                        const data = await resp.json();
+                        await api.event(
+                            confirmedReminder ? 'chat_entry_request_retried_after_reminder' : 'chat_entry_request_response',
+                            confirmedReminder ? '温馨提示确认后重新请求打招呼入口' : '打招呼入口请求已返回',
+                            'script',
+                            'info',
+                            {
+                                code: data?.code,
+                                hasRedirect: Boolean(tools.findChatUrlDeep(data)),
+                                hasQuotaReminder: Boolean(tools.quotaReminderReasonFromValue(data)),
+                            }
+                        );
+                        return data;
+                    };
+                    let data = await fetchEntry(false);
+                    let quotaReason = tools.quotaReminderReasonFromValue(data);
                     if (quotaReason) {
                         await api.event('quota_reminder_response_detected', `打招呼入口返回额度提醒: ${quotaReason}`, 'script', 'warning', {
                             reason: quotaReason,
                         });
-                        const confirmed = await waitForQuotaReminderConfirmation('chat_entry_response', 3000);
+                        const confirmed = await waitForQuotaReminderConfirmation('chat_entry_response', 8000);
                         if (!confirmed) {
-                            await api.event('quota_reminder_not_rendered', `接口返回额度提醒，但页面未发现可确认弹窗，继续当前流程: ${quotaReason}`, 'script', 'warning', {
+                            await api.event('quota_reminder_not_rendered', `接口返回额度提醒，但页面未发现可确认弹窗，已停止本次打招呼入口流程: ${quotaReason}`, 'script', 'error', {
                                 reason: quotaReason,
                             });
+                            throw new Error(`chat_entry_quota_reminder_unconfirmed: ${quotaReason}`);
+                        }
+                        data = await fetchEntry(true);
+                        quotaReason = tools.quotaReminderReasonFromValue(data);
+                        if (quotaReason) {
+                            await api.event('quota_reminder_response_repeated', `温馨提示确认后入口仍返回提醒，已停止本次打招呼入口流程: ${quotaReason}`, 'script', 'error', {
+                                reason: quotaReason,
+                            });
+                            throw new Error(`chat_entry_quota_reminder_repeated: ${quotaReason}`);
                         }
                     }
                     if (data.code === 0) {

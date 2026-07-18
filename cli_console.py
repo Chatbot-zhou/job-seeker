@@ -7,6 +7,7 @@ import importlib.util
 import json
 import re
 import shutil
+import sys
 import time
 import webbrowser
 import zipfile
@@ -311,7 +312,7 @@ def print_config_preview(updates: dict[str, Any]) -> None:
         print(f"- Ollama: {preview.get('ollama_host')}")
     print(f"- 匹配度阈值: {preview.get('score_threshold')}")
     print(
-        f"- 搜索: 冷却 {preview.get('search_round_cooldown_minutes')} 分钟 / "
+        f"- 搜索: 冷却 {preview.get('search_round_cooldown_min_minutes', 1)}-{preview.get('search_round_cooldown_minutes')} 分钟 / "
         f"标签间隔 {preview.get('tag_search_delay_seconds')}-{preview.get('tag_search_delay_max_seconds')} 秒 / "
         f"滚动 {preview.get('search_result_scroll_rounds')} 次"
     )
@@ -375,9 +376,13 @@ def configure_search_safety_settings() -> None:
     current = Config.as_dict()
     updates = {
         "score_threshold": ask_int("最低匹配度阈值", int(current["score_threshold"])),
+        "search_round_cooldown_min_minutes": ask_int(
+            "所有标签无新岗位后的最短搜索冷却分钟数",
+            int(current.get("search_round_cooldown_min_minutes", 1)),
+        ),
         "search_round_cooldown_minutes": ask_int(
-            "所有标签无新岗位后的搜索冷却分钟数",
-            int(current.get("search_round_cooldown_minutes", 60)),
+            "所有标签无新岗位后的最长搜索冷却分钟数",
+            int(current.get("search_round_cooldown_minutes", 10)),
         ),
         "tag_search_delay_seconds": ask_int(
             "标签之间的最小搜索间隔秒数",
@@ -405,6 +410,15 @@ def configure_search_safety_settings() -> None:
         ),
         "job_detail_max_chars": ask_int("职位描述传给模型的最大字数", int(current["job_detail_max_chars"])),
     }
+    if updates["search_round_cooldown_minutes"] < updates["search_round_cooldown_min_minutes"]:
+        updates["search_round_cooldown_minutes"] = updates["search_round_cooldown_min_minutes"]
+        print("[配置] 最长冷却不能小于最短冷却，已自动对齐。")
+    if updates["tag_search_delay_max_seconds"] < updates["tag_search_delay_seconds"]:
+        updates["tag_search_delay_max_seconds"] = updates["tag_search_delay_seconds"]
+        print("[配置] 最大标签间隔不能小于最小间隔，已自动对齐。")
+    if updates["max_search_submissions_per_day"] < updates["max_search_submissions_per_hour"]:
+        updates["max_search_submissions_per_day"] = updates["max_search_submissions_per_hour"]
+        print("[配置] 每日搜索预算不能小于每小时预算，已自动对齐。")
     print_config_preview(updates)
     if ask_bool("保存搜索与风控配置", True):
         Config.save(updates)
@@ -556,7 +570,7 @@ def edit_session_settings() -> None:
     cache.load()
     print("[轮次设置] 当前配置:")
     print(f"  岗位标签: {'、'.join(cache.tags) if cache.tags else '(空)'}")
-    print(f"  搜索冷却: {Config.search_round_cooldown_minutes} 分钟")
+    print(f"  搜索冷却: 随机 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分钟")
     print(f"  标签间隔: 随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒")
     print(f"  搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / 每日 {Config.max_search_submissions_per_day} 次")
     print(f"  滚动扩展: {Config.search_result_scroll_rounds} 次")
@@ -566,7 +580,7 @@ def edit_session_settings() -> None:
     )
     print()
     print("[1] 修改岗位搜索标签")
-    print("[2] 修改搜索冷却时间")
+    print("[2] 修改搜索冷却时间范围")
     print("[3] 修改标签随机搜索间隔")
     print("[4] 修改滚动扩展次数")
     print("[5] 修改自定义推荐 Tab 上限")
@@ -577,18 +591,22 @@ def edit_session_settings() -> None:
         edit_tags()
     elif choice == "2":
         while True:
-            minutes = ask_int("所有标签无新岗位后的搜索冷却分钟数", int(Config.search_round_cooldown_minutes))
-            if not 1 <= minutes <= 240:
-                print("[配置] 搜索冷却建议设置为 1-240 分钟。")
+            min_minutes = ask_int("所有标签无新岗位后的最短搜索冷却分钟数", int(Config.search_round_cooldown_min_minutes))
+            max_minutes = ask_int("所有标签无新岗位后的最长搜索冷却分钟数", int(Config.search_round_cooldown_minutes))
+            if not 1 <= min_minutes <= max_minutes <= 240:
+                print("[配置] 搜索冷却范围需要满足 1 <= 最短 <= 最长 <= 240。")
                 continue
             break
-        Config.save({"search_round_cooldown_minutes": minutes})
+        Config.save({
+            "search_round_cooldown_min_minutes": min_minutes,
+            "search_round_cooldown_minutes": max_minutes,
+        })
         runtime_state.emit(
             "search_cooldown_updated",
-            f"搜索冷却调整为 {minutes} 分钟",
+            f"搜索冷却调整为随机 {min_minutes}-{max_minutes} 分钟",
             source="config",
         )
-        print(f"[配置] 搜索冷却已更新为: {minutes} 分钟")
+        print(f"[配置] 搜索冷却已更新为: 随机 {min_minutes}-{max_minutes} 分钟")
     elif choice == "3":
         while True:
             min_seconds = ask_int("标签之间的最小搜索间隔秒数", int(Config.tag_search_delay_seconds))
@@ -819,9 +837,15 @@ def setup_quick_start() -> None:
         "model_provider": model_provider,
         "think_model": ask("模型名称", current["think_model"]),
         "score_threshold": ensure_range_int("最低匹配度阈值", int(current["score_threshold"]), 0, 100),
+        "search_round_cooldown_min_minutes": ensure_range_int(
+            "所有标签无新岗位后的最短搜索冷却分钟数",
+            int(current.get("search_round_cooldown_min_minutes", 1)),
+            1,
+            240,
+        ),
         "search_round_cooldown_minutes": ensure_range_int(
-            "所有标签无新岗位后的搜索冷却分钟数",
-            int(current.get("search_round_cooldown_minutes", 60)),
+            "所有标签无新岗位后的最长搜索冷却分钟数",
+            int(current.get("search_round_cooldown_minutes", 10)),
             1,
             240,
         ),
@@ -869,6 +893,9 @@ def setup_quick_start() -> None:
     if updates["max_search_submissions_per_day"] < updates["max_search_submissions_per_hour"]:
         updates["max_search_submissions_per_day"] = updates["max_search_submissions_per_hour"]
         print("[配置] 每日搜索预算不能小于每小时预算，已自动对齐。")
+    if updates["search_round_cooldown_minutes"] < updates["search_round_cooldown_min_minutes"]:
+        updates["search_round_cooldown_minutes"] = updates["search_round_cooldown_min_minutes"]
+        print("[配置] 最长冷却不能小于最短冷却，已自动对齐。")
     if model_provider == "ollama":
         updates["ollama_host"] = ask("Ollama 地址", current["ollama_host"])
     else:
@@ -968,7 +995,7 @@ def print_status_panel() -> None:
     if schedule.get("waiting"):
         schedule_label += f" / 等待中 {_format_wait_seconds(int(schedule.get('seconds_until_start', 0)))}"
     search_strategy_label = (
-        f"冷却 {Config.search_round_cooldown_minutes}分 / "
+        f"冷却 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes}分 / "
         f"间隔 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds}秒 / "
         f"滚动 {Config.search_result_scroll_rounds}次 / "
         f"预算 {script_detail.get('searchBudgetHourlyCount', 0)}/{script_detail.get('searchBudgetHourlyLimit') or Config.max_search_submissions_per_hour}时 "
@@ -984,10 +1011,14 @@ def print_status_panel() -> None:
         search_strategy_label = _format_script_cooldown(script_detail)
 
     def _icon(ok: bool) -> str:
-        return "✓" if ok else "○"
+        return "OK" if ok else "--"
+
+    stdout_encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+    unicode_terminal = "utf" in stdout_encoding
 
     simple_status = (
         os.environ.get("JOB_SEEKER_SIMPLE_STATUS", "").strip() == "1"
+        or not unicode_terminal
         or shutil.get_terminal_size((100, 30)).columns < 88
     )
     if simple_status:
@@ -1025,7 +1056,7 @@ def print_status_panel() -> None:
 ║  打招呼语    {_icon(greeting_ok)} {'已确认' if greeting_ok else '未确认'}{' ' * 42}║
 ╠══════════════════════════════════════════════════════════════╣
 ║  脚本连接    {_icon(script_ok)} {'已连接' if script_ok else '等待中...'}{' ' * 42}║
-║  控制状态    {'▶ running' if control == 'running' else '⏸ ' + control}{' ' * 40}║
+║  控制状态    {'running' if control == 'running' else control}{' ' * 40}║
 ╚══════════════════════════════════════════════════════════════╝"""
 
     # 精简版（compact 日志模式下使用单行格式）
@@ -1059,7 +1090,7 @@ def print_summary() -> None:
         print(f"- OpenAI 模型类型: {Config.external_model_profile}")
     print(f"- 最低匹配度阈值: {Config.score_threshold}")
     print(
-        f"- 搜索策略: 无新岗位冷却 {Config.search_round_cooldown_minutes} 分钟 / "
+        f"- 搜索策略: 无新岗位随机冷却 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分钟 / "
         f"标签间隔随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
         f"滚动扩展 {Config.search_result_scroll_rounds} 次"
     )
@@ -1561,21 +1592,21 @@ def show_doctor() -> None:
         f"- 模型参数: temp={Config.model_temperature} / top_p={Config.model_top_p} / "
         f"repeat_penalty={Config.model_repeat_penalty} / freq_penalty={Config.model_frequency_penalty}"
     )
-    conservative_search = (
-        Config.search_round_cooldown_minutes >= 60
+    balanced_search = (
+        1 <= Config.search_round_cooldown_min_minutes <= Config.search_round_cooldown_minutes <= 5
         and Config.tag_search_delay_seconds >= 20
         and Config.tag_search_delay_max_seconds >= 45
         and Config.max_search_submissions_per_hour <= 6
         and Config.max_search_submissions_per_day <= 30
     )
     print(
-        f"- 搜索安全策略: {'保守默认' if conservative_search else '自定义（低于当前保守建议）'} / "
-        f"冷却 {Config.search_round_cooldown_minutes} 分 / "
+        f"- 搜索安全策略: {'当前推荐' if balanced_search else '自定义（建议复核）'} / "
+        f"冷却 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分 / "
         f"间隔 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
         f"预算 {Config.max_search_submissions_per_hour} 次每小时、{Config.max_search_submissions_per_day} 次每日"
     )
-    if not conservative_search:
-        issues.append(("搜索配置低于当前保守建议", "运行 config -> 搜索与风控，建议使用 60 分钟冷却、20-45 秒间隔、每小时 6 次和每日 30 次预算"))
+    if not balanced_search:
+        issues.append(("搜索配置偏离当前推荐", "运行 config -> 搜索与风控，建议使用 1-5 分钟随机冷却、20-45 秒间隔、每小时 6 次和每日 30 次预算"))
     script = runtime_state.script_snapshot()
     state = "在线" if script.get("connected") else ("心跳过期" if script.get("stale") else "离线")
     print(f"- 油猴脚本: {state}")
@@ -1606,6 +1637,7 @@ def show_doctor() -> None:
         )
         print(
             f"  搜索冷却: {_format_script_cooldown(detail)} / "
+            f"范围 {detail.get('cooldownMinMinutes') or Config.search_round_cooldown_min_minutes}-"
             f"{detail.get('cooldownMinutes') or Config.search_round_cooldown_minutes} 分钟"
         )
         print(
@@ -1724,16 +1756,23 @@ def ensure_autorun_ollama_model() -> bool:
 
 
 def model_ready_for_autorun() -> bool:
-    status = runtime_state.ollama_status()
     if Config.model_provider == "openai" and not Config.openai_api_key:
         print("[模型] OpenAI API Key 未配置，请先运行人工启动器 config。")
         return False
     if Config.model_provider == "ollama":
         return ensure_autorun_ollama_model()
-    if not status.get("available"):
-        print(f"[模型] 模型服务不可用: {status.get('error') or '未知错误'}")
-        return False
-    return True
+    if Config.model_provider == "openai":
+        from model_stream import model_warmup_check
+
+        warmup = model_warmup_check()
+        runtime_state.model_warmup.update(warmup)
+        if warmup.get("status") != "ready":
+            print(f"[模型] OpenAI 兼容模型不可用: {warmup.get('error') or '未知错误'}")
+            return False
+        print(f"[模型] OpenAI 兼容模型已连接: {warmup.get('model')} ({warmup.get('latency_seconds', 0)}s)")
+        return True
+    print(f"[模型] 未知模型来源: {Config.model_provider}")
+    return False
 
 
 def auto_prepare_saved_configuration() -> bool:
@@ -1896,7 +1935,7 @@ def run_cli(app, shutdown_callback: Callable[[], None] | None = None) -> None:
     try:
         command_loop()
     except KeyboardInterrupt:
-        print("\n[退出] 正在关闭服务…")
+        print("\n[退出] 正在关闭服务...")
     finally:
         server.should_exit = True
         if shutdown_callback:

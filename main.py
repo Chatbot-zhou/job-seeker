@@ -48,7 +48,7 @@ WEB_SCRIPT_PATH = BASE_DIR / "web_script.js"
 MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-model")
 MODEL_EXECUTOR_SHUTDOWN = False
 ALLOW_REMOTE_API_ENV = "JOB_SEEKER_ALLOW_REMOTE"
-LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 RATE_LIMIT_BUCKET_TTL_SECONDS = RATE_LIMIT_WINDOW_SECONDS * 2
 RATE_LIMIT_RULES = {
@@ -59,6 +59,9 @@ RATE_LIMIT_RULES = {
 RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 RATE_LIMIT_LOCK = threading.Lock()
 RATE_LIMIT_LAST_CLEANUP = 0.0
+MODEL_SCORE_FAILURE_PAUSE_THRESHOLD = 3
+MODEL_SCORE_FAILURE_STREAK = 0
+MODEL_SCORE_FAILURE_LOCK = threading.Lock()
 
 
 def shutdown_model_executor() -> None:
@@ -207,6 +210,51 @@ def missing_profile_analysis(reason: str) -> dict[str, Any]:
     }
 
 
+def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, Any]) -> None:
+    """Pause automation when the model is unavailable for several jobs in a row."""
+    global MODEL_SCORE_FAILURE_STREAK
+    risks = {str(risk) for risk in analysis.get("risks") or []}
+    failed = bool(risks.intersection({"模型调用失败", "模型评分格式错误"}))
+    with MODEL_SCORE_FAILURE_LOCK:
+        if failed:
+            MODEL_SCORE_FAILURE_STREAK += 1
+            streak = MODEL_SCORE_FAILURE_STREAK
+        else:
+            MODEL_SCORE_FAILURE_STREAK = 0
+            return
+    runtime_state.emit(
+        "model_score_failure_streak",
+        f"模型评分连续失败 {streak}/{MODEL_SCORE_FAILURE_PAUSE_THRESHOLD}: {job.get('title', '')}",
+        source="model",
+        level="warning",
+        detail={
+            "streak": streak,
+            "threshold": MODEL_SCORE_FAILURE_PAUSE_THRESHOLD,
+            "job_url": job.get("url", ""),
+            "job_title": job.get("title", ""),
+            "risks": list(risks),
+            "reason": analysis.get("match_reason", ""),
+        },
+    )
+    if streak >= MODEL_SCORE_FAILURE_PAUSE_THRESHOLD:
+        runtime_state.set_control("pause")
+        runtime_state.emit(
+            "model_score_degraded_pause",
+            "模型评分连续失败，已暂停自动化。请先检查模型服务/API 地址/Key，再继续运行。",
+            source="model",
+            level="error",
+            detail={
+                "streak": streak,
+                "threshold": MODEL_SCORE_FAILURE_PAUSE_THRESHOLD,
+                "provider": Config.model_provider,
+                "model": Config.think_model,
+                "last_job_url": job.get("url", ""),
+                "last_job_title": job.get("title", ""),
+                "reason": analysis.get("match_reason", ""),
+            },
+        )
+
+
 def script_base_url() -> str:
     return f"http://{Config.server_host}:{Config.server_port}"
 
@@ -249,7 +297,7 @@ async def health():
 
 @app.get("/web_script.user.js", summary="安装或更新篡改猴脚本")
 async def web_script_user_js():
-    return PlainTextResponse(render_userscript(), media_type="application/javascript")
+    return PlainTextResponse(render_userscript(), media_type="application/javascript; charset=utf-8")
 
 
 @app.get("/status", summary="系统状态")
@@ -451,6 +499,7 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
                 analysis = missing_profile_analysis("服务关闭中，分析被中断")
             else:
                 raise
+        update_model_score_failure_streak(analysis, job)
         if analysis.get("total_score", 0) <= 0 and analysis.get("risks"):
             final_action = final_action or "model_failed_skip"
     job["run_id"] = runtime_state.run_id
@@ -568,7 +617,30 @@ def run_api_only() -> int:
     return 0
 
 
+def print_usage() -> None:
+    print(
+        "\n".join(
+            [
+                "Job Seeker 本地求职辅助工具",
+                "",
+                "用法:",
+                "  python main.py              启动人工 CLI",
+                "  python main.py serve        只启动本地 API 服务",
+                "  python main.py autorun      使用已保存配置自动运行",
+                "  python main.py --help       显示本帮助",
+                "",
+                "推荐入口:",
+                "  start_job_seeker.bat        人工配置和排查",
+                "  start_job_seeker_auto.bat   自动运行",
+            ]
+        )
+    )
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in {"-h", "--help", "help"}:
+        print_usage()
+        raise SystemExit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         raise SystemExit(run_api_only())
     if len(sys.argv) > 1 and sys.argv[1] in {"agent", "mcp"}:
@@ -578,4 +650,8 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "autorun":
         raise SystemExit(run_autorun(app, shutdown_callback=shutdown_model_executor))
+    if len(sys.argv) > 1:
+        print(f"[Job Seeker] 未知命令: {sys.argv[1]}")
+        print_usage()
+        raise SystemExit(2)
     run_cli(app, shutdown_callback=shutdown_model_executor)

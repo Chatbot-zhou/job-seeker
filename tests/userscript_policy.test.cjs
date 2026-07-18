@@ -27,8 +27,11 @@ test('risk detection avoids generic whole-page English tokens', () => {
 test('search safety state persists across refreshes', () => {
   assert.match(source, /__job_seeker_search_budget/);
   assert.match(source, /__job_seeker_search_round_state/);
+  assert.match(source, /__job_seeker_search_cooldown_resume_state/);
   assert.match(source, /maxSearchSubmissionsPerHour/);
   assert.match(source, /maxSearchSubmissionsPerDay/);
+  assert.match(source, /searchRoundCooldownMinMinutes:\s*1/);
+  assert.match(source, /searchRoundCooldownMinutes:\s*5/);
 });
 
 test('job list scrolling is verified and never falls back to window scrolling', () => {
@@ -46,8 +49,24 @@ test('job list scrolling is verified and never falls back to window scrolling', 
   assert.match(source, /scrollCandidateDebug/);
   assert.match(source, /recommend-job-list/);
   assert.match(source, /\[class\*="job-recommend"\]/);
+  assert.match(source, /isFilterLikeContainer/);
+  assert.match(source, /data-job-seeker-overlay/);
+  assert.match(source, /pageHasJobSignal/);
+  assert.match(source, /leftScrollableFallback/);
   assert.match(source, /jobLinkCount\(el\) < 3 && jobCardCount\(el\) < 3/);
   assert.doesNotMatch(source, /window\.scrollBy\s*\(/);
+});
+
+test('cooldown resumes once and returns to preferred feeds before keyword search', () => {
+  assert.match(source, /tryAcquireCooldownResumeLock/);
+  assert.match(source, /markCooldownResumeDone/);
+  assert.match(source, /cooldownResumeRedirecting/);
+  assert.match(source, /preferred_feed_after_cooldown_started/);
+  assert.match(source, /搜索冷却结束，优先处理用户自定义推荐源/);
+  assert.match(source, /Math\.min\(requestedUntil,\s*randomUntil\)/);
+  const cooldownResume = source.indexOf('if (OPTIONS.preferredFeedMode !==');
+  const keywordResume = source.indexOf("await beginSearchRound('cooldown_finished')", cooldownResume);
+  assert.ok(cooldownResume >= 0 && keywordResume > cooldownResume, 'preferred feeds should be considered before keyword search after cooldown');
 });
 
 test('ordinary element failures skip first and pause after three matching failures', () => {
@@ -165,7 +184,10 @@ test('boss quota reminder is confirmed instead of treated as a hard limit', () =
   assert.match(hooks.quotaReminderReasonFromValue({ zpData: { bizData: { chatRemindDialog: { title: '温馨提示', content: text } } } }), /BOSS 温馨提示/);
   assert.match(source, /findQuotaReminderDialog/);
   assert.match(source, /confirmQuotaReminderDialog/);
+  assert.match(source, /clickLikeUser/);
   assert.match(source, /quota_reminder_confirmed/);
+  assert.match(source, /chat_entry_quota_reminder_unconfirmed/);
+  assert.doesNotMatch(source, /继续当前流程: \$\{quotaReason\}/);
   assert.doesNotMatch(source, /dailyGreetSafeLimit|sessionGreetLimit/);
 });
 
