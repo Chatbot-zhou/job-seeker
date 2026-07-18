@@ -137,11 +137,74 @@ def test_openai_thinking_parameter_error_falls_back_once(monkeypatch) -> None:
         assert "".join(chunks) == "ok"
         assert "thinking" in calls[0]
         assert "thinking" not in calls[1]
+        assert calls[1]["messages"][0]["role"] == "system"
+        assert "不要输出任何思考过程" in calls[1]["messages"][0]["content"]
         assert any(event_type == "model_thinking_control_retry" for event_type, _ in events)
         assert model_stream.is_openai_thinking_control_unsupported("doubao-seed-test")
     finally:
         Config.apply(original)
         model_stream.OPENAI_THINKING_CONTROL_UNSUPPORTED.clear()
+
+
+def test_ollama_think_parameter_unsupported_is_cached(monkeypatch) -> None:
+    import model_stream
+    from config import Config
+
+    original = Config.as_dict()
+    calls: list[dict] = []
+    events: list[tuple[str, str]] = []
+
+    def fake_raw_chunks(payload):
+        calls.append(dict(payload))
+        if len(calls) == 1:
+            raise RuntimeError('Ollama 请求失败: HTTP 400 {"error":"unknown field \\"think\\""}')
+        yield {"message": {"content": "ok"}, "done": True}
+
+    try:
+        model_stream.OLLAMA_THINK_PARAMETER_UNSUPPORTED.clear()
+        Config.apply(
+            {
+                **original,
+                "model_provider": "ollama",
+                "ollama_host": "http://127.0.0.1:11434",
+                "think_model": "legacy-model",
+                "disable_model_thinking": True,
+            }
+        )
+        monkeypatch.setattr(model_stream, "iter_ollama_http_raw_chunks", fake_raw_chunks)
+        monkeypatch.setattr(
+            model_stream.runtime_state,
+            "emit",
+            lambda event_type, message, **kwargs: events.append((event_type, message)),
+        )
+
+        first = list(
+            model_stream.iter_ollama_chat_chunks(
+                [{"role": "user", "content": "hi"}],
+                "legacy-model",
+                {"think": False, "disable_thinking": True},
+            )
+        )
+        second = list(
+            model_stream.iter_ollama_chat_chunks(
+                [{"role": "user", "content": "hi"}],
+                "legacy-model",
+                {"think": False, "disable_thinking": True},
+            )
+        )
+
+        assert "".join(first) == "ok"
+        assert "".join(second) == "ok"
+        assert calls[0]["think"] is False
+        assert "think" not in calls[1]
+        assert "think" not in calls[2]
+        assert calls[2]["messages"][0]["role"] == "system"
+        assert "不要输出任何思考过程" in calls[2]["messages"][0]["content"]
+        assert model_stream.is_ollama_think_parameter_unsupported("legacy-model")
+        assert any(event_type == "model_thinking_control_retry" for event_type, _ in events)
+    finally:
+        Config.apply(original)
+        model_stream.OLLAMA_THINK_PARAMETER_UNSUPPORTED.clear()
 
 
 def test_job_score_stops_retrying_on_model_config_error(monkeypatch) -> None:

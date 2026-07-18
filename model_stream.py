@@ -26,6 +26,9 @@ MODEL_MAX_RETRIES = 3
 JOB_SCORE_EARLY_STOP_LABELS = {"计算职位匹配度"}
 OPENAI_THINKING_CONTROL_UNSUPPORTED: set[str] = set()
 OPENAI_THINKING_CONTROL_LOCK = threading.Lock()
+OLLAMA_THINK_PARAMETER_UNSUPPORTED: set[str] = set()
+OLLAMA_THINK_PARAMETER_LOCK = threading.Lock()
+THINKING_SUPPRESSION_MESSAGE = "请直接输出最终答案，不要输出任何思考过程、分析或推理。"
 
 
 class ModelRepetitionError(RuntimeError):
@@ -253,6 +256,15 @@ def payload_model_name() -> str:
     return str(getattr(Config, "think_model", ""))
 
 
+def ollama_think_parameter_key(model: str | None = None) -> str:
+    return "|".join(
+        [
+            str(getattr(Config, "ollama_host", "")),
+            str(model or payload_model_name()),
+        ]
+    )
+
+
 def is_openai_thinking_control_unsupported(model: str | None = None) -> bool:
     key = openai_thinking_control_key(model)
     with OPENAI_THINKING_CONTROL_LOCK:
@@ -265,6 +277,26 @@ def mark_openai_thinking_control_unsupported(model: str | None = None) -> bool:
         already = key in OPENAI_THINKING_CONTROL_UNSUPPORTED
         OPENAI_THINKING_CONTROL_UNSUPPORTED.add(key)
     return not already
+
+
+def is_ollama_think_parameter_unsupported(model: str | None = None) -> bool:
+    key = ollama_think_parameter_key(model)
+    with OLLAMA_THINK_PARAMETER_LOCK:
+        return key in OLLAMA_THINK_PARAMETER_UNSUPPORTED
+
+
+def mark_ollama_think_parameter_unsupported(model: str | None = None) -> bool:
+    key = ollama_think_parameter_key(model)
+    with OLLAMA_THINK_PARAMETER_LOCK:
+        already = key in OLLAMA_THINK_PARAMETER_UNSUPPORTED
+        OLLAMA_THINK_PARAMETER_UNSUPPORTED.add(key)
+    return not already
+
+
+def suppress_thinking_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    if messages and messages[0].get("role") == "system" and THINKING_SUPPRESSION_MESSAGE in messages[0].get("content", ""):
+        return list(messages)
+    return [{"role": "system", "content": THINKING_SUPPRESSION_MESSAGE}] + list(messages)
 
 
 def apply_openai_thinking_control(payload: dict[str, Any], disable_thinking: bool, model: str | None = None) -> bool:
@@ -292,13 +324,16 @@ def iter_openai_chat_chunks(
 ) -> Any:
     if not Config.openai_api_key.strip():
         raise RuntimeError("OpenAI API Key 未配置")
+    disable_thinking = should_disable_thinking(options)
+    if disable_thinking:
+        messages = suppress_thinking_messages(messages)
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
     }
     payload.update(openai_payload_options(options))
-    thinking_control_applied = apply_openai_thinking_control(payload, should_disable_thinking(options), model)
+    thinking_control_applied = apply_openai_thinking_control(payload, disable_thinking, model)
     request = Request(
         openai_chat_url(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -412,9 +447,8 @@ def iter_ollama_chat_chunks(
 ) -> Any:
     raw_options = dict(options or DEFAULT_MODEL_OPTIONS)
     disable_thinking = should_disable_thinking(raw_options)
-    # 主动注入 system 消息禁止思考（prompt 级别，比 API 参数 think 更可靠）
     if disable_thinking:
-        messages = [{"role": "system", "content": "请直接输出最终答案，不要输出任何思考过程、分析或推理。"}] + list(messages)
+        messages = suppress_thinking_messages(messages)
     think = raw_options.pop("think", None)
     request_options = ollama_payload_options(raw_options)
     kwargs: dict[str, Any] = {
@@ -423,7 +457,8 @@ def iter_ollama_chat_chunks(
         "stream": True,
         "options": request_options,
     }
-    kwargs["think"] = bool(think) if think is not None else not disable_thinking
+    if not is_ollama_think_parameter_unsupported(model):
+        kwargs["think"] = bool(think) if think is not None else not disable_thinking
     if format_schema is not None:
         kwargs["format"] = format_schema
     def emit_chunks(payload: dict[str, Any]) -> Any:
@@ -452,6 +487,7 @@ def iter_ollama_chat_chunks(
         error_text = str(exc).lower()
         if "think" not in kwargs or not ollama_think_parameter_unsupported(error_text):
             raise
+        mark_ollama_think_parameter_unsupported(model)
         kwargs.pop("think", None)
         if was_disabling_think:
             runtime_state.emit(

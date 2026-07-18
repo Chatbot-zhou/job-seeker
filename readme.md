@@ -138,6 +138,12 @@ ollama / qwen3:1.7b
 "disable_model_thinking": true
 ```
 
+思考策略以用户配置为准：
+
+- `disable_model_thinking=true`：系统会尽量关闭思考；如果模型不支持 `think/thinking/reasoning` 控制参数，会自动移除该参数继续运行，并用系统提示词要求模型只输出最终答案。
+- `disable_model_thinking=false`：支持思考模式的模型会按思考模式运行；如果模型不支持思考参数，系统会自动移除该参数继续运行。
+- 不论模型是否支持思考控制，都不应该因为这个参数导致岗位评分链路直接不可用。
+
 如果使用 OpenAI 兼容接口，比如火山引擎、豆包、DeepSeek、通义千问兼容 API，可以在人工模式 `config` 中设置：
 
 - `model_provider=openai`
