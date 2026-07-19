@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.27
+// @version      2026.06.26.28
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06.26.27',
+        scriptVersion: '2026.06.26.28',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -165,8 +165,14 @@
                     '[class*="editor"] [contenteditable="true"]',
                     '[class*="input"] [contenteditable="true"]',
                     '[contenteditable="true"][data-placeholder]',
+                    '[role="textbox"][contenteditable="true"]',
+                    '.ProseMirror[contenteditable="true"]',
+                    '[data-slate-editor="true"]',
+                    '[contenteditable="plaintext-only"]',
                     'textarea[id*="chat"]',
                     'textarea[class*="chat"]',
+                    'textarea[placeholder*="消息"]',
+                    'textarea[placeholder*="沟通"]',
                     '[contenteditable="true"]',
                 ], // 聊天输入框
                 MSGSEND: [
@@ -343,29 +349,38 @@
             el.dispatchEvent(new Event('input', { bubbles: true }));
         },
         inputEditableText: function (el, text) {
+            const doc = el?.ownerDocument || document;
+            const view = doc.defaultView || window;
+            const makeInputEvent = () => {
+                try {
+                    return new view.InputEvent('input', { bubbles: true, inputType: 'insertText', data: text });
+                } catch (e) {
+                    return new view.Event('input', { bubbles: true });
+                }
+            };
             if ('value' in el) {
                 el.focus();
                 el.value = text;
-                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(makeInputEvent());
+                el.dispatchEvent(new view.Event('change', { bubbles: true }));
                 return String(el.value || '').trim();
             }
             el.focus();
-            const selection = window.getSelection();
-            const range = document.createRange();
+            const selection = view.getSelection();
+            const range = doc.createRange();
             range.selectNodeContents(el);
             selection.removeAllRanges();
             selection.addRange(range);
-            document.execCommand('delete', false);
-            const inserted = document.execCommand('insertText', false, text);
+            if (typeof doc.execCommand === 'function') doc.execCommand('delete', false);
+            const inserted = typeof doc.execCommand === 'function' && doc.execCommand('insertText', false, text);
             if (!inserted || !el.innerText.includes(text)) {
                 el.innerText = text;
                 el.textContent = text;
             }
-            el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Process' }));
-            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Process' }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new view.KeyboardEvent('keydown', { bubbles: true, key: 'Process' }));
+            el.dispatchEvent(makeInputEvent());
+            el.dispatchEvent(new view.KeyboardEvent('keyup', { bubbles: true, key: 'Process' }));
+            el.dispatchEvent(new view.Event('change', { bubbles: true }));
             selection.removeAllRanges();
             return el.innerText.trim() || el.textContent.trim() || '';
         },
@@ -382,9 +397,14 @@
         },
         isVisible(el) {
             if (!el) return false;
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            try {
+                const view = el.ownerDocument?.defaultView || window;
+                const style = view.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            } catch (e) {
+                return false;
+            }
         },
         isDisabled(el) {
             if (!el) return true;
@@ -429,17 +449,18 @@
                 try { target.focus?.(); } catch (ignore) {}
             }
             const rect = target.getBoundingClientRect();
+            const view = target.ownerDocument?.defaultView || window;
             const eventInit = {
                 bubbles: true,
                 cancelable: true,
-                view: window,
+                view,
                 button: 0,
                 clientX: Math.round(rect.left + Math.max(1, rect.width / 2)),
                 clientY: Math.round(rect.top + Math.max(1, rect.height / 2)),
             };
             for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
                 try {
-                    target.dispatchEvent(new MouseEvent(type, eventInit));
+                    target.dispatchEvent(new view.MouseEvent(type, eventInit));
                 } catch (e) {}
             }
             try {
@@ -550,6 +571,25 @@
         },
         jobIdentityKey(href) {
             return this.jobIdentityUrl(href) || this.normalUrl(href) || String(href || '');
+        },
+        jobIdFromValue(value) {
+            const raw = String(value || '');
+            if (!raw) return '';
+            try {
+                const origin = typeof location !== 'undefined' && location.origin
+                    ? location.origin
+                    : 'https://www.zhipin.com';
+                const parsed = new URL(raw, origin);
+                const queryJobId = parsed.searchParams.get('jobId') || parsed.searchParams.get('jobid');
+                if (queryJobId) return queryJobId;
+                const match = parsed.pathname.match(/\/job_detail\/([^/?#]+?)(?:\.html)?$/i);
+                return match ? match[1] : '';
+            } catch (e) {
+                const queryMatch = raw.match(/[?&]jobId=([^&#]+)/i);
+                if (queryMatch) return decodeURIComponent(queryMatch[1]);
+                const pathMatch = raw.match(/\/job_detail\/([^/?#]+?)(?:\.html)?(?:[?#]|$)/i);
+                return pathMatch ? pathMatch[1] : '';
+            }
         },
         isJobSearchPath(path = location.pathname) {
             const value = String(path || '').replace(/\/+$/, '');
@@ -5353,7 +5393,9 @@
 
             // 发送消息
             const getSelfMessageSnapshot = () => {
-                const nodes = Array.from(document.querySelectorAll('.item-myself'));
+                const nodes = typeof queryChatRoots === 'function'
+                    ? queryChatRoots(['.item-myself'])
+                    : Array.from(document.querySelectorAll('.item-myself'));
                 const texts = nodes.map((node) => {
                     const msgBox = node.querySelector(SELECTORS.ZHIPIN.CHAT.MSGCONTENT);
                     return String((msgBox || node).innerText || (msgBox || node).textContent || '').trim();
@@ -5411,41 +5453,183 @@
                 return true;
             };
 
-            const findChatInput = async () => {
+            let conversationActivationAttempted = false;
+            let conversationActivationClicked = false;
+            let conversationActivationConfirmed = false;
+
+            const chatSearchRoots = () => {
+                const roots = [];
+                const queue = [document];
+                const seen = new Set();
+                while (queue.length && roots.length < 30) {
+                    const root = queue.shift();
+                    if (!root || seen.has(root) || typeof root.querySelectorAll !== 'function') continue;
+                    seen.add(root);
+                    roots.push(root);
+                    try {
+                        root.querySelectorAll('iframe').forEach((frame) => {
+                            try {
+                                if (frame.contentDocument) queue.push(frame.contentDocument);
+                            } catch (e) {
+                                // Cross-origin frames are intentionally ignored.
+                            }
+                        });
+                        root.querySelectorAll('*').forEach((el) => {
+                            if (el.shadowRoot) queue.push(el.shadowRoot);
+                        });
+                    } catch (e) {
+                        // A detached root may disappear while the chat app is rendering.
+                    }
+                }
+                return roots;
+            };
+
+            const queryChatRoots = (selectors, roots = chatSearchRoots()) => {
+                const found = [];
+                for (const root of roots) {
+                    for (const selector of selectors) {
+                        try {
+                            root.querySelectorAll(selector).forEach((el) => {
+                                if (!found.includes(el)) found.push(el);
+                            });
+                        } catch (e) {
+                            // Ignore unsupported selectors and detached roots.
+                        }
+                    }
+                }
+                return found;
+            };
+
+            const activateGreetConversation = async (greetContext = {}) => {
+                if (conversationActivationAttempted) return conversationActivationClicked;
+                conversationActivationAttempted = true;
+                const roots = chatSearchRoots();
+                const jobId = tools.jobIdFromValue(greetContext.chatUrl || greetContext.url || location.href);
+                const attributeValue = String(jobId || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+                const encodedJobId = encodeURIComponent(jobId || '');
+                const strongSelectors = jobId ? [
+                    `[data-job-id="${attributeValue}"]`,
+                    `[data-jobid="${attributeValue}"]`,
+                    `[data-jobId="${attributeValue}"]`,
+                    `a[href*="jobId=${encodedJobId}"]`,
+                    `[data-url*="${attributeValue}"]`,
+                ] : [];
+                const conversationContainerSelector = [
+                    '[class*="chat-list"]',
+                    '[class*="friend-list"]',
+                    '[class*="conversation-list"]',
+                    '[class*="contact-list"]',
+                    '[class*="user-list"]',
+                    '[role="listbox"]',
+                ].join(',');
+                const isConversationCandidate = el => Boolean(
+                    el?.closest?.(conversationContainerSelector)
+                    || el?.matches?.('[class*="chat-item"], [class*="friend-item"], [class*="conversation-item"], [class*="contact-item"]')
+                );
+                const strong = queryChatRoots(strongSelectors, roots)
+                    .filter(el => isConversationCandidate(el) && tools.isVisible(el) && !tools.isDisabled(el));
+                let candidate = strong[0] || null;
+                let matchedBy = candidate ? 'job_id' : '';
+                const listSelectors = [
+                    '[class*="chat-list"] [class*="item"]',
+                    '[class*="friend-list"] [class*="item"]',
+                    '[class*="conversation-list"] [class*="item"]',
+                    '[class*="contact-list"] [class*="item"]',
+                    '[class*="user-list"] [class*="item"]',
+                    '[class*="chat-list"] li',
+                    '[class*="friend-list"] li',
+                    '[role="listbox"] [role="option"]',
+                ];
+                const listItems = queryChatRoots(listSelectors, roots)
+                    .filter(el => tools.isVisible(el) && !tools.isDisabled(el));
+                if (!candidate) {
+                    const normalize = value => String(value || '').replace(/\s+/g, '').toLowerCase();
+                    const title = normalize(greetContext.title);
+                    const company = normalize(greetContext.company);
+                    const ranked = listItems
+                        .map((el) => {
+                            const text = normalize(el.innerText || el.textContent || '');
+                            const titleMatch = title.length >= 4 && text.includes(title);
+                            const companyMatch = company.length >= 4 && text.includes(company);
+                            return { el, score: (titleMatch ? 2 : 0) + (companyMatch ? 1 : 0) };
+                        })
+                        .filter(item => item.score > 0)
+                        .sort((a, b) => b.score - a.score);
+                    if (ranked.length && (ranked.length === 1 || ranked[0].score > ranked[1].score)) {
+                        candidate = ranked[0].el;
+                        matchedBy = ranked[0].score >= 2 ? 'title' : 'company';
+                    }
+                }
+                if (!candidate) {
+                    await pageApi.event('chat_conversation_activation_unavailable', '聊天页未发现可安全确认的目标会话，继续等待输入框', 'script', 'info', {
+                        jobId,
+                        title: greetContext.title || '',
+                        company: greetContext.company || '',
+                        rootCount: roots.length,
+                        listCandidateCount: listItems.length,
+                        path: location.pathname,
+                    });
+                    return false;
+                }
+                const clicked = tools.clickLikeUser(candidate);
+                conversationActivationClicked = Boolean(clicked);
+                await pageApi.event('chat_conversation_activation_clicked', `已尝试激活目标聊天会话: ${matchedBy}`, 'script', 'info', {
+                    jobId,
+                    title: greetContext.title || '',
+                    company: greetContext.company || '',
+                    matchedBy,
+                    candidate: tools.elementBrief(clicked || candidate),
+                });
+                await tools.actionSleep(800);
+                return conversationActivationClicked;
+            };
+
+            const findChatInput = async (greetContext = {}) => {
                 const startedAt = Date.now();
                 while (Date.now() - startedAt < 15000) {
                     await confirmChatQuotaReminderIfPresent('find_chat_input');
-                    const candidates = [];
-                    for (const selector of SELECTORS.ZHIPIN.CHAT.CHATINPUT) {
-                        try {
-                            candidates.push(...Array.from(document.querySelectorAll(selector)));
-                        } catch (e) {
-                            // Ignore unsupported selectors in older browsers.
-                        }
-                    }
+                    const roots = chatSearchRoots();
+                    const candidates = queryChatRoots(SELECTORS.ZHIPIN.CHAT.CHATINPUT, roots);
                     const visible = candidates.find(el => tools.isVisible(el) && !tools.isDisabled(el));
-                    if (visible) return visible;
+                    if (visible) {
+                        if (conversationActivationClicked && !conversationActivationConfirmed) {
+                            conversationActivationConfirmed = true;
+                            await pageApi.event('chat_conversation_activated', '目标聊天会话已激活并发现输入框', 'script', 'info', {
+                                input: tools.elementBrief(visible),
+                                rootCount: roots.length,
+                            });
+                        }
+                        return visible;
+                    }
+                    if (Date.now() - startedAt >= 2500 && !conversationActivationAttempted) {
+                        await activateGreetConversation(greetContext);
+                    }
                     const platformLimit = tools.detectPlatformLimit();
                     if (platformLimit) throw new Error(`平台次数限制: ${platformLimit}`);
                     const interruption = tools.detectManualInterruption();
                     if (interruption) throw new Error(`需要人工处理: ${interruption}`);
                     await tools.asyncSleep(300);
                 }
-                throw new Error(`未找到目标元素: ${SELECTORS.ZHIPIN.CHAT.CHATINPUT.join(', ')}`);
+                const roots = chatSearchRoots();
+                const error = new Error(`未找到目标元素: ${SELECTORS.ZHIPIN.CHAT.CHATINPUT.join(', ')}`);
+                error.detail = {
+                    jobId: tools.jobIdFromValue(greetContext.chatUrl || greetContext.url || location.href),
+                    path: location.pathname,
+                    rootCount: roots.length,
+                    frameCount: document.querySelectorAll('iframe').length,
+                    contentEditableCount: queryChatRoots(['[contenteditable="true"]', '[contenteditable="plaintext-only"]'], roots).length,
+                    textareaCount: queryChatRoots(['textarea'], roots).length,
+                    conversationActivationAttempted,
+                    conversationActivationClicked,
+                };
+                throw error;
             };
 
             const findSendButton = async () => {
                 const startedAt = Date.now();
                 while (Date.now() - startedAt < 10000) {
                     await confirmChatQuotaReminderIfPresent('find_send_button');
-                    const candidates = [];
-                    for (const selector of SELECTORS.ZHIPIN.CHAT.MSGSEND) {
-                        try {
-                            candidates.push(...Array.from(document.querySelectorAll(selector)));
-                        } catch (e) {
-                            // Ignore unsupported selectors in older browsers.
-                        }
-                    }
+                    const candidates = queryChatRoots(SELECTORS.ZHIPIN.CHAT.MSGSEND);
                     const visible = candidates.find(el => tools.isVisible(el) && !tools.isDisabled(el));
                     if (visible) return visible;
                     await tools.asyncSleep(300);
@@ -5455,8 +5639,9 @@
 
             const trySendByEnter = async (inputEl, text, beforeSnapshot) => {
                 inputEl.focus();
+                const view = inputEl.ownerDocument?.defaultView || window;
                 ['keydown', 'keypress', 'keyup'].forEach(type => {
-                    inputEl.dispatchEvent(new KeyboardEvent(type, {
+                    inputEl.dispatchEvent(new view.KeyboardEvent(type, {
                         bubbles: true,
                         cancelable: true,
                         key: 'Enter',
@@ -5478,7 +5663,7 @@
                         if (interruption) throw new Error(`需要人工处理: ${interruption}`);
                         if (!String(text || '').trim()) throw new Error('发送内容为空');
                         await pageApi.event('message_send_started', '准备发送已确认的打招呼消息', 'script', 'info', { length: String(text).length });
-                        const ipt = await findChatInput();
+                        const ipt = await findChatInput(greetContext);
                         const actualText = tools.inputEditableText(ipt, text);
                         if (!actualText || !actualText.includes(String(text).slice(0, 10))) {
                             const error = new Error('输入框写入后内容校验失败');
@@ -5874,6 +6059,7 @@
             sanitizeCompanyName: (value, title, salary) => tools.sanitizeCompanyName(value, title, salary),
             isBackendUnavailableError: (value) => tools.isBackendUnavailableError(value),
             jobIdentityUrl: (value) => tools.jobIdentityUrl(value),
+            jobIdFromValue: (value) => tools.jobIdFromValue(value),
             logSafeUrl: (value) => tools.logSafeUrl(value),
             sanitizeTelemetryText: (value) => tools.sanitizeTelemetryText(value),
             documentScrollFallbackEligible: (metrics) => tools.documentScrollFallbackEligible(metrics),

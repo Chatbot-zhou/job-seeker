@@ -106,6 +106,8 @@ test('job list scrolling prefers containers and safely supports document fallbac
 test('job identity ignores dynamic query data and telemetry redacts security ids', () => {
   const jobUrl = 'https://www.zhipin.com/job_detail/abc123.html?securityId=secret-value&lid=other#anchor';
   assert.equal(hooks.jobIdentityUrl(jobUrl), 'https://www.zhipin.com/job_detail/abc123.html');
+  assert.equal(hooks.jobIdFromValue(jobUrl), 'abc123');
+  assert.equal(hooks.jobIdFromValue('https://www.zhipin.com/web/geek/chat?jobId=job-123'), 'job-123');
   const entryUrl = 'https://www.zhipin.com/wapi/zpgeek/friend/add.json?securityId=secret-value&jobId=job-123';
   assert.equal(hooks.logSafeUrl(entryUrl), 'https://www.zhipin.com/wapi/zpgeek/friend/add.json?jobId=job-123');
   const message = hooks.sanitizeTelemetryText(`请求入口: ${entryUrl}`);
@@ -223,6 +225,12 @@ test('send-clicked unknown results are skipped without reopening chat', () => {
 test('chat send retries stay in the same page and search does not reopen chat on send failure', () => {
   assert.match(source, /sendMsgWithRetries/);
   assert.match(source, /message_send_attempt_retry/);
+  assert.match(source, /chatSearchRoots/);
+  assert.match(source, /activateGreetConversation/);
+  assert.match(source, /chat_conversation_activation_clicked/);
+  assert.match(source, /chat_conversation_activated/);
+  assert.match(source, /\[role="textbox"\]\[contenteditable="true"\]/);
+  assert.match(source, /data-slate-editor/);
   assert.match(source, /failureCode:\s*e\.preSendFailed \? 'message_pre_send_failed'/);
   assert.match(source, /retryable:\s*false/);
   assert.match(source, /打招呼连续 \$\{maxAttempts\} 次失败，系统已暂停/);
