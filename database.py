@@ -11,12 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from config import Config, ensure_data_dirs
-from tools import now_iso
+from tools import now_iso, redact_sensitive_urls, sanitize_log_value
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_MIGRATION_RESULTS: dict[str, dict[str, Any]] = {}
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -44,6 +45,106 @@ def _backup_before_migration(db_path: Path, old_version: int) -> Path | None:
     return backup_path
 
 
+def _sanitize_legacy_event_rows(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        """
+        SELECT id, message, detail_json
+        FROM events
+        WHERE message LIKE '%http%?%'
+           OR detail_json LIKE '%http%?%'
+           OR message LIKE '%securityId=%'
+           OR detail_json LIKE '%securityId=%'
+        """
+    ).fetchall()
+    updates: list[tuple[str, str | None, int]] = []
+    for row in rows:
+        message = redact_sensitive_urls(str(row["message"] or ""))
+        raw_detail = row["detail_json"]
+        detail = redact_sensitive_urls(str(raw_detail)) if raw_detail is not None else None
+        if message != row["message"] or detail != raw_detail:
+            updates.append((message, detail, int(row["id"])))
+    if updates:
+        conn.executemany("UPDATE events SET message = ?, detail_json = ? WHERE id = ?", updates)
+    return len(updates)
+
+
+def _compact_duplicate_thinking_events(conn: sqlite3.Connection) -> dict[str, int]:
+    groups = conn.execute(
+        """
+        SELECT COALESCE(run_id, '') AS run_id, message, COALESCE(detail_json, '') AS detail_json,
+               COUNT(*) AS event_count, MIN(created_at) AS first_at, MAX(created_at) AS last_at
+        FROM events
+        WHERE event_type = 'model_thinking_control_retry' AND level = 'info'
+        GROUP BY COALESCE(run_id, ''), message, COALESCE(detail_json, '')
+        HAVING COUNT(*) > 2
+        """
+    ).fetchall()
+    deleted = 0
+    summaries = 0
+    for group in groups:
+        ids = [
+            int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT id FROM events
+                WHERE event_type = 'model_thinking_control_retry'
+                  AND level = 'info'
+                  AND COALESCE(run_id, '') = ?
+                  AND message = ?
+                  AND COALESCE(detail_json, '') = ?
+                ORDER BY id
+                """,
+                (group["run_id"], group["message"], group["detail_json"]),
+            ).fetchall()
+        ]
+        middle_ids = ids[1:-1]
+        if not middle_ids:
+            continue
+        conn.executemany("DELETE FROM events WHERE id = ?", [(event_id,) for event_id in middle_ids])
+        deleted += len(middle_ids)
+        summary_detail = {
+            "compacted_event_type": "model_thinking_control_retry",
+            "original_count": int(group["event_count"]),
+            "retained_count": 2,
+            "deleted_count": len(middle_ids),
+            "first_at": group["first_at"],
+            "last_at": group["last_at"],
+        }
+        conn.execute(
+            """
+            INSERT INTO events(event_type, level, source, message, detail_json, run_id, created_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                "event_compaction_summary",
+                "info",
+                "database",
+                f"已压缩重复模型兼容事件 {len(middle_ids)} 条",
+                json.dumps(summary_detail, ensure_ascii=False),
+                group["run_id"],
+                now_iso(),
+            ),
+        )
+        summaries += 1
+    return {"deleted": deleted, "summaries": summaries}
+
+
+def _migrate_v5_event_hardening(conn: sqlite3.Connection) -> dict[str, Any]:
+    sanitized = _sanitize_legacy_event_rows(conn)
+    compacted = _compact_duplicate_thinking_events(conn)
+    return {
+        "from_version": 4,
+        "to_version": 5,
+        "sanitized_events": sanitized,
+        "compacted_events": compacted["deleted"],
+        "compaction_summaries": compacted["summaries"],
+    }
+
+
+def last_migration_result() -> dict[str, Any]:
+    return dict(_MIGRATION_RESULTS.get(str(Path(Config.app_db_name).resolve()), {}))
+
+
 def connect() -> sqlite3.Connection:
     ensure_data_dirs()
     conn = sqlite3.connect(Config.app_db_name, timeout=5)
@@ -61,6 +162,8 @@ def init_db() -> None:
     if db_key in _INITIALIZED_PATHS:
         return
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    migration_result: dict[str, Any] = {}
+    backup_path: Path | None = None
     with _INIT_LOCK:
         if db_key in _INITIALIZED_PATHS:
             return
@@ -69,7 +172,7 @@ def init_db() -> None:
             old_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if old_version < SCHEMA_VERSION:
                 conn.close()
-                _backup_before_migration(db_path, old_version)
+                backup_path = _backup_before_migration(db_path, old_version)
                 conn = connect()
             conn.execute(
                 """
@@ -133,6 +236,7 @@ def init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
+                    status TEXT DEFAULT 'paused',
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
                     control TEXT DEFAULT 'paused',
@@ -141,6 +245,7 @@ def init_db() -> None:
                 )
                 """
             )
+            _ensure_column(conn, "runs", "status TEXT DEFAULT 'paused'")
             _ensure_column(conn, "runs", "started_at TEXT DEFAULT ''")
             _ensure_column(conn, "runs", "ended_at TEXT")
             _ensure_column(conn, "runs", "control TEXT DEFAULT 'paused'")
@@ -153,10 +258,23 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_run_id ON actions(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id)")
+            if old_version < 5:
+                migration_result = _migrate_v5_event_hardening(conn)
+                migration_result["from_version"] = old_version
+                migration_result["backup_path"] = str(backup_path or "")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()
         finally:
             conn.close()
+        if migration_result.get("compacted_events"):
+            with sqlite3.connect(str(db_path), timeout=30) as maintenance_conn:
+                maintenance_conn.execute("PRAGMA busy_timeout=30000")
+                maintenance_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                maintenance_conn.execute("VACUUM")
+            migration_result["vacuumed"] = True
+        if migration_result:
+            migration_result["size_bytes_after"] = db_path.stat().st_size if db_path.exists() else 0
+            _MIGRATION_RESULTS[db_key] = migration_result
         _INITIALIZED_PATHS.add(db_key)
 
 
@@ -368,6 +486,8 @@ def list_recent_processed_jobs(limit: int = 500, hours: int = 24) -> list[dict[s
 def create_event(event: dict[str, Any]) -> dict[str, Any]:
     init_db()
     current_time = event.get("time") or now_iso()
+    safe_message = str(sanitize_log_value(event.get("message", "")) or "")
+    safe_detail = sanitize_log_value(event.get("detail", {}))
     with closing(connect()) as conn:
         cursor = conn.execute(
             """
@@ -380,8 +500,8 @@ def create_event(event: dict[str, Any]) -> dict[str, Any]:
                 event.get("type", "event"),
                 event.get("level", "info"),
                 event.get("source", "backend"),
-                event.get("message", ""),
-                json.dumps(event.get("detail", {}), ensure_ascii=False),
+                safe_message,
+                json.dumps(safe_detail, ensure_ascii=False),
                 event.get("run_id", ""),
                 current_time,
             ),
@@ -389,6 +509,8 @@ def create_event(event: dict[str, Any]) -> dict[str, Any]:
         conn.commit()
         event_id = cursor.lastrowid
     stored = dict(event)
+    stored["message"] = safe_message
+    stored["detail"] = safe_detail
     stored["id"] = event_id
     return stored
 
@@ -433,6 +555,36 @@ def upsert_run(run_id: str, *, control: str = "paused", started_at: str = "") ->
                 (run_id, started_at or current_time, control, current_time),
             )
         conn.commit()
+
+
+def reconcile_stale_runs(*, stale_minutes: int = 10, exclude_run_id: str = "") -> dict[str, Any]:
+    """Close abandoned run rows without deleting their event history."""
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, int(stale_minutes)))).isoformat()
+    current_time = now_iso()
+    params: list[Any] = [cutoff]
+    where = "ended_at IS NULL AND updated_at < ?"
+    if exclude_run_id:
+        where += " AND run_id != ?"
+        params.append(exclude_run_id)
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            f"SELECT run_id, updated_at FROM runs WHERE {where} ORDER BY updated_at",
+            tuple(params),
+        ).fetchall()
+        run_ids = [str(row["run_id"]) for row in rows]
+        for row in rows:
+            ended_at = str(row["updated_at"] or current_time)
+            conn.execute(
+                """
+                UPDATE runs
+                SET ended_at = ?, status = 'interrupted', control = 'interrupted', updated_at = ?
+                WHERE run_id = ? AND ended_at IS NULL
+                """,
+                (ended_at, current_time, row["run_id"]),
+            )
+        conn.commit()
+    return {"count": len(run_ids), "run_ids": run_ids, "cutoff": cutoff}
 
 
 def finish_run(run_id: str, *, control: str = "stopped") -> dict[str, Any]:
@@ -606,6 +758,8 @@ def database_stats() -> dict[str, Any]:
         event_count = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
         job_count = int(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
         action_count = int(conn.execute("SELECT COUNT(*) FROM actions").fetchone()[0])
+        open_run_count = int(conn.execute("SELECT COUNT(*) FROM runs WHERE ended_at IS NULL").fetchone()[0])
+        interrupted_run_count = int(conn.execute("SELECT COUNT(*) FROM runs WHERE status = 'interrupted'").fetchone()[0])
     return {
         "path": str(db_path),
         "size_bytes": db_path.stat().st_size if db_path.exists() else 0,
@@ -614,6 +768,8 @@ def database_stats() -> dict[str, Any]:
         "event_count": event_count,
         "job_count": job_count,
         "action_count": action_count,
+        "open_run_count": open_run_count,
+        "interrupted_run_count": interrupted_run_count,
     }
 
 

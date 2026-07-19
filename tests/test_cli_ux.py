@@ -21,6 +21,7 @@ def test_diagnostic_redaction_hides_sensitive_text() -> None:
         "openai_api_key": "test-local-secret-value",
         "resume": "电话 13800138000，邮箱 test@example.com",
         "detail": "身份证 110105199001011234",
+        "url": "https://www.zhipin.com/wapi/zpgeek/friend/add.json?securityId=url-secret&jobId=job-1",
     }
     redacted = _redact_export_value(payload)
     text = str(redacted)
@@ -28,6 +29,9 @@ def test_diagnostic_redaction_hides_sensitive_text() -> None:
     assert "13800138000" not in text
     assert "test@example.com" not in text
     assert "110105199001011234" not in text
+    assert "url-secret" not in text
+    assert "securityId" not in text
+    assert "jobId=job-1" in text
 
 
 def test_status_panel_does_not_trigger_model_warmup(monkeypatch) -> None:

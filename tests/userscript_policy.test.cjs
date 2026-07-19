@@ -4,7 +4,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const source = fs.readFileSync('web_script.js', 'utf8');
-const context = { __JOB_SEEKER_TEST_MODE__: true };
+const context = { __JOB_SEEKER_TEST_MODE__: true, URL };
 vm.createContext(context);
 vm.runInContext(source, context);
 const hooks = context.__JOB_SEEKER_TEST_HOOKS__;
@@ -34,7 +34,7 @@ test('search safety state persists across refreshes', () => {
   assert.match(source, /searchRoundCooldownMinutes:\s*5/);
 });
 
-test('job list scrolling is verified and never falls back to window scrolling', () => {
+test('job list scrolling prefers containers and safely supports document fallback', () => {
   assert.match(source, /jobListFingerprint/);
   assert.match(source, /search_result_scroll_verified/);
   assert.match(source, /isLikelyLeftJobArea/);
@@ -59,7 +59,60 @@ test('job list scrolling is verified and never falls back to window scrolling', 
   assert.match(source, /overlapsJobSignalArea/);
   assert.match(source, /pointTarget/);
   assert.match(source, /jobLinkCount\(el\) < 3 && jobCardCount\(el\) < 3/);
-  assert.doesNotMatch(source, /window\.scrollBy\s*\(/);
+  assert.match(source, /documentScrollFallbackAllowed/);
+  assert.match(source, /document\.scrollingElement/);
+  assert.match(source, /window\.scrollBy\s*\(/);
+  assert.match(source, /search_scroll_target_selected/);
+  assert.match(source, /search_scroll_exhausted/);
+  assert.equal(hooks.documentScrollFallbackEligible({
+    path: '/web/geek/jobs', jobLinkCount: 17, jobCardCount: 45, scrollHeight: 2433, clientHeight: 900,
+  }), true);
+  assert.equal(hooks.documentScrollFallbackEligible({
+    path: '/job_detail/example.html', jobLinkCount: 17, jobCardCount: 45, scrollHeight: 2433, clientHeight: 900,
+  }), false);
+  assert.equal(hooks.documentScrollFallbackEligible({
+    path: '/web/geek/chat', jobLinkCount: 17, jobCardCount: 45, scrollHeight: 2433, clientHeight: 900,
+  }), false);
+  assert.equal(hooks.documentScrollFallbackEligible({
+    path: '/web/geek/jobs', jobLinkCount: 17, jobCardCount: 45, scrollHeight: 2433, clientHeight: 900, riskBlocked: true,
+  }), false);
+  assert.equal(hooks.documentScrollFallbackEligible({
+    path: '/web/geek/jobs', jobLinkCount: 0, jobCardCount: 0, scrollHeight: 2433, clientHeight: 900,
+  }), false);
+  const exhaustedOutcome = hooks.scrollMetricsOutcome(
+    { position: 1200, contentHeight: 2100, jobCount: 20, fingerprint: 'same' },
+    { position: 1200, viewportHeight: 900, contentHeight: 2100, jobCount: 20, fingerprint: 'same' },
+  );
+  assert.equal(exhaustedOutcome.moved, false);
+  assert.equal(exhaustedOutcome.changed, false);
+  assert.equal(exhaustedOutcome.exhausted, true);
+  const loadedOutcome = hooks.scrollMetricsOutcome(
+    { position: 0, contentHeight: 2100, jobCount: 20, fingerprint: 'old' },
+    { position: 600, viewportHeight: 900, contentHeight: 2700, jobCount: 28, fingerprint: 'new' },
+  );
+  assert.equal(loadedOutcome.moved, true);
+  assert.equal(loadedOutcome.changed, true);
+  assert.equal(loadedOutcome.exhausted, false);
+  const positionOnlyOutcome = hooks.scrollMetricsOutcome(
+    { position: 0, contentHeight: 2100, jobCount: 20, fingerprint: 'same' },
+    { position: 600, viewportHeight: 900, contentHeight: 2100, jobCount: 20, fingerprint: 'same' },
+  );
+  assert.equal(positionOnlyOutcome.moved, true);
+  assert.equal(positionOnlyOutcome.changed, false);
+  assert.equal(positionOnlyOutcome.exhausted, false);
+  assert.match(source, /search_scroll_round_limit_reached/);
+});
+
+test('job identity ignores dynamic query data and telemetry redacts security ids', () => {
+  const jobUrl = 'https://www.zhipin.com/job_detail/abc123.html?securityId=secret-value&lid=other#anchor';
+  assert.equal(hooks.jobIdentityUrl(jobUrl), 'https://www.zhipin.com/job_detail/abc123.html');
+  const entryUrl = 'https://www.zhipin.com/wapi/zpgeek/friend/add.json?securityId=secret-value&jobId=job-123';
+  assert.equal(hooks.logSafeUrl(entryUrl), 'https://www.zhipin.com/wapi/zpgeek/friend/add.json?jobId=job-123');
+  const message = hooks.sanitizeTelemetryText(`请求入口: ${entryUrl}`);
+  assert.doesNotMatch(message, /securityId|secret-value/);
+  assert.match(message, /jobId=job-123/);
+  assert.match(source, /const activeKeyword = currentJobSource === 'keyword_search'/);
+  assert.match(source, /sourceLabel: activeSourceLabel/);
 });
 
 test('cooldown resumes once and returns to preferred feeds before keyword search', () => {

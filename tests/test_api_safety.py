@@ -44,10 +44,15 @@ def test_testclient_is_treated_as_loopback() -> None:
     assert main.is_loopback_client("testclient") is True
 
 
-def test_userscript_is_served_as_utf8() -> None:
+def test_userscript_is_served_as_utf8(tmp_path, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
+    import database
     import main
+    from config import Config
+
+    monkeypatch.setattr(Config, "app_db_name", str(tmp_path / "api-test.db"))
+    database._INITIALIZED_PATHS.clear()
 
     with TestClient(main.app) as client:
         response = client.get("/web_script.user.js")

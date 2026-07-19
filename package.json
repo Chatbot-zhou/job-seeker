@@ -2,6 +2,7 @@
   "name": "job-seeker-userscript-tests",
   "private": true,
   "scripts": {
-    "test": "node --test tests/userscript_policy.test.cjs"
+    "test": "node --test tests/userscript_policy.test.cjs",
+    "validate": "python scripts/validate.py"
   }
 }

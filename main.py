@@ -76,12 +76,28 @@ def shutdown_model_executor() -> None:
 async def lifespan(app: FastAPI):
     Config.load()
     database.init_db()
+    migration = database.last_migration_result()
+    stale_runs = database.reconcile_stale_runs(stale_minutes=10, exclude_run_id=runtime_state.run_id)
     company_repair = database.repair_invalid_company_names()
-    database.upsert_run(runtime_state.run_id, control=runtime_state.control, started_at=runtime_state.started_at)
+    database.upsert_run(runtime_state.run_id, control=runtime_state.control, started_at=runtime_state.run_started_at)
     cleanup = database.prune_old_events(normal_days=7, important_days=30)
     cache.load()
     runtime_state.log("Job Seeker 服务已启动")
     runtime_state.log(f"岗位评分版本: {SCORING_VERSION}")
+    if stale_runs.get("count"):
+        runtime_state.emit(
+            "stale_runs_reconciled",
+            f"已将 {stale_runs['count']} 个未正常结束的旧任务标记为 interrupted",
+            source="database",
+            detail={"count": stale_runs["count"], "stale_minutes": 10},
+        )
+    if migration.get("compacted_events") or migration.get("sanitized_events"):
+        runtime_state.emit(
+            "event_compaction_completed",
+            f"数据库 v5 整理完成：压缩 {migration.get('compacted_events', 0)} 条重复事件，脱敏 {migration.get('sanitized_events', 0)} 条事件",
+            source="database",
+            detail=migration,
+        )
     if company_repair.get("repaired"):
         runtime_state.log(f"已修复历史错误公司字段 {company_repair['repaired']} 条", source="database")
     if cleanup.get("deleted"):

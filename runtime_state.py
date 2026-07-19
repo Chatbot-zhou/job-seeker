@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from config import Config
-from tools import now_iso
+from tools import now_iso, sanitize_log_value
 
 
 SCRIPT_STALE_SECONDS = 15
@@ -28,6 +28,7 @@ class RuntimeState:
     def __init__(self) -> None:
         self.started_at = now_iso()
         self.run_id = self._new_run_id()
+        self.run_started_at = self.started_at
         self.current_task = "idle"
         self.control = "paused"
         self.last_error = ""
@@ -59,7 +60,8 @@ class RuntimeState:
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self._subscribers: list[Queue] = []
         self._lock = threading.RLock()
-        self._last_persisted_script_status: tuple[str, str, str] | None = None
+        self._last_persisted_script_status: tuple[str, str] | None = None
+        self._once_event_keys: set[tuple[str, str, str]] = set()
 
     def _new_run_id(self) -> str:
         return f"run-{uuid.uuid4().hex[:12]}"
@@ -75,20 +77,28 @@ class RuntimeState:
         level: str = "info",
         detail: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        safe_message = str(sanitize_log_value(message) or "")
+        safe_detail = sanitize_log_value(detail or {})
         item = {
             "time": now_iso(),
             "run_id": self.run_id,
             "level": level,
             "source": source,
             "type": event_type,
-            "message": message,
-            "detail": detail or {},
+            "message": safe_message,
+            "detail": safe_detail,
         }
         with self._lock:
+            if event_type == "model_thinking_control_retry":
+                model = str((safe_detail or {}).get("model", "")) if isinstance(safe_detail, dict) else ""
+                once_key = (self.run_id, event_type, model)
+                if once_key in self._once_event_keys:
+                    return item
+                self._once_event_keys.add(once_key)
             self.logs.appendleft(item)
             self.events.appendleft(item)
             if level == "error":
-                self.last_error = message
+                self.last_error = safe_message
             subscribers = list(self._subscribers)
         failed_subscribers: list[Queue] = []
         for subscriber in subscribers:
@@ -103,11 +113,11 @@ class RuntimeState:
                 ]
         persist_event = True
         if event_type == "script_status":
-            script_detail = (detail or {}).get("detail") or {}
+            event_detail = safe_detail if isinstance(safe_detail, dict) else {}
+            script_detail = event_detail.get("detail") or {}
             signature = (
-                str((detail or {}).get("page", "")),
-                str((detail or {}).get("status", "")),
-                str((detail or {}).get("current_action", "") or script_detail.get("current_action", "")),
+                str(event_detail.get("page", "")),
+                str(event_detail.get("status", "")),
             )
             with self._lock:
                 persist_event = signature != self._last_persisted_script_status
@@ -192,6 +202,7 @@ class RuntimeState:
             elif command == "resume":
                 if new_run or self.control == "stopped" or not self.run_id:
                     self.run_id = self._new_run_id()
+                    self.run_started_at = now_iso()
                 self.clear_autorun_blocked()
                 self.control = "running"
                 self.current_task = "idle"
@@ -200,12 +211,13 @@ class RuntimeState:
                 self.current_task = "stopped"
             current_run_id = self.run_id
             current_control = self.control
+            current_run_started_at = self.run_started_at
         try:
             import database
 
             if current_run_id != previous_run_id and previous_run_id:
                 database.finish_run(previous_run_id, control="completed")
-            database.upsert_run(current_run_id, control=current_control, started_at=self.started_at)
+            database.upsert_run(current_run_id, control=current_control, started_at=current_run_started_at)
             if command == "stop":
                 database.finish_run(current_run_id, control="stopped")
         except Exception:
@@ -234,11 +246,13 @@ class RuntimeState:
         with self._lock:
             control = self.control
             run_id = self.run_id
+            run_started_at = self.run_started_at
             current_task = self.current_task
         should_start = control == "running"
         return {
             "control": control,
             "run_id": run_id,
+            "run_started_at": run_started_at,
             "current_task": current_task,
             "script": self.script_snapshot(),
             "should_start": should_start,
@@ -340,6 +354,7 @@ class RuntimeState:
         model_thinking_disabled = bool(Config.disable_model_thinking)
         with self._lock:
             started_at = self.started_at
+            run_started_at = self.run_started_at
             run_id = self.run_id
             current_task = self.current_task
             control = self.control
@@ -350,6 +365,8 @@ class RuntimeState:
             "backend": {
                 "running": True,
                 "started_at": started_at,
+                "service_started_at": started_at,
+                "run_started_at": run_started_at,
                 "run_id": run_id,
                 "version": "2026.06-cli",
                 "current_task": current_task,

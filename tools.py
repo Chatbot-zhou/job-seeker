@@ -9,7 +9,7 @@ LastEditors: Chatbot-Zhou
 import re
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 
 def now_iso() -> str:
@@ -75,6 +75,82 @@ def script_connect_hosts(base_url: str) -> list[str]:
     if parsed_host and parsed_host not in hosts:
         hosts.append(parsed_host)
     return hosts
+
+
+SENSITIVE_QUERY_KEYS = {
+    "securityid",
+    "token",
+    "access_token",
+    "authorization",
+    "secret",
+    "api_key",
+    "apikey",
+    "sessionid",
+}
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def safe_url_for_logs(value: str) -> str:
+    """Keep a useful endpoint/job identity without persisting session-like query data."""
+    raw = str(value or "")
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return raw
+        allowed_query = [
+            (key, item)
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() == "jobid"
+        ]
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(allowed_query), ""))
+    except ValueError:
+        return raw
+
+
+def redact_sensitive_urls(text: str) -> str:
+    """Redact URL query credentials while retaining enough path context for diagnostics."""
+    value = str(text or "")
+
+    def replace_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        trailing = ""
+        while raw and raw[-1] in "),.;，。；":
+            trailing = raw[-1] + trailing
+            raw = raw[:-1]
+        return safe_url_for_logs(raw) + trailing
+
+    value = URL_PATTERN.sub(replace_url, value)
+    sensitive_names = "|".join(re.escape(key) for key in sorted(SENSITIVE_QUERY_KEYS, key=len, reverse=True))
+    return re.sub(
+        rf"([?&](?:{sensitive_names})=)[^&\s]+",
+        r"\1[已隐藏]",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
+def sanitize_log_value(value: Any, depth: int = 0) -> Any:
+    """Recursively sanitize telemetry before it reaches memory or SQLite."""
+    if depth > 8 or value is None:
+        return value
+    if isinstance(value, str):
+        return redact_sensitive_urls(value)
+    if isinstance(value, list):
+        return [sanitize_log_value(item, depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_log_value(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if key_text in SENSITIVE_QUERY_KEYS or "securityid" in key_text:
+                result[str(key)] = "[已隐藏]"
+            else:
+                result[str(key)] = sanitize_log_value(item, depth + 1)
+        return result
+    return value
 
 
 PRIVACY_PATTERNS = {

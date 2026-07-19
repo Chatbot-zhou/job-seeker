@@ -24,7 +24,7 @@ import resume_service
 from cache import cache
 from config import CONFIG_WAS_MISSING, Config
 from runtime_state import runtime_state
-from tools import redact_privacy, script_connect_hosts as build_script_connect_hosts
+from tools import redact_privacy, redact_sensitive_urls, script_connect_hosts as build_script_connect_hosts
 
 
 PREFIX = {
@@ -1016,6 +1016,14 @@ def print_status_panel() -> None:
         f" / {script_detail.get('feedTabProcessedCount', 0)}/"
         f"{format_feed_job_limit(script_detail.get('feedTabMaxJobs') if script_detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
     )
+    scroll_label = (
+        f"{script_detail.get('scrollMode') or '未选择'} / "
+        f"{script_detail.get('scrollTarget') or '-'} / "
+        f"第 {script_detail.get('scrollRound', 0)} 轮 / "
+        f"{script_detail.get('lastScrollOutcome') or '-'} / "
+        f"位置 {script_detail.get('scrollBefore', 0)}->{script_detail.get('scrollAfter', 0)} / "
+        f"岗位 {script_detail.get('scrollJobCountBefore', 0)}->{script_detail.get('scrollJobCountAfter', 0)}"
+    )
     if script_detail.get("cooldownUntil"):
         search_strategy_label = _format_script_cooldown(script_detail)
 
@@ -1039,6 +1047,7 @@ def print_status_panel() -> None:
         print(f"- 阈值与统计: {Config.score_threshold} 分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}")
         print(f"- 搜索策略: {search_strategy_label}")
         print(f"- 岗位来源: {source_label}")
+        print(f"- 岗位滚动: {scroll_label}")
         print(f"- 油猴脚本版本: {script_version_label}")
         print(f"- 定时启动: {schedule_label}")
         print(f"- 准备状态: 简历 {_icon(resume_ok)} / 画像 {_icon(profile_ok)} / 话术 {_icon(greeting_ok)} / 脚本 {_icon(script_ok)} / 控制 {control}")
@@ -1057,6 +1066,7 @@ def print_status_panel() -> None:
 ║  评分阈值    {Config.score_threshold}分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}{' ' * 18}║
 ║  搜索策略    {search_strategy_label[:48]:<48}║
 ║  岗位来源    {source_label[:48]:<48}║
+║  岗位滚动    {scroll_label[:48]:<48}║
 ║  定时启动    {schedule_label:<48}║
 ║  评分令牌    关思考 {Config.job_score_num_predict_think_off} / 开思考 {Config.job_score_num_predict_think_on}{' ' * 18}║
 ║  温度/top_p  {Config.model_temperature} / {Config.model_top_p}{' ' * 38}║
@@ -1492,7 +1502,7 @@ def show_run_summary() -> None:
 
 def _redact_export_value(value: Any) -> Any:
     if isinstance(value, str):
-        return redact_privacy(value)
+        return redact_privacy(redact_sensitive_urls(value))
     if isinstance(value, list):
         return [_redact_export_value(item) for item in value]
     if isinstance(value, dict):
@@ -1502,7 +1512,7 @@ def _redact_export_value(value: Any) -> Any:
             if "api_key" in key_text or "key" == key_text:
                 result[str(key)] = "[已隐藏]"
             elif key_text in {"resume", "detail", "greeting", "active_content", "content"}:
-                text = redact_privacy(str(item or ""))
+                text = redact_privacy(redact_sensitive_urls(str(item or "")))
                 result[str(key)] = text[:240] + ("..." if len(text) > 240 else "")
             else:
                 result[str(key)] = _redact_export_value(item)
@@ -1655,6 +1665,13 @@ def show_doctor() -> None:
             f"{format_feed_job_limit(detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
         )
         print(
+            f"  岗位滚动: {detail.get('scrollMode') or '未选择'} / "
+            f"{detail.get('scrollTarget') or '-'} / round={detail.get('scrollRound', 0)} / "
+            f"{detail.get('lastScrollOutcome') or '-'} / "
+            f"位置 {detail.get('scrollBefore', 0)}->{detail.get('scrollAfter', 0)} / "
+            f"岗位 {detail.get('scrollJobCountBefore', 0)}->{detail.get('scrollJobCountAfter', 0)}"
+        )
+        print(
             f"  搜索冷却: {_format_script_cooldown(detail)} / "
             f"范围 {detail.get('cooldownMinMinutes') or Config.search_round_cooldown_min_minutes}-"
             f"{detail.get('cooldownMinutes') or Config.search_round_cooldown_minutes} 分钟"
@@ -1689,7 +1706,8 @@ def show_doctor() -> None:
         )
         print(
             f"- 本地数据库: {db_stats.get('size_mb', 0):.1f} MB / "
-            f"事件 {db_stats.get('event_count', 0)} 条 / schema v{db_stats.get('schema_version', 0)}"
+            f"事件 {db_stats.get('event_count', 0)} 条 / schema v{db_stats.get('schema_version', 0)} / "
+            f"活动任务 {db_stats.get('open_run_count', 0)} / 历史中断 {db_stats.get('interrupted_run_count', 0)}"
         )
         if recent_counts:
             print(

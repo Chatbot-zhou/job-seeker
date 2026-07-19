@@ -106,7 +106,11 @@ def check_userscript_version_sync() -> None:
     assert "__job_seeker_search_budget" in script
     assert "__job_seeker_search_round_state" in script
     assert "greet_delivery_unknown" in script
-    assert "window.scrollBy(" not in script
+    assert "documentScrollFallbackAllowed" in script
+    assert "document.scrollingElement" in script
+    assert "window.scrollBy(" in script
+    assert "jobIdentityUrl" in script
+    assert "sanitizeTelemetryText" in script
 
 
 def check_diagnostic_redaction() -> None:
