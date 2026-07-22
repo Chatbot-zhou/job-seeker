@@ -47,6 +47,8 @@ def check_config_normalization() -> None:
         assert Config.max_search_submissions_per_day == 9
         assert Config.search_result_scroll_rounds == 20
         assert Config.auto_start_time == "09:00"
+        assert Config.zhaopin_apply_delay_min_seconds >= 3
+        assert Config.zhaopin_apply_delay_max_seconds >= Config.zhaopin_apply_delay_min_seconds
     finally:
         Config.apply(original)
 
@@ -111,6 +113,10 @@ def check_userscript_version_sync() -> None:
     assert "window.scrollBy(" in script
     assert "jobIdentityUrl" in script
     assert "sanitizeTelemetryText" in script
+    assert "https://www.zhaopin.com/*" in script
+    assert "https://passport.zhaopin.com/*" in script
+    assert "zhaopinActionState" in script
+    assert "apply_delivery_unknown" in script
 
 
 def check_diagnostic_redaction() -> None:

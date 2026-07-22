@@ -25,6 +25,7 @@ class JobAnalysis(BaseModel):
     decision_source: str = "fast_llm"
     match_reason: str = ""
     blocked_reason: str = ""
+    platform_action: str = ""
 
 
 class ResumeUpdate(BaseModel):
@@ -45,6 +46,9 @@ class ConfigUpdate(BaseModel):
 
 
 class ScriptHeartbeat(BaseModel):
+    platform: str = Field(default="boss", pattern="^(boss|zhaopin)$")
+    instance_id: str = ""
+    page_kind: str = ""
     page: str = "unknown"
     status: str = "idle"
     current_action: str = ""
@@ -52,6 +56,8 @@ class ScriptHeartbeat(BaseModel):
 
 
 class JobAnalyzeRequest(BaseModel):
+    platform: str = Field(default="boss", pattern="^(boss|zhaopin)$")
+    external_job_id: str = ""
     title: str
     salary: str = ""
     detail: str
@@ -65,6 +71,9 @@ class JobAnalyzeRequest(BaseModel):
 class ActionCreate(BaseModel):
     action_type: str
     status: str = "pending"
+    platform: str = Field(default="boss", pattern="^(boss|zhaopin)$")
+    idempotency_key: str = ""
+    external_job_id: str = ""
     job_url: str = ""
     company: str = ""
     title: str = ""
@@ -78,6 +87,8 @@ class ActionDecision(BaseModel):
 class ControlUpdate(BaseModel):
     command: str = Field(pattern="^(pause|resume|stop)$")
     new_run: bool = False
+    platform: str | None = Field(default=None, pattern="^(boss|zhaopin)$")
+    reason: str = ""
 
 
 class EventCreate(BaseModel):

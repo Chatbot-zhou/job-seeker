@@ -12,6 +12,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,6 +57,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_presence_penalty": 0.1,
     "job_score_num_predict_think_off": -1,
     "job_score_num_predict_think_on": -1,
+    "boss_enabled": True,
+    "zhaopin_enabled": True,
+    "zhaopin_job_urls": ["https://www.zhaopin.com/recommend"],
+    "zhaopin_resume_name": "",
+    "zhaopin_apply_delay_min_seconds": 3,
+    "zhaopin_apply_delay_max_seconds": 10,
+    "zhaopin_max_applications_per_run": 0,
+    "zhaopin_max_applications_per_day": 0,
+    "model_max_concurrency": 1,
+    "model_concurrency_profile": "",
     "auto_start_enabled": False,
     "auto_start_time": "09:00",
 }
@@ -114,6 +125,43 @@ def _as_hhmm(value: Any, default: str = "09:00") -> str:
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return default
     return f"{hour:02d}:{minute:02d}"
+
+
+def _as_zhaopin_urls(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = value.replace("\r", "\n").replace(",", "\n").split("\n")
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = []
+    result: list[str] = []
+    for item in values:
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urlsplit(raw)
+        except ValueError:
+            continue
+        if parsed.scheme.lower() != "https" or parsed.hostname not in {"www.zhaopin.com", "zhaopin.com"}:
+            continue
+        path = parsed.path or "/recommend"
+        normalized = urlunsplit(("https", "www.zhaopin.com", path, parsed.query, ""))
+        if normalized not in result:
+            result.append(normalized)
+    return result or list(DEFAULT_CONFIG["zhaopin_job_urls"])
+
+
+def model_concurrency_fingerprint(data: dict[str, Any] | None = None) -> str:
+    values = data or Config.as_dict()
+    provider = str(values.get("model_provider") or "").strip().lower()
+    endpoint = (
+        str(values.get("openai_api_base") or "").strip().rstrip("/")
+        if provider == "openai"
+        else str(values.get("ollama_host") or "").strip().rstrip("/")
+    )
+    model = str(values.get("think_model") or "").strip()
+    return f"{provider}|{endpoint}|{model}"
 
 
 def _detect_external_model_profile(data: dict[str, Any]) -> str:
@@ -215,6 +263,16 @@ class Config:
     model_presence_penalty = DEFAULT_CONFIG["model_presence_penalty"]
     job_score_num_predict_think_off = DEFAULT_CONFIG["job_score_num_predict_think_off"]
     job_score_num_predict_think_on = DEFAULT_CONFIG["job_score_num_predict_think_on"]
+    boss_enabled = DEFAULT_CONFIG["boss_enabled"]
+    zhaopin_enabled = DEFAULT_CONFIG["zhaopin_enabled"]
+    zhaopin_job_urls = list(DEFAULT_CONFIG["zhaopin_job_urls"])
+    zhaopin_resume_name = DEFAULT_CONFIG["zhaopin_resume_name"]
+    zhaopin_apply_delay_min_seconds = DEFAULT_CONFIG["zhaopin_apply_delay_min_seconds"]
+    zhaopin_apply_delay_max_seconds = DEFAULT_CONFIG["zhaopin_apply_delay_max_seconds"]
+    zhaopin_max_applications_per_run = DEFAULT_CONFIG["zhaopin_max_applications_per_run"]
+    zhaopin_max_applications_per_day = DEFAULT_CONFIG["zhaopin_max_applications_per_day"]
+    model_max_concurrency = DEFAULT_CONFIG["model_max_concurrency"]
+    model_concurrency_profile = DEFAULT_CONFIG["model_concurrency_profile"]
     auto_start_enabled = DEFAULT_CONFIG["auto_start_enabled"]
     auto_start_time = DEFAULT_CONFIG["auto_start_time"]
 
@@ -261,6 +319,10 @@ class Config:
             data["external_model_profile"] = DEFAULT_CONFIG["external_model_profile"]
         data["disable_model_thinking"] = _as_bool(data.get("disable_model_thinking"))
         data["show_model_reasoning"] = _as_bool(data.get("show_model_reasoning"))
+        data["boss_enabled"] = _as_bool(data.get("boss_enabled"))
+        data["zhaopin_enabled"] = _as_bool(data.get("zhaopin_enabled"))
+        data["zhaopin_job_urls"] = _as_zhaopin_urls(data.get("zhaopin_job_urls"))
+        data["zhaopin_resume_name"] = str(data.get("zhaopin_resume_name") or "").strip()
         data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
         data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
         data["search_round_cooldown_min_minutes"] = _as_int(
@@ -329,6 +391,31 @@ class Config:
             500,
             8000,
         )
+        data["zhaopin_apply_delay_min_seconds"] = _as_int(
+            data.get("zhaopin_apply_delay_min_seconds"),
+            DEFAULT_CONFIG["zhaopin_apply_delay_min_seconds"],
+            3,
+            60,
+        )
+        data["zhaopin_apply_delay_max_seconds"] = _as_int(
+            data.get("zhaopin_apply_delay_max_seconds"),
+            DEFAULT_CONFIG["zhaopin_apply_delay_max_seconds"],
+            data["zhaopin_apply_delay_min_seconds"],
+            60,
+        )
+        data["zhaopin_max_applications_per_run"] = _as_int(
+            data.get("zhaopin_max_applications_per_run"), 0, 0, 1000
+        )
+        data["zhaopin_max_applications_per_day"] = _as_int(
+            data.get("zhaopin_max_applications_per_day"), 0, 0, 5000
+        )
+        requested_concurrency = _as_int(data.get("model_max_concurrency"), 1, 1, 2)
+        concurrency_profile = str(data.get("model_concurrency_profile") or "").strip()
+        current_profile = model_concurrency_fingerprint(data)
+        data["model_max_concurrency"] = (
+            2 if requested_concurrency == 2 and concurrency_profile == current_profile else 1
+        )
+        data["model_concurrency_profile"] = concurrency_profile
         env_key = _env_openai_api_key()
         if env_key:
             data["openai_api_key"] = env_key

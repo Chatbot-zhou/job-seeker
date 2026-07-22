@@ -117,6 +117,66 @@ test('job identity ignores dynamic query data and telemetry redacts security ids
   assert.match(source, /sourceLabel: activeSourceLabel/);
 });
 
+test('Zhaopin adapter normalizes identity, paginates safely, isolates apply semantics, and bounds delays', () => {
+  const url = 'https://www.zhaopin.com/jobdetail/CC123.htm?positionId=CC123&securityId=secret#detail';
+  assert.equal(hooks.zhaopinJobIdFromValue(url), 'CC123');
+  assert.equal(hooks.zhaopinJobIdentityUrl(url), 'https://www.zhaopin.com/jobdetail/CC123.htm');
+  assert.equal(hooks.isZhaopinListUrl('https://www.zhaopin.com/recommend'), true);
+  assert.equal(hooks.isZhaopinListUrl('https://www.zhaopin.com/sou/?jl=489'), true);
+  assert.equal(hooks.isZhaopinListUrl(url), false);
+  assert.equal(hooks.zhaopinActionState('立即投递'), 'apply');
+  assert.equal(hooks.zhaopinActionState('已投递'), 'already_applied');
+  assert.equal(hooks.zhaopinActionState('立即沟通'), 'ignore');
+  assert.equal(hooks.zhaopinPaginationControlState({ text: '下一页', inPagination: true }), 'next');
+  assert.equal(hooks.zhaopinPaginationControlState({ text: '›', className: 'ant-pagination-next', inPagination: true }), 'next');
+  assert.equal(hooks.zhaopinPaginationControlState({ ariaLabel: '下一页', disabled: true }), 'disabled');
+  assert.equal(hooks.zhaopinPaginationControlState({ text: '下一职位', inPagination: true }), 'ignore');
+  assert.equal(hooks.zhaopinPaginationControlState({ text: '立即投递', inPagination: true }), 'ignore');
+  assert.equal(
+    hooks.zhaopinListSourceIdentity('https://www.zhaopin.com/sou/?page=3&jl=489#jobs'),
+    'https://www.zhaopin.com/sou/?jl=489',
+  );
+  const pageChanged = hooks.zhaopinPageTransitionOutcome(
+    { url: 'https://www.zhaopin.com/recommend', page: '1', jobCount: 20, fingerprint: 'jobs-1' },
+    { url: 'https://www.zhaopin.com/recommend', page: '2', jobCount: 20, fingerprint: 'jobs-2' },
+  );
+  assert.equal(pageChanged.pageChanged, true);
+  assert.equal(pageChanged.jobsChanged, true);
+  assert.equal(pageChanged.ready, true);
+  const unchangedPage = hooks.zhaopinPageTransitionOutcome(
+    { url: 'https://www.zhaopin.com/recommend', page: '2', jobCount: 20, fingerprint: 'jobs-2' },
+    { url: 'https://www.zhaopin.com/recommend', page: '2', jobCount: 20, fingerprint: 'jobs-2' },
+  );
+  assert.equal(unchangedPage.changed, false);
+  assert.equal(unchangedPage.ready, false);
+  assert.equal(hooks.randomApplyDelayMs(3, 10, 0), 3000);
+  assert.equal(hooks.randomApplyDelayMs(3, 10, 1), 10000);
+  assert.match(source, /@match\s+https:\/\/www\.zhaopin\.com\/\*/);
+  assert.match(source, /@match\s+https:\/\/passport\.zhaopin\.com\/\*/);
+  assert.match(source, /transactionState:\s*'unknown'/);
+  assert.match(source, /apply_delivery_unknown/);
+  assert.match(source, /detailActionRoot/);
+  assert.match(source, /state === 'already_applied' \|\| !tools\.isDisabled\(el\)/);
+  assert.match(source, /text === '立即投递'/);
+  assert.match(source, /text === '已投递'/);
+  assert.match(source, /zhaopin_next_page_selected/);
+  assert.match(source, /zhaopin_next_page_clicked/);
+  assert.match(source, /zhaopin_next_page_verified/);
+  assert.match(source, /zhaopin_pagination_exhausted/);
+  assert.match(source, /clickPaginationControl/);
+  assert.doesNotMatch(source, /clickLikeUser\(lastControl\.element\)/);
+  assert.match(source, /zhaopin_detail_action_missing/);
+  assert.match(source, /zhaopin_detail_job_skipped/);
+  assert.match(source, /zhaopin_detail_compatibility_pause/);
+  assert.match(source, /this\.detailFailureCount\s*>=\s*3/);
+  assert.match(source, /paginationMode:\s*'next_button'/);
+  const zhaopinAdapter = source.slice(source.indexOf('class Zhaopin'), source.indexOf('if (globalThis.__JOB_SEEKER_TEST_MODE__)'));
+  assert.doesNotMatch(zhaopinAdapter, /scrollForMore|new WheelEvent|window\.scrollBy/);
+  assert.match(source, /cooldownUntil:\s*this\.cooldownUntil/);
+  assert.match(source, /for \(let attempt = 2; attempt <= 3 && finalResult\.preClickFailure && !finalResult\.clicked; attempt\+\+\)/);
+  assert.match(source, /location\.hostname === 'www\.zhaopin\.com'/);
+});
+
 test('cooldown resumes once and returns to preferred feeds before keyword search', () => {
   assert.match(source, /tryAcquireCooldownResumeLock/);
   assert.match(source, /markCooldownResumeDone/);

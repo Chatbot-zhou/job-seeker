@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.28
+// @version      2026.06.26.31
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
+// @match        https://www.zhaopin.com/*
+// @match        https://passport.zhaopin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
@@ -22,7 +24,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06.26.28',
+        scriptVersion: '2026.06.26.31',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -44,6 +46,14 @@
         searchLeaseMs: 12000,
         openCooldownMs: 45000,
         recentProcessedHours: 24,
+        bossEnabled: true,
+        zhaopinEnabled: true,
+        zhaopinJobUrls: ['https://www.zhaopin.com/recommend'],
+        zhaopinResumeName: '',
+        zhaopinApplyDelayMinSeconds: 3,
+        zhaopinApplyDelayMaxSeconds: 10,
+        zhaopinMaxApplicationsPerRun: 0,
+        zhaopinMaxApplicationsPerDay: 0,
     };
 
     let backendOfflineNotified = false;
@@ -88,6 +98,23 @@
         if (Number.isFinite(Number(config.preferred_feed_max_jobs_per_tab))) {
             OPTIONS.preferredFeedMaxJobsPerTab = Math.max(0, Math.min(500, Number(config.preferred_feed_max_jobs_per_tab)));
         }
+        OPTIONS.bossEnabled = config.boss_enabled !== false;
+        OPTIONS.zhaopinEnabled = config.zhaopin_enabled !== false;
+        if (Array.isArray(config.zhaopin_job_urls) && config.zhaopin_job_urls.length) {
+            OPTIONS.zhaopinJobUrls = config.zhaopin_job_urls.map(String).filter(Boolean);
+        }
+        OPTIONS.zhaopinResumeName = String(config.zhaopin_resume_name || '');
+        if (Number.isFinite(Number(config.zhaopin_apply_delay_min_seconds))) {
+            OPTIONS.zhaopinApplyDelayMinSeconds = Math.max(3, Math.min(60, Number(config.zhaopin_apply_delay_min_seconds)));
+        }
+        if (Number.isFinite(Number(config.zhaopin_apply_delay_max_seconds))) {
+            OPTIONS.zhaopinApplyDelayMaxSeconds = Math.max(
+                OPTIONS.zhaopinApplyDelayMinSeconds,
+                Math.min(60, Number(config.zhaopin_apply_delay_max_seconds)),
+            );
+        }
+        OPTIONS.zhaopinMaxApplicationsPerRun = Math.max(0, Number(config.zhaopin_max_applications_per_run || 0));
+        OPTIONS.zhaopinMaxApplicationsPerDay = Math.max(0, Number(config.zhaopin_max_applications_per_day || 0));
     }
 
     // 元素选择器
@@ -590,6 +617,110 @@
                 const pathMatch = raw.match(/\/job_detail\/([^/?#]+?)(?:\.html)?(?:[?#]|$)/i);
                 return pathMatch ? pathMatch[1] : '';
             }
+        },
+        zhaopinJobIdFromValue(value) {
+            const raw = String(value || '');
+            if (!raw) return '';
+            try {
+                const parsed = new URL(raw, 'https://www.zhaopin.com');
+                for (const key of ['positionNumber', 'positionnumber', 'jobId', 'jobid', 'positionId', 'positionid']) {
+                    const candidate = parsed.searchParams.get(key);
+                    if (candidate) return candidate;
+                }
+                const match = parsed.pathname.match(/\/(?:jobdetail|job-detail|job)\/([^/?#]+?)(?:\.html)?$/i);
+                return match ? match[1] : '';
+            } catch (e) {
+                return '';
+            }
+        },
+        zhaopinJobIdentityUrl(value) {
+            const absolute = this.normalUrl(value);
+            if (!absolute) return '';
+            try {
+                const parsed = new URL(absolute, 'https://www.zhaopin.com');
+                const path = parsed.pathname.replace(/\/+$/, '') || '/';
+                return `${parsed.origin}${path}`;
+            } catch (e) {
+                return String(absolute).split(/[?#]/, 1)[0];
+            }
+        },
+        isZhaopinListUrl(value) {
+            try {
+                const parsed = new URL(String(value || ''), 'https://www.zhaopin.com');
+                if (parsed.hostname !== 'www.zhaopin.com') return false;
+                const path = parsed.pathname.toLowerCase();
+                return path === '/recommend'
+                    || path.startsWith('/recommend/')
+                    || path === '/sou'
+                    || path.startsWith('/sou/');
+            } catch (e) {
+                return false;
+            }
+        },
+        zhaopinActionState(value) {
+            const text = this.normalizePlainText(value).replace(/\s+/g, '');
+            if (text === '已投递' || text.includes('已投递')) return 'already_applied';
+            if (text === '立即投递') return 'apply';
+            return 'ignore';
+        },
+        zhaopinPaginationControlState(meta = {}) {
+            const text = this.normalizePlainText(meta.text || '');
+            const ariaLabel = this.normalizePlainText(meta.ariaLabel || '');
+            const title = this.normalizePlainText(meta.title || '');
+            const rel = this.normalizePlainText(meta.rel || '').toLowerCase();
+            const classText = `${meta.className || ''} ${meta.parentClassName || ''}`.toLowerCase();
+            const inPagination = Boolean(meta.inPagination);
+            const namedNext = rel === 'next'
+                || /^(?:下一页|下页|next(?:\s*page)?)(?:\s*[>›»])?$/i.test(text)
+                || /(?:下一页|下页|next\s*page)/i.test(`${ariaLabel} ${title}`)
+                || (inPagination && /^[>›»]$/.test(text))
+                || (inPagination && /(?:^|[-_\s])next(?:$|[-_\s])/.test(classText));
+            if (!namedNext) return 'ignore';
+            const disabled = Boolean(meta.disabled)
+                || String(meta.ariaDisabled || '').toLowerCase() === 'true'
+                || /disabled|forbid/.test(classText);
+            return disabled ? 'disabled' : 'next';
+        },
+        zhaopinListSourceIdentity(value) {
+            try {
+                const parsed = new URL(String(value || ''), 'https://www.zhaopin.com');
+                const pageKeys = new Set(['p', 'page', 'pageno', 'pagenum', 'pageindex', 'current', 'currentpage']);
+                for (const key of Array.from(parsed.searchParams.keys())) {
+                    if (pageKeys.has(String(key).toLowerCase())) parsed.searchParams.delete(key);
+                }
+                parsed.hash = '';
+                parsed.searchParams.sort();
+                return `${parsed.origin}${parsed.pathname}${parsed.search}`.replace(/\/$/, '');
+            } catch (e) {
+                return String(value || '').split('#')[0];
+            }
+        },
+        zhaopinPageTransitionOutcome(before = {}, after = {}) {
+            const beforeUrl = String(before.url || '').split('#')[0];
+            const afterUrl = String(after.url || '').split('#')[0];
+            const beforePage = String(before.page || '');
+            const afterPage = String(after.page || '');
+            const beforeFingerprint = String(before.fingerprint || '');
+            const afterFingerprint = String(after.fingerprint || '');
+            const urlChanged = Boolean(beforeUrl && afterUrl && beforeUrl !== afterUrl);
+            const pageChanged = Boolean(beforePage && afterPage && beforePage !== afterPage);
+            const jobsChanged = Boolean(afterFingerprint && beforeFingerprint !== afterFingerprint);
+            const navigationChanged = urlChanged || pageChanged;
+            const jobsReady = Number(after.jobCount || 0) > 0;
+            return {
+                urlChanged,
+                pageChanged,
+                jobsChanged,
+                navigationChanged,
+                changed: navigationChanged || jobsChanged,
+                ready: jobsChanged || (navigationChanged && jobsReady),
+            };
+        },
+        randomApplyDelayMs(minSeconds = 3, maxSeconds = 10, randomValue = Math.random()) {
+            const min = Math.max(3, Math.min(60, Number(minSeconds) || 3));
+            const max = Math.max(min, Math.min(60, Number(maxSeconds) || min));
+            const ratio = Math.max(0, Math.min(1, Number(randomValue) || 0));
+            return Math.floor((min + (max - min) * ratio) * 1000);
         },
         isJobSearchPath(path = location.pathname) {
             const value = String(path || '').replace(/\/+$/, '');
@@ -1485,7 +1616,9 @@
 
     // API 请求
     class Api {
-        constructor() { }
+        constructor(platform = 'boss') {
+            this.platform = platform === 'zhaopin' ? 'zhaopin' : 'boss';
+        }
 
         /**
          * 封装请求
@@ -1583,6 +1716,9 @@
          */
         heartbeat(page, status = 'running', currentAction = '', detail = {}) {
             return this.__http('/script/heartbeat', 'POST', JSON.stringify({
+                platform: this.platform,
+                instance_id: PAGE_INSTANCE_ID,
+                page_kind: page,
                 page,
                 status,
                 current_action: tools.sanitizeTelemetryText(currentAction),
@@ -1597,8 +1733,12 @@
             }));
         }
 
-        control(command) {
-            return this.__http('/control', 'POST', JSON.stringify({ command }));
+        control(command, reason = '', global = false) {
+            return this.__http('/control', 'POST', JSON.stringify({
+                command,
+                reason,
+                platform: global ? null : this.platform,
+            }));
         }
 
         event(type, message, source = 'script', level = 'info', detail = {}) {
@@ -1607,7 +1747,7 @@
                 source,
                 level,
                 message: tools.sanitizeTelemetryText(message),
-                detail: tools.sanitizeTelemetryValue(detail),
+                detail: tools.sanitizeTelemetryValue({ platform: this.platform, ...detail }),
             })).catch(() => null);
         }
 
@@ -1615,7 +1755,7 @@
          * 结构化职位分析
          */
         analyzeJob(jobInfo) {
-            return this.__http('/jobs/analyze', 'POST', JSON.stringify(jobInfo)).then(res => res.analysis);
+            return this.__http('/jobs/analyze', 'POST', JSON.stringify({ platform: this.platform, ...jobInfo })).then(res => res.analysis);
         }
 
         /**
@@ -1625,6 +1765,9 @@
             return this.__http('/actions', 'POST', JSON.stringify({
                 action_type: actionType,
                 status,
+                platform: this.platform,
+                idempotency_key: payload.idempotencyKey || '',
+                external_job_id: jobInfo.external_job_id || '',
                 job_url: jobInfo.url || '',
                 company: jobInfo.company || '',
                 title: jobInfo.title || '',
@@ -6043,6 +6186,1500 @@
         }
     }
 
+    class Zhaopin {
+        constructor() {
+            this.api = new Api('zhaopin');
+            this.targets = {
+                list: '__zhaopin_list',
+                detail: '__zhaopin_detail',
+            };
+            this.types = {
+                JOB_INFO: 'zhaopin-job-info',
+                APPLY: 'zhaopin-apply',
+                APPLY_RESULT: 'zhaopin-apply-result',
+                CLOSE: 'zhaopin-close-detail',
+            };
+            this.contextKey = '__job_seeker_zhaopin_detail_context';
+            this.leaseKey = '__job_seeker_zhaopin_list_lease';
+            this.urlStateKey = '__job_seeker_zhaopin_url_state';
+            this.paginationStateKey = '__job_seeker_zhaopin_pagination_state';
+            this.counterKey = '__job_seeker_zhaopin_apply_counter';
+            this.pause = true;
+            this.running = false;
+            this.loopRunning = false;
+            this.urls = [];
+            this.urlIndex = 0;
+            this.queue = [];
+            this.seen = new Set();
+            this.pending = new Map();
+            this.activeTab = null;
+            this.backendRunId = '';
+            this.cooldownUntil = 0;
+            this.cooldownTimer = null;
+            this.pageTurnCount = 0;
+            this.pageNumber = '';
+            this.pageBefore = '';
+            this.pageAfter = '';
+            this.paginationTarget = '';
+            this.lastPageOutcome = 'idle';
+            this.listEmptyRetries = 0;
+            this.pageJobCountBefore = 0;
+            this.pageJobCountAfter = 0;
+            this.detailFailureCode = '';
+            this.detailFailureCount = 0;
+            this.currentJob = null;
+            this.leaseTimer = null;
+            this.heartbeatTimer = null;
+            this.logger = null;
+            this.broadcast = null;
+        }
+
+        safeJson(key, fallback = {}) {
+            try {
+                const value = JSON.parse(localStorage.getItem(key) || 'null');
+                return value && typeof value === 'object' ? value : fallback;
+            } catch (e) {
+                return fallback;
+            }
+        }
+
+        writeJson(key, value) {
+            localStorage.setItem(key, JSON.stringify(value));
+            return value;
+        }
+
+        actionNodes(root = document) {
+            return Array.from(root.querySelectorAll('button,a,[role="button"],[class*="button"],[class*="btn"]'))
+                .filter(el => tools.isVisible(el) && !el.closest('[data-job-seeker-overlay="1"]'));
+        }
+
+        actionButtons(root = document) {
+            return this.actionNodes(root).filter(el => !tools.isDisabled(el));
+        }
+
+        findActionButton(state, root = null) {
+            const scope = root || this.detailActionRoot(document);
+            return this.actionNodes(scope).find(el => {
+                if (tools.zhaopinActionState(tools.normalizedText(el)) !== state) return false;
+                return state === 'already_applied' || !tools.isDisabled(el);
+            }) || null;
+        }
+
+        detailRoot(root = document) {
+            const candidates = [
+                '[class*="job-detail"]', '[class*="jobDetail"]', '[class*="position-detail"]',
+                '[class*="positionDetail"]', '[class*="detail-content"]', '[class*="job-content"]',
+                'main', 'article',
+            ];
+            for (const selector of candidates) {
+                for (const node of Array.from(root.querySelectorAll(selector))) {
+                    if (!tools.isVisible(node)) continue;
+                    const text = tools.normalizedText(node);
+                    if ((text.includes('职位描述') || text.includes('职位详情')) && text.length >= 80) return node;
+                }
+            }
+            const heading = Array.from(root.querySelectorAll('h1,h2,h3,h4,div,span'))
+                .find(node => tools.isVisible(node) && /^(职位描述|职位详情)$/.test(tools.normalizedText(node)));
+            return heading?.parentElement || root.body || root.documentElement || root;
+        }
+
+        detailActionRoot(rootDocument = document) {
+            let scope = this.detailRoot(rootDocument);
+            for (let depth = 0; scope && depth < 7; depth++, scope = scope.parentElement) {
+                const hasAction = this.actionNodes(scope).some(el => {
+                    const state = tools.zhaopinActionState(tools.normalizedText(el));
+                    return state === 'already_applied' || (state === 'apply' && !tools.isDisabled(el));
+                });
+                const wholeDocument = scope === rootDocument.body || scope === rootDocument.documentElement;
+                if (hasAction && !(wholeDocument && tools.isZhaopinListUrl(location.href))) return scope;
+                if (wholeDocument) break;
+            }
+            return this.detailRoot(rootDocument);
+        }
+
+        firstText(root, selectors) {
+            for (const selector of selectors) {
+                for (const node of Array.from(root.querySelectorAll(selector))) {
+                    if (!tools.isVisible(node)) continue;
+                    const text = tools.normalizedText(node);
+                    if (text) return text;
+                }
+            }
+            return '';
+        }
+
+        detailText(root) {
+            const direct = this.firstText(root, [
+                '[class*="job-description"]', '[class*="jobDescription"]', '[class*="position-description"]',
+                '[class*="positionDescription"]', '[class*="describ"]', '[data-testid*="description"]',
+            ]);
+            if (direct.length >= 40) return direct;
+            const heading = Array.from(root.querySelectorAll('h1,h2,h3,h4,div,span'))
+                .find(node => tools.isVisible(node) && /^(职位描述|职位详情)$/.test(tools.normalizedText(node)));
+            if (heading) {
+                const section = heading.closest('section,[class*="section"],[class*="detail"],article') || heading.parentElement;
+                const text = tools.normalizedText(section);
+                if (text.length >= 40) return text.replace(/^(职位描述|职位详情)\s*/, '');
+            }
+            const text = tools.normalizedText(root);
+            return text.length >= 80 ? text.slice(0, 12000) : '';
+        }
+
+        riskReason() {
+            const locationReason = tools.interruptionLocationReason();
+            if (location.hostname === 'passport.zhaopin.com') return locationReason || '智联登录页面';
+            const compact = tools.compactPageText();
+            return tools.detectManualInterruption() || tools.detectInterruptionText(compact) || '';
+        }
+
+        platformLimitReason() {
+            return tools.detectPlatformLimit() || tools.detectPlatformLimitText(tools.compactPageText()) || '';
+        }
+
+        readJobInfo(rootDocument = document, context = {}) {
+            const root = this.detailRoot(rootDocument);
+            const actionRoot = this.detailActionRoot(rootDocument);
+            const title = this.firstText(rootDocument, [
+                'h1', '[class*="job-name"]', '[class*="jobName"]', '[class*="position-name"]',
+                '[class*="positionName"]', '[data-testid*="title"]',
+            ]);
+            const salary = this.firstText(root, [
+                '[class*="salary"]', '[class*="wage"]', '[class*="job-salary"]', '[class*="position-salary"]',
+            ]);
+            const company = tools.sanitizeCompanyName(this.firstText(rootDocument, [
+                '[class*="company-name"]', '[class*="companyName"]', '[class*="company-title"]',
+                '[class*="companyTitle"]', '[data-testid*="company"]',
+            ]), title, salary);
+            const city = this.firstText(root, [
+                '[class*="location"]', '[class*="address"]', '[class*="city"]', '[class*="area"]',
+            ]);
+            const detail = this.detailText(root);
+            const alreadyButton = this.findActionButton('already_applied', actionRoot);
+            const applyButton = this.findActionButton('apply', actionRoot);
+            if (!title) {
+                const error = new Error('智联详情页未找到职位名称');
+                error.code = 'zhaopin_detail_title_missing';
+                throw error;
+            }
+            if (!detail) {
+                const error = new Error('智联详情页未找到职位描述');
+                error.code = 'zhaopin_detail_description_missing';
+                throw error;
+            }
+            if (!alreadyButton && !applyButton) {
+                const error = new Error('智联详情页未找到立即投递或已投递按钮');
+                error.code = 'zhaopin_detail_action_missing';
+                throw error;
+            }
+            const navigationUrl = context.navigationUrl || location.href;
+            return {
+                requestId: context.requestId || '',
+                title,
+                salary,
+                company,
+                city,
+                detail,
+                url: tools.zhaopinJobIdentityUrl(navigationUrl),
+                navigationUrl,
+                external_job_id: context.externalJobId || tools.zhaopinJobIdFromValue(navigationUrl),
+                alreadyApplied: Boolean(alreadyButton),
+                source: context.inline ? 'zhaopin_inline_detail' : 'zhaopin_detail',
+            };
+        }
+
+        simpleDialogs() {
+            const selectors = '[role="dialog"],[aria-modal="true"],[class*="modal"],[class*="dialog"],[class*="popup"]';
+            return Array.from(document.querySelectorAll(selectors))
+                .filter(node => tools.isVisible(node) && !node.closest('[data-job-seeker-overlay="1"]'));
+        }
+
+        async confirmSimpleApplyDialog(resumeName) {
+            const deadline = Date.now() + 6000;
+            while (Date.now() < deadline) {
+                if (this.findActionButton('already_applied')) return { confirmed: true, mode: 'button_changed' };
+                const dialog = this.simpleDialogs().find(node => {
+                    const text = tools.normalizedText(node);
+                    return /投递|简历/.test(text);
+                });
+                if (!dialog) {
+                    await tools.asyncSleep(250);
+                    continue;
+                }
+                const dialogText = tools.normalizedText(dialog);
+                const supplementalFields = Array.from(dialog.querySelectorAll(
+                    'textarea,select,input[type="file"],input[type="text"],input:not([type])'
+                )).filter(node => tools.isVisible(node));
+                if (/问卷|补充问题|附加问题|上传附件|作品集|求职信|回答以下/.test(dialogText) || supplementalFields.length) {
+                    const error = new Error('智联投递需要填写问卷、附件或补充信息');
+                    error.manualIntervention = true;
+                    throw error;
+                }
+                const radios = Array.from(dialog.querySelectorAll('input[type="radio"]'));
+                const resumeOptions = Array.from(dialog.querySelectorAll(
+                    'input[type="radio"],[role="radio"],[data-resume-id],[class*="resume-item"],[class*="resumeItem"]'
+                )).filter(node => tools.isVisible(node));
+                if (resumeName) {
+                    const textNode = Array.from(dialog.querySelectorAll('label,li,div,span'))
+                        .filter(node => tools.isVisible(node))
+                        .find(node => tools.normalizedText(node) === resumeName);
+                    if (!textNode) {
+                        const error = new Error(`未找到配置的智联简历: ${resumeName}`);
+                        error.manualIntervention = true;
+                        throw error;
+                    }
+                    const clickable = tools.clickableAncestor(textNode, dialog) || textNode;
+                    tools.clickLikeUser(clickable);
+                    await tools.asyncSleep(300);
+                } else if (
+                    (radios.length > 1 && !radios.some(node => node.checked))
+                    || (radios.length === 0 && resumeOptions.length > 1
+                        && !resumeOptions.some(node => node.getAttribute('aria-checked') === 'true' || node.classList.contains('selected')))
+                ) {
+                    const error = new Error('智联投递弹窗存在多份简历且没有明确默认项');
+                    error.manualIntervention = true;
+                    throw error;
+                }
+                const confirm = this.actionButtons(dialog).find(node => /^(确认投递|确定投递|投递|确认|确定)$/.test(tools.normalizedText(node)));
+                if (!confirm) {
+                    const error = new Error('智联投递弹窗无法安全确认');
+                    error.manualIntervention = true;
+                    throw error;
+                }
+                tools.clickLikeUser(confirm);
+                return { confirmed: false, mode: 'simple_dialog_confirmed' };
+            }
+            return { confirmed: false, mode: 'no_dialog' };
+        }
+
+        async executeApply(context) {
+            const job = context.job || {};
+            const idempotencyKey = context.idempotencyKey || `zhaopin:${job.external_job_id || job.url}:apply`;
+            const control = await this.api.heartbeat('detail', 'running', `智联投递前控制检查: ${job.title || ''}`, {
+                version: OPTIONS.scriptVersion,
+                jobId: job.external_job_id || '',
+            });
+            if (control.offline || control.should_pause || control.should_stop || !control.should_start) {
+                return {
+                    success: false,
+                    pauseRequired: true,
+                    reason: control.offline ? '后端不可用，智联投递已取消' : '智联平台当前未允许运行',
+                    requestId: context.requestId,
+                };
+            }
+            const risk = this.riskReason();
+            const limit = this.platformLimitReason();
+            if (risk || limit) {
+                return {
+                    success: false,
+                    pauseRequired: true,
+                    failureKind: limit ? 'platform_limit' : 'manual_intervention',
+                    reason: risk || limit,
+                    requestId: context.requestId,
+                };
+            }
+            const alreadyButton = this.findActionButton('already_applied');
+            if (alreadyButton) {
+                await this.api.createAction('already_applied', {
+                    idempotencyKey,
+                    transactionState: 'confirmed',
+                    source: 'detail_before_click',
+                }, job, 'confirmed');
+                return { success: true, alreadyApplied: true, state: 'confirmed', requestId: context.requestId };
+            }
+            const button = this.findActionButton('apply');
+            if (!button) {
+                return { success: false, preClickFailure: true, reason: '未找到可用的立即投递按钮', requestId: context.requestId };
+            }
+            const clicked = tools.clickLikeUser(button);
+            if (!clicked) {
+                return { success: false, preClickFailure: true, reason: '立即投递按钮点击失败', requestId: context.requestId };
+            }
+            await this.api.createAction('apply', {
+                idempotencyKey,
+                transactionState: 'clicked',
+                attempt: Number(context.attempt || 1),
+            }, job, 'clicked');
+            await tools.asyncSleep(700);
+            try {
+                await this.confirmSimpleApplyDialog(String(context.resumeName || ''));
+            } catch (error) {
+                if (error.manualIntervention) {
+                    return { success: false, clicked: true, pauseRequired: true, reason: String(error), requestId: context.requestId };
+                }
+                throw error;
+            }
+            const deadline = Date.now() + 15000;
+            while (Date.now() < deadline) {
+                if (this.findActionButton('already_applied')) {
+                    await this.api.createAction('apply', {
+                        idempotencyKey,
+                        transactionState: 'confirmed',
+                        verification: 'button_changed_to_applied',
+                    }, job, 'confirmed');
+                    await this.api.event('apply_confirmed', `智联投递已确认: ${job.title || ''}`, 'script', 'info', {
+                        jobId: job.external_job_id || '',
+                        url: job.url || '',
+                    });
+                    return { success: true, state: 'confirmed', requestId: context.requestId };
+                }
+                const riskAfterClick = this.riskReason() || this.platformLimitReason();
+                if (riskAfterClick) {
+                    return {
+                        success: false,
+                        clicked: true,
+                        pauseRequired: true,
+                        failureKind: this.platformLimitReason() ? 'platform_limit' : 'manual_intervention',
+                        reason: riskAfterClick,
+                        requestId: context.requestId,
+                    };
+                }
+                await tools.asyncSleep(300);
+            }
+            await this.api.createAction('apply_delivery_unknown', {
+                idempotencyKey,
+                transactionState: 'unknown',
+                verification: 'button_did_not_change',
+            }, job, 'unknown');
+            await this.api.event('apply_delivery_unknown', `智联投递结果无法确认: ${job.title || ''}`, 'script', 'error', {
+                jobId: job.external_job_id || '',
+                url: job.url || '',
+            });
+            await this.api.control('pause', '投递按钮点击后未变为已投递').catch(() => null);
+            return {
+                success: false,
+                clicked: true,
+                pauseRequired: true,
+                preservePage: true,
+                unknown: true,
+                reason: '投递按钮点击后未变为已投递',
+                requestId: context.requestId,
+            };
+        }
+
+        setupBroadcast(target) {
+            this.broadcast = new WebBroadcast('__zhaopin_broadcast', target);
+            return this.broadcast;
+        }
+
+        detailContext() {
+            const context = this.safeJson(this.contextKey, {});
+            if (!context.createdAt || Date.now() - Number(context.createdAt) > OPTIONS.timestampTimeout) return {};
+            return context;
+        }
+
+        async runDetail() {
+            this.setupBroadcast(this.targets.detail);
+            const context = this.detailContext();
+            if (!context.requestId) {
+                await this.api.heartbeat('detail', 'idle', '智联详情页独立打开，未执行自动动作', {
+                    version: OPTIONS.scriptVersion,
+                    path: location.pathname,
+                });
+                return;
+            }
+            const currentId = tools.zhaopinJobIdFromValue(location.href);
+            if (context.externalJobId && currentId && context.externalJobId !== currentId) {
+                await this.api.control('pause', '智联详情页与目标岗位不一致').catch(() => null);
+                await this.api.event('zhaopin_detail_identity_mismatch', '智联详情页与目标岗位不一致，已暂停', 'script', 'error', {
+                    expectedJobId: context.externalJobId,
+                    currentJobId: currentId,
+                });
+                banner('智联详情页与目标岗位不一致，已暂停');
+                return;
+            }
+            this.broadcast.on(this.types.APPLY, async (from, data) => {
+                if (from !== this.targets.list || data?.requestId !== context.requestId) return;
+                const result = await this.executeApply(data || {}).catch(error => ({
+                    success: false,
+                    reason: String(error),
+                    requestId: context.requestId,
+                    clicked: true,
+                    unknown: true,
+                    preservePage: true,
+                }));
+                await this.broadcast.send(this.targets.list, this.types.APPLY_RESULT, result).catch(() => null);
+                if (result.success && !result.preservePage) setTimeout(() => window.close(), 500);
+            });
+            this.broadcast.on(this.types.CLOSE, (from, data) => {
+                if (from === this.targets.list && (!data?.requestId || data.requestId === context.requestId)) window.close();
+            });
+            try {
+                let jobInfo = null;
+                let lastError = null;
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        const risk = this.riskReason();
+                        const limit = this.platformLimitReason();
+                        if (risk || limit) throw new Error(`需要人工处理: ${risk || limit}`);
+                        jobInfo = this.readJobInfo(document, context);
+                        break;
+                    } catch (error) {
+                        lastError = error;
+                        if (attempt < 3) await tools.asyncSleep(1200 * attempt);
+                    }
+                }
+                if (!jobInfo) throw lastError || new Error('智联详情读取失败');
+                await this.api.heartbeat('detail', 'running', `智联详情已读取: ${jobInfo.title}`, {
+                    version: OPTIONS.scriptVersion,
+                    jobId: jobInfo.external_job_id,
+                });
+                await this.broadcast.send(this.targets.list, this.types.JOB_INFO, jobInfo);
+            } catch (error) {
+                const reason = this.riskReason() || this.platformLimitReason() || String(error?.message || error);
+                await this.broadcast.send(this.targets.list, this.types.JOB_INFO, {
+                    requestId: context.requestId,
+                    pageFailure: true,
+                    reason,
+                    failureCode: String(error.code || ''),
+                    manualIntervention: Boolean(this.riskReason() || this.platformLimitReason()),
+                }).catch(() => null);
+                await this.api.heartbeat('detail', 'error', reason, { version: OPTIONS.scriptVersion });
+            }
+            this.heartbeatTimer = setInterval(async () => {
+                const response = await this.api.heartbeat('detail', 'running', '等待智联列表页评分或投递指令', {
+                    version: OPTIONS.scriptVersion,
+                    jobId: context.externalJobId || '',
+                });
+                if (response.should_stop || response.should_pause) clearInterval(this.heartbeatTimer);
+            }, 5000);
+        }
+
+        leaseSnapshot() {
+            const lease = this.safeJson(this.leaseKey, {});
+            if (!lease.updatedAt || Date.now() - Number(lease.updatedAt) > 15000) return {};
+            return lease;
+        }
+
+        acquireLease() {
+            const lease = this.leaseSnapshot();
+            if (lease.owner && lease.owner !== PAGE_INSTANCE_ID) return false;
+            this.writeJson(this.leaseKey, { owner: PAGE_INSTANCE_ID, updatedAt: Date.now() });
+            const confirmed = this.leaseSnapshot();
+            if (confirmed.owner !== PAGE_INSTANCE_ID) return false;
+            if (!this.leaseTimer) {
+                this.leaseTimer = setInterval(() => {
+                    this.writeJson(this.leaseKey, { owner: PAGE_INSTANCE_ID, updatedAt: Date.now() });
+                }, 5000);
+            }
+            return true;
+        }
+
+        releaseLease() {
+            if (this.leaseTimer) clearInterval(this.leaseTimer);
+            this.leaseTimer = null;
+            const lease = this.leaseSnapshot();
+            if (lease.owner === PAGE_INSTANCE_ID) localStorage.removeItem(this.leaseKey);
+        }
+
+        counterState() {
+            const now = new Date();
+            const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            const saved = this.safeJson(this.counterKey, {});
+            return {
+                date: today,
+                runId: this.backendRunId,
+                runCount: saved.runId === this.backendRunId ? Number(saved.runCount || 0) : 0,
+                dailyCount: saved.date === today ? Number(saved.dailyCount || 0) : 0,
+                nextAllowedAt: Number(saved.nextAllowedAt || 0),
+            };
+        }
+
+        saveCounter(state) {
+            return this.writeJson(this.counterKey, state);
+        }
+
+        applicationLimitReason() {
+            const state = this.counterState();
+            if (OPTIONS.zhaopinMaxApplicationsPerRun > 0 && state.runCount >= OPTIONS.zhaopinMaxApplicationsPerRun) {
+                return `智联本轮投递达到本地上限 ${OPTIONS.zhaopinMaxApplicationsPerRun}`;
+            }
+            if (OPTIONS.zhaopinMaxApplicationsPerDay > 0 && state.dailyCount >= OPTIONS.zhaopinMaxApplicationsPerDay) {
+                return `智联今日投递达到本地上限 ${OPTIONS.zhaopinMaxApplicationsPerDay}`;
+            }
+            return '';
+        }
+
+        async waitForApplicationInterval() {
+            const state = this.counterState();
+            const remaining = state.nextAllowedAt - Date.now();
+            if (remaining > 0) {
+                this.logger?.add(`智联投递随机间隔，等待 ${(remaining / 1000).toFixed(1)} 秒`);
+                await tools.asyncSleep(remaining);
+            }
+        }
+
+        markApplicationAttempt(confirmed = false) {
+            const state = this.counterState();
+            state.nextAllowedAt = Date.now() + tools.randomApplyDelayMs(
+                OPTIONS.zhaopinApplyDelayMinSeconds,
+                OPTIONS.zhaopinApplyDelayMaxSeconds,
+            );
+            if (confirmed) {
+                state.runCount += 1;
+                state.dailyCount += 1;
+            }
+            this.saveCounter(state);
+            return state;
+        }
+
+        heartbeatDetail() {
+            const counter = this.counterState();
+            return {
+                version: OPTIONS.scriptVersion,
+                platform: 'zhaopin',
+                configuredUrls: this.urls.map(url => tools.logSafeUrl(url)),
+                currentUrlIndex: this.urlIndex,
+                currentUrl: tools.logSafeUrl(location.href),
+                queuedJobs: this.queue.length,
+                seenJobs: this.seen.size,
+                currentJobId: this.currentJob?.externalJobId || '',
+                currentJobTitle: this.currentJob?.title || '',
+                listMode: 'pagination',
+                paginationMode: 'next_button',
+                pageNumber: this.pageNumber,
+                pageTurnCount: this.pageTurnCount,
+                pageTarget: this.paginationTarget,
+                lastPageOutcome: this.lastPageOutcome,
+                pageBefore: this.pageBefore,
+                pageAfter: this.pageAfter,
+                pageJobCountBefore: this.pageJobCountBefore,
+                pageJobCountAfter: this.pageJobCountAfter,
+                // 保留旧滚动字段，便于既有状态页展示；智联值明确标记为分页。
+                scrollMode: 'pagination',
+                scrollTarget: this.paginationTarget,
+                scrollRound: this.pageTurnCount,
+                lastScrollOutcome: this.lastPageOutcome,
+                scrollBefore: this.pageBefore,
+                scrollAfter: this.pageAfter,
+                scrollJobCountBefore: this.pageJobCountBefore,
+                scrollJobCountAfter: this.pageJobCountAfter,
+                cooldownUntil: this.cooldownUntil ? new Date(this.cooldownUntil).toISOString() : '',
+                runApplyCount: counter.runCount,
+                dailyApplyCount: counter.dailyCount,
+                nextApplyAllowedAt: counter.nextAllowedAt ? new Date(counter.nextAllowedAt).toISOString() : '',
+            };
+        }
+
+        async syncControl(action = '智联岗位列表运行中') {
+            const response = await this.api.heartbeat('list', this.pause ? 'paused' : 'running', action, this.heartbeatDetail());
+            applyBackendConfig(response.config);
+            this.urls = Array.isArray(OPTIONS.zhaopinJobUrls) && OPTIONS.zhaopinJobUrls.length
+                ? OPTIONS.zhaopinJobUrls.filter(url => tools.isZhaopinListUrl(url))
+                : ['https://www.zhaopin.com/recommend'];
+            this.backendRunId = response.run_id || this.backendRunId;
+            if (response.offline) {
+                this.pause = true;
+                this.running = false;
+                this.releaseLease();
+                return false;
+            }
+            if (response.should_pause || response.should_stop || !OPTIONS.zhaopinEnabled) {
+                this.pause = true;
+                this.running = false;
+                this.releaseLease();
+                return false;
+            }
+            if (response.should_start) {
+                this.pause = false;
+                return true;
+            }
+            return false;
+        }
+
+        async pausePlatform(reason, type = 'zhaopin_platform_pause', preservePage = false) {
+            this.pause = true;
+            this.running = false;
+            this.releaseLease();
+            this.logger?.setPaused(true);
+            this.logger?.add(`智联已暂停: ${reason}`);
+            await this.api.event(type, `智联已暂停: ${reason}`, 'script', 'error', {
+                preservePage,
+                jobId: this.currentJob?.externalJobId || '',
+            });
+            await this.api.control('pause', reason).catch(() => null);
+            await this.api.heartbeat('list', 'paused', reason, this.heartbeatDetail()).catch(() => null);
+        }
+
+        currentConfiguredIndex() {
+            const current = tools.zhaopinListSourceIdentity(location.href);
+            let index = this.urls.findIndex(url => tools.zhaopinListSourceIdentity(url) === current);
+            if (index < 0) {
+                const currentPath = `${location.origin}${location.pathname}`.replace(/\/+$/, '');
+                index = this.urls.findIndex(url => {
+                    try {
+                        const parsed = new URL(url);
+                        return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '') === currentPath;
+                    } catch (e) {
+                        return false;
+                    }
+                });
+            }
+            return index;
+        }
+
+        restorePaginationState() {
+            const saved = this.safeJson(this.paginationStateKey, {});
+            if (saved.runId === this.backendRunId && Number(saved.urlIndex) === this.urlIndex) {
+                this.pageTurnCount = Math.max(0, Number(saved.pageTurnCount || 0));
+                this.lastPageOutcome = saved.pending ? 'page_navigation_restored' : String(saved.lastPageOutcome || 'idle');
+                this.pageBefore = String(saved.pageBefore || '');
+                this.pageNumber = this.currentPageMarker();
+                this.pageAfter = this.pageNumber || String(saved.pageAfter || '');
+                if (saved.pending) this.savePaginationState({ pending: false });
+                return;
+            }
+            this.resetPaginationState(this.urlIndex, 'source_initialized');
+        }
+
+        savePaginationState(patch = {}) {
+            const current = this.safeJson(this.paginationStateKey, {});
+            return this.writeJson(this.paginationStateKey, {
+                ...current,
+                runId: this.backendRunId,
+                urlIndex: this.urlIndex,
+                pageTurnCount: this.pageTurnCount,
+                lastPageOutcome: this.lastPageOutcome,
+                pageBefore: this.pageBefore,
+                pageAfter: this.pageAfter,
+                updatedAt: Date.now(),
+                ...patch,
+            });
+        }
+
+        resetPaginationState(index = this.urlIndex, reason = 'source_reset') {
+            this.pageTurnCount = 0;
+            this.pageNumber = '';
+            this.pageBefore = '';
+            this.pageAfter = '';
+            this.paginationTarget = '';
+            this.lastPageOutcome = reason;
+            this.pageJobCountBefore = 0;
+            this.pageJobCountAfter = 0;
+            this.writeJson(this.paginationStateKey, {
+                runId: this.backendRunId,
+                urlIndex: index,
+                pageTurnCount: 0,
+                lastPageOutcome: reason,
+                pageBefore: '',
+                pageAfter: '',
+                pending: false,
+                updatedAt: Date.now(),
+            });
+        }
+
+        navigateToUrl(index, reason) {
+            const target = this.urls[index];
+            if (!target) return false;
+            this.writeJson(this.urlStateKey, { index, reason, updatedAt: Date.now() });
+            if (location.href.split('#')[0] === target.split('#')[0]) return false;
+            this.resetPaginationState(index, reason || 'source_switch');
+            this.api.event('zhaopin_list_url_switch', `切换智联岗位页 ${index + 1}/${this.urls.length}: ${reason}`, 'script', 'info', {
+                target: tools.logSafeUrl(target),
+                index,
+            });
+            location.href = target;
+            return true;
+        }
+
+        jobLinkSelectors() {
+            return [
+                'a[href*="/jobdetail/"]', 'a[href*="/job-detail/"]', 'a[href*="/job/"]',
+                'a[href*="positionNumber="]', 'a[href*="positionId="]', 'a[href*="jobId="]',
+            ];
+        }
+
+        collectCandidates() {
+            const candidates = [];
+            const identities = new Set();
+            for (const node of Array.from(document.querySelectorAll(this.jobLinkSelectors().join(',')))) {
+                const href = tools.normalUrl(node.getAttribute('href'));
+                if (!href || tools.isZhaopinListUrl(href)) continue;
+                const externalJobId = tools.zhaopinJobIdFromValue(href);
+                if (!externalJobId && !/\/(?:jobdetail|job-detail|job)\//i.test(new URL(href).pathname)) continue;
+                const identity = tools.zhaopinJobIdentityUrl(href);
+                if (!identity || identities.has(identity)) continue;
+                identities.add(identity);
+                candidates.push({ navigationUrl: href, identity, externalJobId, element: node, inline: false });
+            }
+            if (!candidates.length) {
+                const inlineNodes = Array.from(document.querySelectorAll(
+                    '[data-positionnumber],[data-position-number],[data-jobid],[class*="job-card"],[class*="jobCard"],[class*="position-item"]'
+                )).filter(node => tools.isVisible(node)).slice(0, 200);
+                inlineNodes.forEach((node, index) => {
+                    const externalJobId = node.getAttribute('data-positionnumber')
+                        || node.getAttribute('data-position-number')
+                        || node.getAttribute('data-jobid')
+                        || '';
+                    const text = tools.normalizedText(node).slice(0, 180);
+                    if (!text || (!externalJobId && text.length < 20)) return;
+                    const identity = externalJobId ? `zhaopin:inline:${externalJobId}` : `zhaopin:inline:${index}:${text}`;
+                    if (identities.has(identity)) return;
+                    identities.add(identity);
+                    candidates.push({ navigationUrl: '', identity, externalJobId, element: node, inline: true });
+                });
+            }
+            return candidates;
+        }
+
+        enqueueNewCandidates() {
+            const existing = new Set(this.queue.map(item => item.identity));
+            const found = this.collectCandidates();
+            let added = 0;
+            for (const candidate of found) {
+                if (this.seen.has(candidate.identity) || existing.has(candidate.identity)) continue;
+                this.queue.push(candidate);
+                existing.add(candidate.identity);
+                added += 1;
+            }
+            return added;
+        }
+
+        paginationRootSelector() {
+            return [
+                '[class*="pagination"]', '[class*="Pagination"]',
+                '[class*="pager"]', '[class*="Pager"]',
+                '[class*="soupager"]',
+                'nav[aria-label*="分页"]', '[role="navigation"][aria-label*="分页"]',
+            ].join(',');
+        }
+
+        clickablePaginationNode(node) {
+            if (!node) return null;
+            if (node.matches?.('button,a,[role="button"]')) return node;
+            return node.querySelector?.('button,a,[role="button"]') || node;
+        }
+
+        clickPaginationControl(node) {
+            const target = this.clickablePaginationNode(node);
+            if (!target) return false;
+            try { target.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+            try { target.focus?.({ preventScroll: true }); } catch (e) {}
+            try {
+                target.click();
+                return true;
+            } catch (e) {
+                try {
+                    const view = target.ownerDocument?.defaultView || window;
+                    target.dispatchEvent(new view.MouseEvent('click', { bubbles: true, cancelable: true, view }));
+                    return true;
+                } catch (ignore) {
+                    return false;
+                }
+            }
+        }
+
+        paginationControlMeta(node) {
+            const clickable = this.clickablePaginationNode(node);
+            const rootSelector = this.paginationRootSelector();
+            const paginationRoot = node.closest?.(rootSelector) || clickable?.closest?.(rootSelector) || null;
+            return {
+                element: clickable,
+                inPagination: Boolean(paginationRoot),
+                text: tools.normalizedText(clickable || node),
+                ariaLabel: clickable?.getAttribute?.('aria-label') || node.getAttribute?.('aria-label') || '',
+                ariaDisabled: clickable?.getAttribute?.('aria-disabled') || node.getAttribute?.('aria-disabled') || '',
+                title: clickable?.getAttribute?.('title') || node.getAttribute?.('title') || '',
+                rel: clickable?.getAttribute?.('rel') || node.getAttribute?.('rel') || '',
+                className: String(clickable?.className || node.className || ''),
+                parentClassName: String(clickable?.parentElement?.className || node.parentElement?.className || ''),
+                disabled: tools.isDisabled(clickable || node),
+            };
+        }
+
+        findNextPageControl() {
+            const directSelectors = [
+                'a[rel="next"]', 'button[rel="next"]',
+                '[aria-label="下一页"]', '[title="下一页"]',
+                '[aria-label="Next Page" i]', '[title="Next Page" i]',
+                '.ant-pagination-next', '.soupager__btn--next',
+                '[class*="pagination"] [class*="next"]', '[class*="Pagination"] [class*="next"]',
+                '[class*="pager"] [class*="next"]', '[class*="Pager"] [class*="next"]',
+                '[class*="soupager"] [class*="next"]',
+            ];
+            const candidates = [];
+            const seen = new Set();
+            const add = (node) => {
+                const element = this.clickablePaginationNode(node);
+                if (!element || seen.has(element) || element.closest?.('[data-job-seeker-overlay="1"]')) return;
+                seen.add(element);
+                candidates.push(node);
+            };
+            for (const selector of directSelectors) {
+                try { document.querySelectorAll(selector).forEach(add); } catch (e) {}
+            }
+            try {
+                document.querySelectorAll(this.paginationRootSelector()).forEach(root => {
+                    root.querySelectorAll('button,a,[role="button"]').forEach(add);
+                });
+            } catch (e) {}
+            try {
+                document.querySelectorAll('button,a,[role="button"]').forEach(node => {
+                    if (/^(?:下一页|下页|next(?:\s*page)?)(?:\s*[>›»])?$/i.test(tools.normalizedText(node))) add(node);
+                });
+            } catch (e) {}
+            let disabled = null;
+            for (const node of candidates) {
+                const meta = this.paginationControlMeta(node);
+                if (!meta.element || !tools.isVisible(meta.element)) continue;
+                const state = tools.zhaopinPaginationControlState(meta);
+                if (state === 'next') return { state, element: meta.element, meta };
+                if (state === 'disabled' && !disabled) disabled = { state, element: meta.element, meta };
+            }
+            return disabled || { state: 'missing', element: null, meta: {} };
+        }
+
+        currentPageMarker() {
+            const selectors = [
+                '.ant-pagination-item-active',
+                '[class*="pagination"] [aria-current="page"]', '[class*="Pagination"] [aria-current="page"]',
+                '[class*="pagination"] [class*="active"]', '[class*="Pagination"] [class*="active"]',
+                '[class*="pager"] [class*="active"]', '[class*="Pager"] [class*="active"]',
+                '[class*="soupager"] [class*="active"]',
+            ];
+            for (const selector of selectors) {
+                let nodes = [];
+                try { nodes = Array.from(document.querySelectorAll(selector)); } catch (e) {}
+                for (const node of nodes) {
+                    if (!tools.isVisible(node)) continue;
+                    const match = tools.normalizedText(node).match(/\d+/);
+                    if (match) return match[0];
+                }
+            }
+            try {
+                const parsed = new URL(location.href);
+                for (const key of ['page', 'pageNo', 'pageNum', 'pageIndex', 'currentPage', 'current', 'p']) {
+                    const value = parsed.searchParams.get(key);
+                    if (/^\d+$/.test(value || '')) return value;
+                }
+            } catch (e) {}
+            return '';
+        }
+
+        paginationSnapshot() {
+            const candidates = this.collectCandidates();
+            return {
+                url: location.href,
+                page: this.currentPageMarker(),
+                jobCount: candidates.length,
+                fingerprint: candidates.map(item => item.identity).sort().join('|'),
+            };
+        }
+
+        async waitForPageTransition(before, timeoutMs = 10000) {
+            const deadline = Date.now() + timeoutMs;
+            let latest = this.paginationSnapshot();
+            let outcome = tools.zhaopinPageTransitionOutcome(before, latest);
+            while (Date.now() < deadline) {
+                const risk = this.riskReason();
+                const limit = this.platformLimitReason();
+                if (risk || limit) throw new Error(risk || limit);
+                if (outcome.ready) return { verified: true, after: latest, outcome };
+                await tools.asyncSleep(500);
+                latest = this.paginationSnapshot();
+                outcome = tools.zhaopinPageTransitionOutcome(before, latest);
+            }
+            return { verified: outcome.changed, after: latest, outcome };
+        }
+
+        async turnToNextPage() {
+            const maxTurns = Math.max(0, Math.min(20, Number(OPTIONS.searchResultScrollRounds) || 0));
+            if (this.pageTurnCount >= maxTurns) {
+                this.lastPageOutcome = 'page_turn_limit';
+                this.savePaginationState({ pending: false });
+                return false;
+            }
+            const before = this.paginationSnapshot();
+            this.pageBefore = before.page || '';
+            this.pageAfter = before.page || '';
+            this.pageNumber = before.page || this.pageNumber;
+            this.pageJobCountBefore = before.jobCount;
+            this.pageJobCountAfter = before.jobCount;
+            let lastControl = { state: 'missing', element: null, meta: {} };
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                const alreadyChanged = tools.zhaopinPageTransitionOutcome(before, this.paginationSnapshot());
+                if (alreadyChanged.changed) {
+                    lastControl = { state: 'next', element: lastControl.element, meta: lastControl.meta };
+                } else {
+                    lastControl = this.findNextPageControl();
+                    if (lastControl.state === 'disabled') {
+                        this.paginationTarget = tools.elementBrief(lastControl.element);
+                        this.lastPageOutcome = 'last_page';
+                        this.savePaginationState({ pending: false });
+                        return false;
+                    }
+                    if (lastControl.state === 'missing') {
+                        if (attempt < 3) {
+                            this.lastPageOutcome = `waiting_for_next_button_${attempt}`;
+                            await tools.asyncSleep(1000 * attempt);
+                            continue;
+                        }
+                        this.paginationTarget = '';
+                        this.lastPageOutcome = 'next_button_missing';
+                        this.savePaginationState({ pending: false });
+                        return false;
+                    }
+                    this.paginationTarget = tools.elementBrief(lastControl.element);
+                    this.lastPageOutcome = 'next_button_selected';
+                    await this.api.event('zhaopin_next_page_selected', `智联下一页按钮已定位，准备第 ${attempt}/3 次翻页`, 'script', 'info', {
+                        attempt,
+                        pageTurnCount: this.pageTurnCount,
+                        pageBefore: this.pageBefore,
+                        target: this.paginationTarget,
+                        urlIndex: this.urlIndex,
+                    });
+                    this.savePaginationState({
+                        pending: true,
+                        pageTurnCount: this.pageTurnCount + 1,
+                    });
+                    if (!this.clickPaginationControl(lastControl.element)) {
+                        this.lastPageOutcome = `next_click_failed_${attempt}`;
+                        if (attempt < 3) await tools.asyncSleep(800 * attempt);
+                        continue;
+                    }
+                    await this.api.event('zhaopin_next_page_clicked', `智联已点击下一页 ${attempt}/3`, 'script', 'info', {
+                        attempt,
+                        pageBefore: this.pageBefore,
+                        urlIndex: this.urlIndex,
+                    });
+                }
+                const transition = await this.waitForPageTransition(before);
+                this.pageAfter = transition.after.page || this.pageAfter;
+                this.pageNumber = transition.after.page || this.pageNumber;
+                this.pageJobCountAfter = transition.after.jobCount;
+                if (transition.verified) {
+                    this.pageTurnCount += 1;
+                    this.lastPageOutcome = transition.outcome.jobsChanged ? 'page_jobs_changed' : 'page_changed';
+                    this.listEmptyRetries = 0;
+                    this.enqueueNewCandidates();
+                    this.savePaginationState({ pending: false });
+                    await this.api.event('zhaopin_next_page_verified', `智联下一页已生效: ${this.pageBefore || '?'} -> ${this.pageAfter || '?'}`, 'script', 'info', {
+                        pageTurnCount: this.pageTurnCount,
+                        pageBefore: this.pageBefore,
+                        pageAfter: this.pageAfter,
+                        jobCountBefore: this.pageJobCountBefore,
+                        jobCountAfter: this.pageJobCountAfter,
+                        urlChanged: transition.outcome.urlChanged,
+                        pageChanged: transition.outcome.pageChanged,
+                        jobsChanged: transition.outcome.jobsChanged,
+                        urlIndex: this.urlIndex,
+                    });
+                    return true;
+                }
+                this.lastPageOutcome = `next_click_unconfirmed_${attempt}`;
+                if (attempt < 3) await tools.asyncSleep(800 * attempt);
+            }
+            this.savePaginationState({ pending: false });
+            throw new Error('智联下一页连续点击 3 次后，页码、网址和岗位列表均未变化');
+        }
+
+        waitFor(type, requestId, timeout = OPTIONS.jobInfoResponseTimeout) {
+            const key = `${type}:${requestId}`;
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    this.pending.delete(key);
+                    reject(new Error(`等待智联详情页响应超时: ${type}`));
+                }, timeout);
+                this.pending.set(key, { resolve, reject, timer });
+            });
+        }
+
+        resolvePending(type, data) {
+            const key = `${type}:${data?.requestId || ''}`;
+            const pending = this.pending.get(key);
+            if (!pending) return;
+            clearTimeout(pending.timer);
+            this.pending.delete(key);
+            pending.resolve(data);
+        }
+
+        cancelPending(type, requestId, reason = '') {
+            const key = `${type}:${requestId}`;
+            const pending = this.pending.get(key);
+            if (!pending) return;
+            clearTimeout(pending.timer);
+            this.pending.delete(key);
+            if (reason) pending.reject(new Error(reason));
+        }
+
+        closeActiveDetail(requestId = '') {
+            if (this.broadcast) this.broadcast.send(this.targets.detail, this.types.CLOSE, { requestId }).catch(() => null);
+            if (this.activeTab) tools.closeTabHandle(this.activeTab);
+            this.activeTab = null;
+            localStorage.removeItem(this.contextKey);
+        }
+
+        async readCandidate(candidate) {
+            const requestId = `zhaopin_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+            const context = {
+                requestId,
+                navigationUrl: tools.zhaopinJobIdentityUrl(candidate.navigationUrl),
+                identity: candidate.identity,
+                externalJobId: candidate.externalJobId,
+                createdAt: Date.now(),
+            };
+            this.writeJson(this.contextKey, context);
+            if (candidate.inline) {
+                if (!candidate.element?.isConnected) throw new Error('智联岗位卡片已失效');
+                tools.clickLikeUser(candidate.element);
+                await tools.asyncSleep(1200);
+                return this.readJobInfo(document, { ...context, inline: true });
+            }
+            const wait = this.waitFor(this.types.JOB_INFO, requestId);
+            this.activeTab = tools.openTabNSetTimestamp(candidate.navigationUrl, this.targets.detail, false, {
+                force: true,
+                cooldownMs: 0,
+            });
+            if (!this.activeTab) {
+                const reason = '浏览器拦截了智联详情页，请允许 zhaopin.com 弹出窗口';
+                this.cancelPending(this.types.JOB_INFO, requestId);
+                throw new Error(reason);
+            }
+            return wait;
+        }
+
+        async applyThroughDetail(jobInfo, candidate, attempt = 1) {
+            const requestId = jobInfo.requestId || this.detailContext().requestId;
+            const idempotencyKey = `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`;
+            await this.api.createAction('apply', {
+                idempotencyKey,
+                transactionState: 'prepared',
+                score: jobInfo.score,
+                threshold: OPTIONS.thread,
+            }, jobInfo, 'prepared');
+            if (candidate.inline) {
+                try {
+                    return await this.executeApply({
+                        requestId,
+                        job: jobInfo,
+                        idempotencyKey,
+                        resumeName: OPTIONS.zhaopinResumeName,
+                        attempt,
+                    });
+                } catch (error) {
+                    return {
+                        success: false,
+                        clicked: true,
+                        unknown: true,
+                        preservePage: true,
+                        reason: `智联投递指令执行后状态未知: ${error}`,
+                        requestId,
+                    };
+                }
+            }
+            const wait = this.waitFor(this.types.APPLY_RESULT, requestId, 45000);
+            try {
+                await this.broadcast.send(this.targets.detail, this.types.APPLY, {
+                    requestId,
+                    job: jobInfo,
+                    idempotencyKey,
+                    resumeName: OPTIONS.zhaopinResumeName,
+                    attempt,
+                });
+            } catch (error) {
+                this.cancelPending(this.types.APPLY_RESULT, requestId);
+                return { success: false, preClickFailure: true, reason: String(error), requestId };
+            }
+            return wait.catch(error => ({
+                success: false,
+                clicked: true,
+                unknown: true,
+                preservePage: true,
+                reason: `智联投递指令发出后未收到确认: ${error}`,
+                requestId,
+            }));
+        }
+
+        isDetailCompatibilityFailure(code) {
+            return [
+                'zhaopin_detail_title_missing',
+                'zhaopin_detail_description_missing',
+                'zhaopin_detail_action_missing',
+            ].includes(String(code || ''));
+        }
+
+        resetDetailCompatibilityFailures() {
+            this.detailFailureCode = '';
+            this.detailFailureCount = 0;
+        }
+
+        async handleDetailCompatibilityFailure(code, reason, candidate) {
+            const normalizedCode = String(code || 'zhaopin_detail_unknown');
+            if (this.detailFailureCode === normalizedCode) this.detailFailureCount += 1;
+            else {
+                this.detailFailureCode = normalizedCode;
+                this.detailFailureCount = 1;
+            }
+            const message = `智联详情元素异常，已跳过当前岗位 ${this.detailFailureCount}/3: ${reason}`;
+            this.logger?.add(message);
+            await this.api.event('zhaopin_detail_job_skipped', message, 'script', 'warning', {
+                failureCode: normalizedCode,
+                consecutiveCount: this.detailFailureCount,
+                jobId: candidate?.externalJobId || '',
+            });
+            if (this.detailFailureCount >= 3) {
+                await this.pausePlatform(
+                    `智联详情页连续 ${this.detailFailureCount} 个岗位出现同类元素异常: ${reason}`,
+                    'zhaopin_detail_compatibility_pause',
+                );
+            }
+        }
+
+        async processCandidate(candidate) {
+            this.currentJob = candidate;
+            this.seen.add(candidate.identity);
+            let jobInfo = null;
+            let lastError = null;
+            let lastFailureCode = '';
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    jobInfo = await this.readCandidate(candidate);
+                    if (jobInfo.pageFailure) {
+                        const error = new Error(jobInfo.reason || '智联详情读取失败');
+                        error.failureCode = String(jobInfo.failureCode || '');
+                        error.manualIntervention = Boolean(jobInfo.manualIntervention);
+                        throw error;
+                    }
+                    break;
+                } catch (error) {
+                    lastError = error;
+                    lastFailureCode = String(error.failureCode || '');
+                    this.closeActiveDetail();
+                    if (this.riskReason() || this.platformLimitReason() || error.manualIntervention || jobInfo?.manualIntervention) break;
+                    if (attempt < 3) {
+                        this.logger?.add(`智联详情读取失败 ${attempt}/3，准备重试: ${error}`);
+                        await tools.asyncSleep(1500 * attempt);
+                    }
+                }
+            }
+            if (!jobInfo || jobInfo.pageFailure) {
+                const reason = String(lastError?.message || jobInfo?.reason || lastError || '智联详情读取失败');
+                if (!this.riskReason() && !this.platformLimitReason() && this.isDetailCompatibilityFailure(lastFailureCode)) {
+                    await this.handleDetailCompatibilityFailure(lastFailureCode, reason, candidate);
+                    return;
+                }
+                await this.pausePlatform(this.riskReason() || this.platformLimitReason() || reason, 'zhaopin_detail_failed');
+                return;
+            }
+            this.resetDetailCompatibilityFailures();
+            jobInfo.url = jobInfo.url || candidate.identity;
+            jobInfo.external_job_id = jobInfo.external_job_id || candidate.externalJobId;
+            this.currentJob = { ...candidate, title: jobInfo.title, externalJobId: jobInfo.external_job_id };
+            if (jobInfo.alreadyApplied) {
+                const idempotencyKey = `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`;
+                await this.api.createAction('already_applied', {
+                    idempotencyKey,
+                    transactionState: 'confirmed',
+                    source: 'detail_read',
+                }, jobInfo, 'confirmed');
+                await this.api.event('already_applied', `智联岗位已投递，跳过: ${jobInfo.title}`, 'script', 'info', {
+                    jobId: jobInfo.external_job_id,
+                });
+                this.logger?.add(`已投递，跳过: ${jobInfo.title}`);
+                this.closeActiveDetail(jobInfo.requestId);
+                return;
+            }
+            this.logger?.add(`智联开始评分: ${jobInfo.title}`);
+            const analysis = await this.api.analyzeJob({
+                title: jobInfo.title,
+                salary: jobInfo.salary || '',
+                detail: jobInfo.detail,
+                company: jobInfo.company || '',
+                city: jobInfo.city || '',
+                url: jobInfo.url,
+                external_job_id: jobInfo.external_job_id || '',
+                talked: false,
+            });
+            const score = Number(analysis.total_score || 0);
+            jobInfo.score = score;
+            this.logger?.add(`智联匹配度: ${score}`);
+            await this.api.event('job_analysis_finished', `智联职位分析完成: ${jobInfo.title} / ${score}`, 'script', 'info', {
+                title: jobInfo.title,
+                jobId: jobInfo.external_job_id,
+                score,
+                platformAction: analysis.platform_action || '',
+            });
+            if (!(await this.syncControl(`智联评分完成: ${jobInfo.title}`))) return;
+            const shouldApply = score >= OPTIONS.thread
+                && (analysis.platform_action === 'apply' || (!analysis.platform_action && analysis.recommendation === 'greet'));
+            if (!shouldApply) {
+                await this.api.event('decision_skip', `智联跳过职位: ${jobInfo.title} / ${score}`, 'script', 'info', {
+                    jobId: jobInfo.external_job_id,
+                    score,
+                    recommendation: analysis.recommendation || '',
+                    reason: analysis.match_reason || analysis.blocked_reason || '',
+                });
+                this.closeActiveDetail(jobInfo.requestId);
+                return;
+            }
+            const localLimit = this.applicationLimitReason();
+            if (localLimit) {
+                await this.pausePlatform(localLimit, 'zhaopin_local_apply_limit');
+                return;
+            }
+            await this.waitForApplicationInterval();
+            if (!(await this.syncControl(`智联准备投递: ${jobInfo.title}`))) return;
+            const result = await this.applyThroughDetail(jobInfo, candidate, 1).catch(error => ({
+                success: false,
+                preClickFailure: true,
+                reason: String(error),
+            }));
+            if (result.success) {
+                if (!result.alreadyApplied) {
+                    const counter = this.markApplicationAttempt(true);
+                    this.logger?.add(`智联投递成功，本轮 ${counter.runCount}，今日 ${counter.dailyCount}`);
+                } else {
+                    this.logger?.add(`智联岗位已投递，已同步历史: ${jobInfo.title}`);
+                }
+                this.closeActiveDetail(jobInfo.requestId);
+                return;
+            }
+            if (result.preClickFailure && !result.clicked) {
+                let finalResult = result;
+                for (let attempt = 2; attempt <= 3 && finalResult.preClickFailure && !finalResult.clicked; attempt++) {
+                    await tools.asyncSleep(1200 * attempt);
+                    finalResult = await this.applyThroughDetail(jobInfo, candidate, attempt).catch(error => ({
+                        success: false,
+                        preClickFailure: true,
+                        reason: String(error),
+                    }));
+                }
+                if (finalResult.success) {
+                    if (!finalResult.alreadyApplied) {
+                        const counter = this.markApplicationAttempt(true);
+                        this.logger?.add(`智联投递成功，本轮 ${counter.runCount}，今日 ${counter.dailyCount}`);
+                    } else {
+                        this.logger?.add(`智联岗位已投递，已同步历史: ${jobInfo.title}`);
+                    }
+                    this.closeActiveDetail(jobInfo.requestId);
+                    return;
+                }
+                result.reason = finalResult.reason || result.reason;
+                if (finalResult.clicked) result.clicked = true;
+                if (finalResult.preservePage) result.preservePage = true;
+                if (finalResult.unknown) result.unknown = true;
+            }
+            if (result.clicked) {
+                this.markApplicationAttempt(false);
+                if (result.unknown) {
+                    await this.api.createAction('apply_delivery_unknown', {
+                        idempotencyKey: `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`,
+                        transactionState: 'unknown',
+                        reason: result.reason || '投递指令发出后状态未知',
+                    }, jobInfo, 'unknown').catch(() => null);
+                }
+            }
+            if (!result.clicked) {
+                await this.api.createAction('apply', {
+                    idempotencyKey: `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`,
+                    transactionState: 'failed',
+                    reason: result.reason || '投递前操作失败',
+                }, jobInfo, 'failed').catch(() => null);
+            }
+            const pauseEventType = result.unknown
+                ? 'apply_delivery_unknown'
+                : (result.failureKind === 'platform_limit' ? 'platform_limit_pause'
+                    : (result.failureKind === 'manual_intervention' ? 'manual_intervention_required' : 'zhaopin_apply_failed'));
+            await this.pausePlatform(result.reason || '智联投递失败', pauseEventType, Boolean(result.preservePage || result.clicked));
+            if (!result.preservePage && !result.clicked) this.closeActiveDetail(jobInfo.requestId);
+        }
+
+        async switchOrCooldown(reason) {
+            if (this.urlIndex + 1 < this.urls.length) {
+                this.navigateToUrl(this.urlIndex + 1, reason);
+                return;
+            }
+            const min = Math.max(1, Number(OPTIONS.searchRoundCooldownMinMinutes || 1));
+            const max = Math.max(min, Number(OPTIONS.searchRoundCooldownMinutes || min));
+            const minutes = min + Math.random() * (max - min);
+            this.cooldownUntil = Date.now() + Math.floor(minutes * 60 * 1000);
+            this.writeJson(this.urlStateKey, {
+                index: this.urlIndex,
+                reason: 'all_urls_exhausted',
+                cooldownUntil: this.cooldownUntil,
+                updatedAt: Date.now(),
+            });
+            this.logger?.add(`智联岗位页均已耗尽，冷却 ${minutes.toFixed(1)} 分钟`);
+            await this.api.event('zhaopin_cooldown_started', `智联岗位页均已耗尽，进入冷却`, 'script', 'info', {
+                cooldownUntil: new Date(this.cooldownUntil).toISOString(),
+                urlCount: this.urls.length,
+            });
+            this.scheduleCooldownResume();
+        }
+
+        scheduleCooldownResume() {
+            if (this.cooldownTimer) clearTimeout(this.cooldownTimer);
+            if (!this.cooldownUntil) return;
+            this.cooldownTimer = setTimeout(() => {
+                this.cooldownTimer = null;
+                if (this.pause) return;
+                this.cooldownUntil = 0;
+                this.writeJson(this.urlStateKey, {
+                    index: 0,
+                    reason: 'cooldown_finished',
+                    cooldownUntil: 0,
+                    updatedAt: Date.now(),
+                });
+                this.resetPaginationState(0, 'cooldown_finished');
+                location.href = this.urls[0];
+            }, Math.max(1000, this.cooldownUntil - Date.now()));
+        }
+
+        async loop() {
+            if (this.loopRunning || this.pause) return;
+            this.loopRunning = true;
+            try {
+                if (!this.acquireLease()) return;
+                const risk = this.riskReason();
+                const limit = this.platformLimitReason();
+                if (risk || limit) {
+                    await this.pausePlatform(risk || limit, risk ? 'manual_intervention_required' : 'platform_limit_pause');
+                    return;
+                }
+                if (this.queue.length === 0) {
+                    const foundCount = this.enqueueNewCandidates();
+                    if (foundCount > 0) {
+                        this.listEmptyRetries = 0;
+                    } else if (this.collectCandidates().length === 0 && this.listEmptyRetries < 3) {
+                        this.listEmptyRetries += 1;
+                        this.lastPageOutcome = `waiting_for_cards_${this.listEmptyRetries}`;
+                        this.logger?.add(`智联岗位卡片尚未加载，等待重试 ${this.listEmptyRetries}/3`);
+                        await tools.asyncSleep(1200 * this.listEmptyRetries);
+                        if (!this.pause) setTimeout(() => this.loop(), 0);
+                        return;
+                    }
+                }
+                if (this.queue.length > 0) {
+                    const candidate = this.queue.shift();
+                    if (candidate.element && !candidate.element.isConnected && candidate.inline) {
+                        setTimeout(() => this.loop(), 0);
+                        return;
+                    }
+                    await this.processCandidate(candidate);
+                    if (!this.pause) setTimeout(() => this.loop(), 0);
+                    return;
+                }
+                const mayContinue = await this.turnToNextPage();
+                if (this.queue.length > 0 || mayContinue) {
+                    setTimeout(() => this.loop(), 0);
+                    return;
+                }
+                await this.api.event('zhaopin_pagination_exhausted', `智联岗位页已耗尽: ${this.lastPageOutcome}`, 'script', 'info', this.heartbeatDetail());
+                await this.switchOrCooldown(this.lastPageOutcome);
+            } catch (error) {
+                if (tools.isBackendUnavailableError(error)) {
+                    this.pause = true;
+                    this.running = false;
+                    this.releaseLease();
+                    this.logger?.add(`后端不可用，智联已暂停: ${error}`);
+                } else {
+                    await this.pausePlatform(String(error), 'zhaopin_loop_failed');
+                }
+            } finally {
+                this.loopRunning = false;
+                this.currentJob = null;
+            }
+        }
+
+        async runList() {
+            this.setupBroadcast(this.targets.list);
+            this.broadcast.on(this.types.JOB_INFO, (from, data) => {
+                if (from === this.targets.detail) this.resolvePending(this.types.JOB_INFO, data || {});
+            });
+            this.broadcast.on(this.types.APPLY_RESULT, (from, data) => {
+                if (from === this.targets.detail) this.resolvePending(this.types.APPLY_RESULT, data || {});
+            });
+            this.logger = new Logger(
+                async () => this.api.control('resume'),
+                async () => this.api.control('pause', '用户在智联页面点击暂停'),
+            );
+            this.logger.add('智联招聘脚本已就绪，等待 CLI start');
+            const ready = await this.syncControl('智联岗位列表已连接');
+            if (!this.urls.length) {
+                await this.pausePlatform('未配置有效的智联岗位列表网址', 'zhaopin_config_invalid');
+                return;
+            }
+            const currentIndex = this.currentConfiguredIndex();
+            const savedUrlState = this.safeJson(this.urlStateKey, {});
+            this.cooldownUntil = Number(savedUrlState.cooldownUntil || 0);
+                if (this.cooldownUntil && this.cooldownUntil <= Date.now()) {
+                    this.cooldownUntil = 0;
+                    this.writeJson(this.urlStateKey, { index: 0, reason: 'cooldown_finished', cooldownUntil: 0, updatedAt: Date.now() });
+                    this.resetPaginationState(0, 'cooldown_finished');
+                    location.href = this.urls[0];
+                    return;
+                }
+                this.urlIndex = currentIndex >= 0 ? currentIndex : Number(savedUrlState.index || 0);
+                if (currentIndex < 0 && this.navigateToUrl(Math.min(this.urlIndex, this.urls.length - 1), '进入用户配置的智联岗位页')) return;
+                this.restorePaginationState();
+            if (ready && this.acquireLease()) {
+                this.running = true;
+                this.logger.setPaused(false);
+                if (this.cooldownUntil) this.scheduleCooldownResume();
+                else this.loop();
+            }
+            this.heartbeatTimer = setInterval(async () => {
+                if (this.cooldownUntil && Date.now() >= this.cooldownUntil) {
+                    this.cooldownUntil = 0;
+                    this.writeJson(this.urlStateKey, { index: 0, reason: 'cooldown_finished', cooldownUntil: 0, updatedAt: Date.now() });
+                    this.resetPaginationState(0, 'cooldown_finished');
+                    location.href = this.urls[0];
+                    return;
+                }
+                const shouldRun = await this.syncControl(this.cooldownUntil && Date.now() < this.cooldownUntil
+                    ? '智联岗位页冷却中'
+                    : '智联岗位列表运行中');
+                if (shouldRun && !this.running) {
+                    if (!this.acquireLease()) return;
+                    this.running = true;
+                    this.logger.setPaused(false);
+                    if (this.cooldownUntil && Date.now() < this.cooldownUntil) this.scheduleCooldownResume();
+                    else this.loop();
+                } else if (shouldRun && !this.loopRunning && !(this.cooldownUntil && Date.now() < this.cooldownUntil)) {
+                    this.loop();
+                }
+            }, 3000);
+            window.addEventListener('beforeunload', () => this.releaseLease());
+        }
+
+        async runPassport() {
+            const reason = '智联招聘需要登录，请完成登录后返回岗位页';
+            await this.api.heartbeat('login', 'paused', reason, {
+                version: OPTIONS.scriptVersion,
+                path: location.pathname,
+                humanRequired: true,
+            });
+            await this.api.event('manual_intervention_required', reason, 'script', 'error', {
+                path: location.pathname,
+                humanRequired: true,
+            });
+            await this.api.control('pause', reason).catch(() => null);
+            banner(reason);
+        }
+
+        run() {
+            if (location.hostname === 'passport.zhaopin.com') {
+                this.runPassport();
+                return;
+            }
+            if (tools.isZhaopinListUrl(location.href)) {
+                this.runList();
+                return;
+            }
+            const context = this.detailContext();
+            if (context.requestId) {
+                this.runDetail();
+                return;
+            }
+            this.api.heartbeat('unmatched', 'idle', '智联页面不是配置的岗位列表或受控详情页', {
+                version: OPTIONS.scriptVersion,
+                path: location.pathname,
+            });
+            new Logger(() => {
+                location.href = OPTIONS.zhaopinJobUrls[0] || 'https://www.zhaopin.com/recommend';
+            });
+        }
+    }
+
     if (globalThis.__JOB_SEEKER_TEST_MODE__) {
         globalThis.__JOB_SEEKER_TEST_HOOKS__ = Object.freeze({
             detectInterruptionText: (text) => tools.detectInterruptionText(text),
@@ -6064,9 +7701,21 @@
             sanitizeTelemetryText: (value) => tools.sanitizeTelemetryText(value),
             documentScrollFallbackEligible: (metrics) => tools.documentScrollFallbackEligible(metrics),
             scrollMetricsOutcome: (before, after) => tools.scrollMetricsOutcome(before, after),
+            zhaopinJobIdFromValue: (value) => tools.zhaopinJobIdFromValue(value),
+            zhaopinJobIdentityUrl: (value) => tools.zhaopinJobIdentityUrl(value),
+            isZhaopinListUrl: (value) => tools.isZhaopinListUrl(value),
+            zhaopinActionState: (value) => tools.zhaopinActionState(value),
+            zhaopinPaginationControlState: (meta) => tools.zhaopinPaginationControlState(meta),
+            zhaopinListSourceIdentity: (value) => tools.zhaopinListSourceIdentity(value),
+            zhaopinPageTransitionOutcome: (before, after) => tools.zhaopinPageTransitionOutcome(before, after),
+            randomApplyDelayMs: (min, max, randomValue) => tools.randomApplyDelayMs(min, max, randomValue),
         });
         return;
     }
 
-    new Zhipin().run();
+    if (location.hostname === 'www.zhaopin.com' || location.hostname === 'passport.zhaopin.com') {
+        new Zhaopin().run();
+    } else {
+        new Zhipin().run();
+    }
 })();

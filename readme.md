@@ -1,534 +1,242 @@
 # Job Seeker
 
-Job Seeker 是一个本机运行的 BOSS 直聘辅助工具。它由 Python 本地后端、命令行控制台和 Tampermonkey 油猴脚本组成，用来读取岗位、调用模型评分、记录历史，并在用户确认好配置后自动执行打招呼流程。
+Job Seeker 是一个运行在本机的双平台求职辅助工具，目前支持 BOSS 直聘和智联招聘。系统通过浏览器用户脚本读取岗位信息，使用配置的模型完成岗位评分，并按照平台流程执行后续操作。
 
-当前版本走“双启动器”路线：
+- BOSS 直聘：读取推荐岗位或关键词搜索结果，完成岗位分析、筛选和打招呼。
+- 智联招聘：轮询用户配置的岗位列表，完成岗位分析、筛选和“立即投递”，并验证投递结果。
+- 双平台相互隔离：一个平台因登录、验证码或页面异常暂停时，另一个平台可以继续运行。
+- 统一评分：复用“学历专业、技术栈、项目经验”三项评分标准、阈值和岗位历史。
+- 本地优先：配置、运行记录和岗位历史保存在本机，模型可使用 Ollama 或 OpenAI 兼容接口。
 
-- `start_job_seeker.bat`：人工模式。用于首次配置、编辑简历、生成画像、确认标签、设置模型、查看状态和排查问题。
-- `start_job_seeker_auto.bat`：自动模式。读取已有配置后直接运行，适合日常使用，也适合让 Hermes、Codex 或其他本机 agent 打开。
+> [!IMPORTANT]
+> 智联招聘平台的人机检测和安全校验触发比较频繁。如果系统突然暂停，尤其是只有智联通道暂停，通常可能是程序检测到了登录校验、验证码、安全验证、访问频率限制或页面异常，并不一定是程序故障。请先在浏览器中人工完成验证，确认岗位列表恢复正常后，再执行 `resume zhaopin`。不要连续刷新、反复恢复或尝试绕过平台验证。
 
-项目不再提供 MCP 或 JSON Agent 控制入口。`python main.py agent` 和 `python main.py mcp` 会明确提示不支持。
+## 核心运行策略
 
-> 当前版本只做岗位分析和打招呼流程。普通 BOSS 聊天页不会自动检查官方附件简历请求卡片，也不会自动发送简历附件。简历文件仍用于画像、标签、岗位评分和话术生成。
-
-## 当前核心策略
-
-1. 启动后优先进入 BOSS Web 推荐页 `https://www.zhipin.com/web/geek/jobs`。
-2. 脚本先识别并处理用户自定义推荐 Tab，跳过系统默认“推荐”Tab。
-3. 每个自定义推荐 Tab 默认低频滚动读取 20 次；滚动过程中发现多少新岗位就处理多少。
-4. 推荐 Tab 全部处理后，再进入关键词标签搜索。
-5. 关键词搜索每轮每个标签只搜索一次；所有标签无新岗位后进入 1-5 分钟随机冷却。
-6. 每个推荐源或关键词会低频滚动岗位结果，默认最多 20 次：优先使用独立列表容器，当前页面只有文档级滚动时才安全回退到整页滚动，不做高频刷新。
-7. 模型评分达到阈值、历史未重复、公司未超限后，进入聊天页发送已确认话术。
-8. 聊天页发送会在同一个页面内最多尝试 3 次；仍失败则关闭当前临时页，记录失败并暂停系统。
-9. 如果点击发送后结果无法确认，记录 `greet_delivery_unknown`，关闭当前临时页，跳过该岗位，继续运行。
-10. BOSS “温馨提示/剩余次数”弹窗会自动点击确认后继续；登录过期、验证码、安全验证、访问过频等风险状态不会绕过，会暂停或停止并提示人工处理。
-
-安全边界保持不变：系统不会绕过登录、验证码、Tampermonkey 安装确认、浏览器权限或平台风控。
+1. 系统先读取岗位基本信息和 JD，再通过模型完成三项评分。
+2. 只有达到配置阈值且模型建议继续的岗位，才会进入平台后续流程。
+3. BOSS 和智联分别维护页面、心跳、列表扩展状态、成功计数和暂停原因。
+4. 两个平台的模型请求进入同一队列，默认一次只运行一个评分任务，避免本地设备同时加载多个模型请求。
+5. BOSS 在列表不足时使用自适应滚动；智联处理完当前页后定位并点击“下一页”，通过页码、网址和岗位集合验证翻页结果。
+6. 岗位 URL 会规范化后再用于去重，避免动态查询参数导致同一岗位被重复处理。
+7. 登录失效、验证码、安全验证、访问过频、平台上限或结果无法确认时，系统采用保守暂停策略。
+8. 所有页面操作都会加入随机等待；智联相邻两次投递点击之间默认保持 3～10 秒随机间隔。
 
 ## 快速开始
 
-### 1. 准备环境
+### 运行环境
 
-推荐使用 Windows + Chrome/Edge + Tampermonkey。
+- Windows 10 或 Windows 11
+- Python 3.10 或更高版本
+- Chrome、Edge 或其他支持 Tampermonkey 的 Chromium 浏览器
+- Tampermonkey 扩展
+- Ollama，或可用的 OpenAI 兼容模型接口
 
-本项目启动器会优先使用项目内 `.venv`。如果 `.venv` 不存在，自动启动器会尝试创建并安装依赖。
+项目启动器会优先使用 `.venv`，首次运行时可自动创建虚拟环境并安装依赖。
 
-手动安装依赖：
+### 第一次启动
 
-```powershell
-cd E:\Desktop\goodjobs-main
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+1. 双击 `start_job_seeker.bat`，进入控制台。
+2. 执行 `config`，确认平台、模型、评分阈值和投递参数。
+3. 执行 `resume` 导入或更新简历内容，再用 `profile` 检查识别结果。
+4. 使用 BOSS 时，执行 `tags` 和 `greeting` 配置搜索标签与招呼语。
+5. 执行 `script`，按照提示安装或更新浏览器用户脚本。也可以直接打开：
 
-开发测试依赖：
+   ```text
+   http://127.0.0.1:33333/web_script.user.js
+   ```
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-```
+6. 在浏览器中分别登录需要启用的平台，并打开岗位列表页：
 
-### 2. 首次配置
+   - BOSS 直聘：<https://www.zhipin.com/web/geek/jobs>
+   - 智联招聘：<https://www.zhaopin.com/recommend>
 
-双击：
+7. 安装或更新用户脚本后刷新平台页面，回到控制台执行 `status`，确认对应平台已经连接。
+8. 执行 `start` 开始运行。
 
-```text
-start_job_seeker.bat
-```
+日常使用可以双击 `start_job_seeker_auto.bat`，直接加载已保存配置并进入自动运行模式。
 
-进入 CLI 后，建议按这个顺序处理：
+## 平台流程
 
-```text
-config
-resume
-profile
-tags
-greeting
-status
-doctor
-```
+### BOSS 直聘
 
-常见输入文件位置：
+- 优先读取用户配置的推荐 Tab，再按搜索标签处理关键词岗位。
+- 列表不足时自动滚动加载，达到页面末尾后进入下一来源或随机冷却。
+- 岗位通过评分和历史检查后，进入打招呼流程。
+- 公司联系次数、搜索频率和每日搜索次数均可通过配置限制。
 
-- 简历 PDF 建议放在 `data/resume/`。
-- 粘贴文件路径时不需要带引号。
-- 岗位标签保存在 `data/cache/tags.txt`。
-- 打招呼话术保存在 `data/cache/greeting.json`。
-- 用户画像保存在 `data/cache/user_detail.md`。
+### 智联招聘
 
-### 3. 安装或更新油猴脚本
+- 默认使用 `https://www.zhaopin.com/recommend`，也可以配置多个岗位列表网址并依次轮询。
+- 当前页岗位处理完毕后，系统会点击可用的“下一页”继续读取；按钮禁用或不存在时，才将当前网址判定为耗尽并切换下一个网址。
+- 系统打开岗位详情页或读取同页详情区域，提取 JD 后使用同一套模型评分。
+- 已显示“已投递”的岗位会直接记录并跳过。
+- 通过评分后，只在当前岗位详情区域操作可见且可用的“立即投递”按钮。
+- 简历确认界面只有在默认简历唯一，或简历名称与 `zhaopin_resume_name` 精确匹配且没有补充问题时，才会自动确认。
+- 遇到岗位问卷、附件要求、多份简历无法确认或异常提示时，仅暂停智联通道，等待人工处理。
+- 单个岗位缺少预期详情元素时会跳过当前岗位；连续 3 个岗位出现同类元素异常时才暂停智联，避免偶发失效岗位中断整轮任务。
+- 点击投递后，必须观察到按钮变为“已投递”才记为成功。结果无法确认时会保留详情页、记录未知状态并暂停智联，避免重复点击。
 
-CLI 启动后会提供脚本地址：
+## 常用配置
 
-```text
-http://127.0.0.1:33333/web_script.user.js
-```
+在控制台执行 `config` 可以查看和修改配置。下面列出日常最常用的选项。
 
-复制地址时不要复制多余标点。Tampermonkey 打开安装页后，点击“安装”或“更新”。
+### 平台与投递
 
-每次修改 `web_script.js` 后，都需要重新打开这个地址更新浏览器里的油猴脚本。只改本地文件但不更新脚本，浏览器仍会运行旧逻辑。
-
-如果日志里还出现 README 没有描述的旧文案，通常说明 Tampermonkey 仍在运行旧版本。先在 CLI 里输入 `script`，重新打开安装地址，确认脚本版本号已更新，再刷新 BOSS 页面。
-
-### 4. 打开 BOSS 页面
-
-推荐打开：
-
-```text
-https://www.zhipin.com/web/geek/jobs
-```
-
-这个页面包含系统推荐和用户自定义推荐 Tab。当前脚本会跳过系统默认“推荐”，优先处理用户自己设置的岗位推荐 Tab。
-
-关键词搜索页也能使用：
-
-```text
-https://www.zhipin.com/web/geek/job
-```
-
-但如果本轮推荐源还没处理完，脚本会先跳回推荐页。关键词搜索进入冷却后，脚本会补充扫描一轮用户自定义推荐源；补充扫描完成后继续等待关键词冷却结束。
-
-### 5. 开始运行
-
-人工模式中输入：
-
-```text
-start
-```
-
-CLI 会确认岗位标签和运行配置，然后允许脚本运行。
-
-日常直接运行可以双击：
-
-```text
-start_job_seeker_auto.bat
-```
-
-自动模式会使用已保存配置，不打开编辑器、不询问 `start`，但仍不会绕过登录、验证码、脚本安装确认和平台风控。
-
-## 模型配置
-
-默认本地模型：
-
-```text
-ollama / qwen3:1.7b
-```
-
-小模型建议关闭思考功能，尤其是岗位评分。当前默认：
-
-```json
-"disable_model_thinking": true
-```
-
-思考策略以用户配置为准：
-
-- `disable_model_thinking=true`：系统会尽量关闭思考；如果模型不支持 `think/thinking/reasoning` 控制参数，会自动移除该参数继续运行，并用系统提示词要求模型只输出最终答案。
-- `disable_model_thinking=false`：支持思考模式的模型会按思考模式运行；如果模型不支持思考参数，系统会自动移除该参数继续运行。
-- 不论模型是否支持思考控制，都不应该因为这个参数导致岗位评分链路直接不可用。
-
-如果使用 OpenAI 兼容接口，比如火山引擎、豆包、DeepSeek、通义千问兼容 API，可以在人工模式 `config` 中设置：
-
-- `model_provider=openai`
-- `openai_api_base`
-- `think_model`
-- `external_model_profile`
-
-火山引擎要特别注意 Base URL 和模型名必须属于同一种接入方式：
-
-| 接入方式 | `openai_api_base` | 模型名示例 |
+| 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
-| 按量在线推理 | `https://ark.cn-beijing.volces.com/api/v3` | `deepseek-v3-2-251201` |
-| Coding Plan | `https://ark.cn-beijing.volces.com/api/coding/v3` | `deepseek-v3.2` 或 `ark-code-latest` |
+| `boss_enabled` | 是否启用 BOSS 通道 | `true` |
+| `zhaopin_enabled` | 是否启用智联通道 | `true` |
+| `zhaopin_job_urls` | 智联岗位列表网址，可配置多个 | `https://www.zhaopin.com/recommend` |
+| `zhaopin_resume_name` | 自动确认时要求精确匹配的智联简历名称；留空时仅接受唯一默认简历 | 空 |
+| `zhaopin_apply_delay_min_seconds` | 智联投递最小间隔 | `3` |
+| `zhaopin_apply_delay_max_seconds` | 智联投递最大间隔 | `10` |
+| `zhaopin_max_applications_per_run` | 智联单次运行投递上限，`0` 表示关闭限制 | `0` |
+| `zhaopin_max_applications_per_day` | 智联每日投递上限，`0` 表示关闭限制 | `0` |
+| `max_contacts_per_company` | BOSS 同一公司的联系次数上限 | `1` |
 
-如果 `/models` 能看到模型，但真实生成返回 `InvalidEndpointOrModel.NotFound`，通常不是脚本问题，而是当前 Key 对该 Chat 模型/Endpoint 没有调用权限，或把 Coding Plan 与按量在线推理的 Base URL/模型名混用了。此时先用 `doctor` 看模型真实生成检查，再确认火山控制台里的开通方式、余额和权限。
+建议首次使用智联时设置较小的单次和每日投递上限，确认页面行为稳定后再逐步调整。
 
-### API Key 建议
+### 模型与评分
 
-推荐使用环境变量：
+| 配置项 | 说明 | 默认值 |
+| --- | --- | --- |
+| `model_provider` | 模型来源，例如 Ollama 或 OpenAI 兼容接口 | `ollama` |
+| `ollama_host` | Ollama 服务地址 | `http://127.0.0.1:11434` |
+| `openai_api_base` | OpenAI 兼容接口地址 | `https://api.openai.com/v1` |
+| `think_model` | 岗位评分使用的模型 | `qwen3:1.7b` |
+| `score_threshold` | 进入后续流程的最低总分 | `70` |
+| `disable_model_thinking` | 是否请求关闭模型思考模式 | `true` |
+| `model_max_concurrency` | 模型最大并发数 | `1` |
+| `show_model_reasoning` | 是否在控制台显示模型评分说明 | `false` |
+
+使用需要密钥的兼容接口时，可以在启动前设置环境变量：
 
 ```powershell
 $env:OPENAI_API_KEY="你的密钥"
 ```
 
-`OPENAI_API_KEY` 优先级高于 `data/config.json`。当环境变量存在时，程序不会把环境变量中的 Key 写回配置文件，`/status` 和 `/config` 也只会显示“已配置/来源”，不会返回明文。
+默认并发数为 1。需要提高到 2 时，请先执行 `doctor concurrency`；该命令会使用当前模型配置发起两次轻量真实请求，通过后再由用户确认是否启用并发。
 
-如果曾经把真实 Key 写入 `data/config.json`，建议到服务商控制台轮换旧 Key，再迁移到环境变量。
+### 列表扩展与频率
 
-## 搜索与推荐策略
-
-### 用户自定义推荐 Tab
-
-当前脚本会在 `/web/geek/jobs` 页面扫描推荐 Tab：
-
-- 固定系统 Tab，如“推荐”“系统推荐”“为你推荐”，会被跳过。
-- 系统推荐旁边的用户自定义 Tab 会被识别为推荐源。
-- `地图`、`筛选`、`附近`、`求职类型`、`薪资待遇`、`立即沟通`、职位卡片内容等不会被当作推荐源。
-- 真实岗位方向，例如 `自然语言处理算法(北京)`、`大模型算法(杭州)`，会被作为自定义推荐源处理。
-
-每个自定义推荐 Tab 默认不按岗位数量截断，而是默认低频滚动读取 20 次；滚动过程中发现多少新岗位就处理多少：
-
-```json
-"search_result_scroll_rounds": 20,
-"preferred_feed_max_jobs_per_tab": 0
-```
-
-`preferred_feed_max_jobs_per_tab=0` 表示不限制单个 Tab 的处理数量。仍受历史去重、搜索节流和平台风控限制。
-
-滚动目标采用自适应策略：如果 BOSS 提供独立的岗位列表滚动容器，脚本优先滚动该容器；如果岗位卡片位于普通文档流，且当前确实是 `/web/geek/job` 或 `/web/geek/jobs` 岗位页，则使用 `document.scrollingElement`。详情页、聊天页、登录/验证码/安全验证或访问过频状态不会启用整页滚动。`status` 和 `doctor` 会显示滚动模式、目标、轮次、位置和岗位数量变化。
-
-### 关键词搜索
-
-推荐 Tab 处理完后，脚本进入关键词标签搜索。标签来自：
-
-```text
-data/cache/tags.txt
-```
-
-当前默认策略：
-
-| 配置 | 默认值 | 说明 |
+| 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
-| `search_round_cooldown_min_minutes` | `1` | 一轮关键词全部无新岗位后的最短冷却分钟数 |
-| `search_round_cooldown_minutes` | `10` | 一轮关键词全部无新岗位后的最长冷却分钟数 |
-| `tag_search_delay_seconds` | `20` | 标签切换最小等待秒数 |
-| `tag_search_delay_max_seconds` | `45` | 标签切换最大等待秒数 |
-| `max_search_submissions_per_hour` | `6` | 每小时最多提交关键词搜索次数 |
-| `max_search_submissions_per_day` | `30` | 每日最多提交关键词搜索次数 |
-| `search_result_scroll_rounds` | `20` | 每个推荐源或关键词最多低频滚动读取次数 |
+| `search_result_scroll_rounds` | 单个岗位来源最多扩展轮次；BOSS 表示滚动次数，智联表示翻页次数 | `20` |
+| `preferred_feed_mode` | BOSS 推荐来源模式 | `all_custom_tabs` |
+| `preferred_feed_max_jobs_per_tab` | 每个推荐 Tab 的岗位上限，`0` 表示不限 | `0` |
+| `search_round_cooldown_min_minutes` | 搜索来源耗尽后的最小冷却时间 | `1` |
+| `search_round_cooldown_minutes` | 搜索来源耗尽后的最大冷却时间 | `5` |
+| `tag_search_delay_seconds` | BOSS 标签切换最小等待 | `20` |
+| `tag_search_delay_max_seconds` | BOSS 标签切换最大等待 | `45` |
+| `max_search_submissions_per_hour` | BOSS 每小时搜索提交上限 | `6` |
+| `max_search_submissions_per_day` | BOSS 每日搜索提交上限 | `30` |
 
-冷却期间脚本仍在线，不提交关键词搜索、不高频刷新页面。进入关键词冷却时会先补充扫描一轮用户自定义推荐源，补充完成后再静默等待冷却结束。`status` 和 `doctor` 会显示冷却状态。
+降低频率、增加随机等待通常能减少平台安全校验。不要将间隔设置得过短。
 
-### APP 推荐和 Web 推荐不同
+## 常用命令
 
-BOSS 手机 APP 推荐流和 Web 端 `/web/geek/jobs` 不是完全相同的入口。脚本不会模拟 APP 推荐接口，也不会调用移动端接口。建议在 BOSS 网页端多设置几个清晰的自定义推荐 Tab，再用关键词搜索补充。
-
-## 打招呼策略
-
-当前版本仍使用本地已确认话术在聊天页发送消息。用户需要先在人工模式用 `greeting` 命令生成、编辑并确认话术。
-
-打招呼流程：
-
-1. 详情页读取岗位。
-2. 模型评分。
-3. 达到阈值后请求沟通入口或打开聊天页。
-4. 聊天页读取已确认话术。
-5. 写入输入框。
-6. 点击发送按钮；如果按钮不可用，会尝试使用 Enter 发送。
-7. 检查聊天记录或输入框状态，判断发送是否成功。
-
-当前重试规则：
-
-| 步骤 | 策略 |
+| 命令 | 用途 |
 | --- | --- |
-| BOSS “温馨提示”剩余次数弹窗 | 自动识别并点击“好”，随后继续当前流程 |
-| 聊天页打开失败 | 尚未点击发送时可有限重试 |
-| 输入框未出现 | 在当前聊天页等待并重试 |
-| 写入失败 | 当前聊天页最多 3 次发送尝试 |
-| 发送按钮不可用 | 尝试 Enter 发送 |
-| 发送结果确认失败 | 记录 `greet_delivery_unknown`，关闭临时页，跳过当前岗位，继续下一个 |
-| 连续 3 次发送失败 | 暂停系统并提示人工查看 |
-| 登录/验证码/访问过频 | 暂停或停止，不继续自动化 |
-| 页面身份不一致 | 暂停并保留页面，避免发错聊天对象 |
-
-这样做的取舍是：优先保持整体运行连续，不因为单个岗位发送状态不明就停住；同时用 `greet_delivery_unknown` 保留证据，避免把未知结果当作成功计数。
-
-## 弹窗、失败与风控
-
-当前版本不再设置“本轮最多打招呼数量”或“每日自动打招呼安全上限”。成功次数只作为状态统计展示，不作为自动停止条件。
-
-BOSS 约 120 次后可能出现“温馨提示”弹窗，例如：
-
-```text
-您今天已与120位BOSS沟通，还剩30次沟通机会哦
-```
-
-脚本会优先识别这类居中弹窗，并点击同一弹窗内的 `好` / `确定` / `知道了`，确认后继续运行。真正到达平台上限或聊天页异常时，通常会表现为输入框、发送按钮或发送确认连续失败；脚本会完成首次 + 2 次重试，总计 3 次失败后暂停系统，避免无限开页或无限报错。
-
-有时 BOSS 会把“温馨提示”直接放在打招呼入口接口响应里，而不是渲染成页面弹窗。如果接口同时返回聊天入口，脚本会记录提醒并继续打开聊天页；如果没有聊天入口，也没有可点击弹窗，才会暂停并提示人工检查。
-
-验证码、登录过期、访问异常、操作过频不属于正常弹窗，脚本不会尝试绕过。
-
-## 常用 CLI 命令
-
-| 命令 | 作用 |
-| --- | --- |
-| `status` | 查看系统状态、脚本连接、计数、冷却、模型状态 |
-| `doctor` | 检查依赖、模型、脚本版本、数据库大小和风险项 |
-| `config` | 分组配置模型、搜索风控、自动启动时间等 |
+| `status` | 查看全局状态、双平台连接、BOSS 滚动、智联翻页和模型队列 |
+| `doctor` | 检查配置、模型、数据库和浏览器脚本连接 |
+| `doctor concurrency` | 测试当前模型是否适合并发评分 |
+| `config` | 查看或修改系统配置 |
 | `resume` | 导入或更新简历 |
-| `profile` | 生成或编辑用户画像 |
-| `tags` | 编辑岗位标签 |
-| `greeting` | 生成、编辑、确认打招呼话术 |
-| `session` | 修改本轮标签和搜索策略 |
-| `start` | 开始或继续运行 |
-| `pause` | 暂停运行 |
-| `stop` | 停止当前轮次 |
-| `logs` | 查看近期日志 |
-| `history` | 查看岗位历史 |
-| `summary` | 查看当前运行汇总 |
-| `script` | 查看油猴脚本安装/更新地址 |
-| `backup` | 备份配置、缓存和数据库 |
-| `exit` | 退出 CLI |
+| `profile` | 查看从简历提取的求职画像 |
+| `tags` | 配置 BOSS 搜索标签 |
+| `greeting` | 配置 BOSS 招呼语 |
+| `session` | 修改本轮岗位标签和搜索策略 |
+| `start` | 启动或继续全局任务 |
+| `resume-run` | `start` 的兼容别名 |
+| `pause` | 暂停全局任务 |
+| `stop` | 停止全局任务 |
+| `pause boss` / `resume boss` / `stop boss` | 单独控制 BOSS 通道 |
+| `pause zhaopin` / `resume zhaopin` / `stop zhaopin` | 单独控制智联通道 |
+| `logs` | 查看最近日志 |
+| `history` | 查看岗位处理历史 |
+| `summary` | 查看本次运行摘要 |
+| `report` | 导出诊断报告 |
+| `backup` | 备份本地数据库 |
+| `script` | 查看用户脚本安装地址和版本 |
+| `actions` | 处理需要人工确认的待办动作 |
+| `help` | 查看完整命令帮助 |
+| `quit` | 退出控制台 |
 
-`resume-run` 是 `start` 的兼容别名。
+裸 `resume` 用于管理简历；恢复全局任务请使用 `start`，恢复单个平台请使用 `resume boss` 或 `resume zhaopin`。
 
-## 自动模式与定时启动
+## 暂停与恢复
 
-自动模式入口：
+| 情况 | 系统行为 | 建议处理 |
+| --- | --- | --- |
+| 某平台登录失效、验证码、安全验证或访问过频 | 只暂停对应平台 | 人工处理页面后执行 `resume boss` 或 `resume zhaopin` |
+| 智联点击后无法确认是否已投递 | 暂停智联并保留详情页 | 人工核对投递记录，不要再次点击；确认后再恢复智联 |
+| 岗位问卷、附件要求或简历无法唯一确认 | 暂停智联 | 人工完成或跳过当前岗位，再恢复智联 |
+| 一个岗位列表确认耗尽 | 切换下一个来源；全部耗尽时进入冷却 | 等待冷却结束即可 |
+| 模型连续失败、后端中断或执行全局暂停 | 两个平台同时停止继续操作 | 先运行 `doctor` 排查，再恢复全局任务 |
 
-```text
-start_job_seeker_auto.bat
-```
+执行 `start` 恢复全局任务时，不会自动解除平台安全暂停。人工处理完成后，仍需显式执行对应平台的恢复命令。
 
-它会尽量自修复：
+## 使用建议
 
-- `.venv` 不存在时自动创建。
-- Python 依赖缺失时自动安装 `requirements.txt`。
-- Ollama 已安装但未运行时尝试启动。
-- 默认本地模型缺失时尝试拉取 `qwen3:1.7b`。
-- 已有健康 Job Seeker 服务占用端口时进入 attach 逻辑，不重复启动后端。
+- 第一次运行智联投递时，请在浏览器旁观察至少一次完整流程，确认岗位详情、简历选择和“已投递”状态符合预期。
+- 智联人机检测较频繁，出现暂停时先检查浏览器页面，不要立即连续执行恢复命令。
+- 投递结果未知时，先到智联投递记录中人工核对，避免重复投递。
+- 初次使用建议设置保守的投递上限和更长的随机间隔。
+- 保持 BOSS、智联列表页已登录；不要同时手动打开大量相同平台的调度页面。
+- 项目更新后，执行 `script` 检查用户脚本版本，并在 Tampermonkey 中更新后刷新平台页面。
+- 修改模型来源、地址或模型名称后，模型并发会回到 1；需要并发时重新执行 `doctor concurrency`。
+- 大幅调整配置或升级前执行 `backup`，保留数据库备份。
+- 诊断报告可能包含岗位、公司和本地配置摘要，对外发送前请先检查内容。
 
-不可自动越过的问题会进入 blocked/paused，而不是静默失败：
+## 常见情况
 
-- 缺简历。
-- 模型不可用。
-- 油猴脚本未安装或未连接。
-- BOSS 未登录。
-- 验证码、安全验证、平台风控。
-- Tampermonkey 权限确认。
+### 智联通道经常暂停
 
-定时启动可在人工模式 `config` 中设置：
-
-- `auto_start_enabled`
-- `auto_start_time`
-
-注意：定时启动不是 Windows 计划任务。自动启动器必须被打开后，才会等待到设定时间再运行。
-
-## 状态与日志
-
-本地 API：
-
-```text
-http://127.0.0.1:33333
-```
-
-常用观察接口：
+这是最常见的情况。先查看智联页面是否出现登录页、滑块、短信验证、安全提示、访问频率提示或异常弹窗。完成人工验证后返回配置的岗位列表页并刷新，再执行：
 
 ```text
-/status
-/logs
-/history
+status
+resume zhaopin
 ```
 
-本地 API 默认只允许 loopback 本机访问，不面向局域网远程控制。高成本接口带有轻量限流。
+如果投递结果显示为未知，必须先人工核对，不能直接重复投递。
 
-## 数据与文件位置
+### 平台显示未连接或脚本离线
 
-| 路径 | 说明 |
-| --- | --- |
-| `data/config.json` | 本地配置，不提交 Git |
-| `data/resume/` | 简历文件目录 |
-| `data/cache/tags.txt` | 岗位标签 |
-| `data/cache/greeting.json` | 打招呼话术 |
-| `data/cache/user_detail.md` | 用户画像 |
-| `data/app.db` | SQLite 本地数据库 |
-| `data/backups/` | 数据库迁移或手动备份 |
-| `web_script.js` | 油猴脚本源码 |
-| `start_job_seeker.bat` | 人工启动器 |
-| `start_job_seeker_auto.bat` | 自动启动器 |
+1. 确认后端控制台仍在运行。
+2. 执行 `script` 检查安装地址和版本。
+3. 确认 Tampermonkey 已启用该脚本。
+4. 刷新对应平台页面，等待几秒后再次执行 `status`。
 
-`data/`、`.venv/`、`node_modules/`、缓存和数据库都不会提交到 Git。
+### 模型评分为 0 或持续失败
 
-## 数据库与保留策略
+执行 `doctor` 检查模型服务地址、模型名称和密钥。使用 Ollama 时，确认 Ollama 已启动且配置的模型已经下载；使用兼容接口时，确认接口地址和 `OPENAI_API_KEY` 有效。
 
-SQLite 使用 schema 版本管理。发生结构升级时，程序会先在 `data/backups/` 创建数据库备份，再执行迁移。
+### 岗位列表没有继续加载或翻页
 
-schema v5 会在备份后压缩完全重复的模型兼容事件、脱敏历史事件 URL，并回收 SQLite 空间；不会删除岗位、动作或打招呼历史。服务启动时还会把超过 10 分钟且未正常结束的旧任务标记为 `interrupted`，避免历史面板长期显示多个伪“运行中”任务。
+先执行 `status`。BOSS 重点查看滚动模式、目标、轮次和岗位数量变化；智联重点查看当前页码、翻页次数、下一页结果和翻页前后的岗位数量。如果智联页面能够人工点击下一页但系统没有翻页，优先更新用户脚本并刷新页面；如果已经显示下一页禁用、列表耗尽或进入冷却，则属于正常状态。
 
-启动服务时会低频清理运行事件：
+### 详情页没有打开
 
-- 普通状态事件保留 7 天。
-- 错误、人工处理、模型和打招呼结果保留 30 天。
-- 岗位联系历史长期保留。
+检查浏览器是否拦截了新标签页或弹窗，并允许 BOSS、智联页面打开岗位详情。智联结果未知时，系统会有意保留详情页供人工核对。
 
-`resume_sent` 等旧字段只用于历史兼容。当前版本不会自动发送简历附件。
+### 端口 `33333` 被占用
 
-## 常见问题
+关闭重复启动的 Job Seeker 控制台后重新运行启动器。如果端口仍被占用，使用 `doctor` 查看占用提示，再关闭对应的旧进程。
 
-### 启动停在“岗位评分版本”
+## 状态、日志与备份
 
-当前版本模型连通性检查已经改为后台执行。CLI 会先显示状态面板，模型状态显示“检查中”，模型返回后再弹出“模型已连接”或失败提示。
+控制台运行后可以在本机查看：
 
-### 推荐 Tab 没识别或识别错
+- 状态：<http://127.0.0.1:33333/status>
+- 日志：<http://127.0.0.1:33333/logs>
+- 岗位历史：<http://127.0.0.1:33333/history>
 
-先确认浏览器里油猴脚本已经更新到当前版本。脚本只识别明显的用户自定义岗位推荐 Tab，不识别 `地图`、筛选项、导航项、职位卡片内容。如果仍然识别异常，请贴 CLI 中 `发现用户自定义推荐 Tab` 的日志。
-
-### 聊天页进入了但没发消息
-
-当前版本会在同一个聊天页内尝试 3 次发送。仍失败时会关闭当前临时页、记录失败并暂停系统，避免继续制造未发送会话。只有在已经点击发送但无法确认结果时，才会记录 `greet_delivery_unknown` 并跳过当前岗位继续运行，避免重复发送同一条消息。
-
-如果聊天列表中已经留下很多未发送会话，建议先人工清理或确认话术、输入框和发送按钮是否正常，再继续扩大运行数量。
-
-### 端口 33333 被占用
-
-查看占用：
-
-```powershell
-netstat -ano | findstr :33333
-```
-
-结束指定 PID：
-
-```powershell
-taskkill /PID <PID> /F
-```
-
-不要盲目结束不认识的进程。确认是旧的 Job Seeker 后再处理。
-
-### 油猴脚本离线
-
-检查：
-
-- CLI 或自动启动器窗口仍在运行。
-- 已安装或更新 `http://127.0.0.1:33333/web_script.user.js`。
-- BOSS 页面已刷新。
-- Tampermonkey 没有禁用该脚本。
-- 脚本 `@connect` 权限已允许 `127.0.0.1` 和 `localhost`。
-
-### 模型评分全是 0
-
-常见原因：
-
-- 模型接口不可用。
-- 小模型输出空内容。
-- 思考内容进入正文导致 JSON 解析失败。
-- API Key 或模型名称配置错误。
-
-建议：
-
-- 运行 `doctor`。
-- 小模型优先关闭思考。
-- Ollama 默认使用 `qwen3:1.7b`。
-- OpenAI 兼容接口确认 `openai_api_base`、`think_model` 和 `external_model_profile`。
-
-### 为什么所有标签无新岗位后不继续刷新
-
-这是账号安全策略。旧策略会每隔几秒循环搜索，容易触发风控。当前版本默认每次随机冷却 1-5 分钟；冷却结束后会先回到用户自定义推荐源，再进入关键词搜索。
-
-### 低频滚动没有加载新岗位
-
-脚本会优先滚动 BOSS 独立岗位列表；当前页面没有独立容器时，会在确认岗位页、岗位卡片和可滚动文档都存在后回退到整页滚动。先输入 `script` 更新油猴脚本并刷新 BOSS 页面，再用 `status` 或 `doctor` 查看：
-
-- `scrollMode=element`：正在滚动独立岗位容器。
-- `scrollMode=document`：正在滚动当前岗位页文档。
-- `lastScrollOutcome=jobs_or_height_changed`：岗位集合或页面高度已经变化。
-- `lastScrollOutcome=exhausted`：已确认滚动到底，不会无限重试。
-
-如果仍出现 `search_scroll_target_missing`，通常是浏览器仍运行旧脚本、页面没有岗位卡片，或筛选/风控弹层正在遮挡页面。诊断日志不会保存 `securityId` 等敏感查询参数。
-
-### 后端关闭后浏览器还在跑
-
-当前版本遇到 `/jobs/analyze background shutdown`、后端断开或连接拒绝，会让油猴脚本进入暂停/错误状态并释放搜索锁，不再继续开详情页。运行时请保持 CLI 或自动启动器窗口打开；要关闭时先输入 `pause` 或 `stop`。
-
-### 公司上限误判
-
-旧版本曾把“职位名 + 薪资”误写入公司字段，可能导致同公司上限误判。当前版本启动时会轻量清理这类历史脏字段，只清空明显错误的公司名，不影响真实公司历史。
-
-### 手机 APP 有岗位，但脚本没有
-
-APP 推荐流和 Web 推荐/搜索不是同一个入口。当前脚本只处理 Web 端 `/web/geek/jobs` 的用户自定义推荐 Tab 和关键词搜索，不模拟 APP 推荐算法。
-
-## 验证命令
-
-提交或更新前建议执行：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\validate.py
-```
-
-该入口会依次运行 Pytest、Node userscript 测试、`node --check`、项目自检、依赖一致性和 `git diff --check`，不依赖可能被 PowerShell 执行策略拦截的 `npm.ps1`。也可以单独执行 `node --test tests\userscript_policy.test.cjs`。
-
-Python 编译检查：
-
-```powershell
-$env:PYTHONDONTWRITEBYTECODE='1'
-Get-ChildItem -Path . -Recurse -Filter *.py |
-  Where-Object { $_.FullName -notmatch '\\.venv\\|\\__pycache__\\' } |
-  ForEach-Object { .\.venv\Scripts\python.exe -m py_compile $_.FullName }
-```
-
-PowerShell 启动器解析检查：
-
-```powershell
-[System.Management.Automation.Language.Parser]::ParseFile(
-  "scripts/start_job_seeker.ps1",
-  [ref]$null,
-  [ref]$null
-) | Out-Null
-
-[System.Management.Automation.Language.Parser]::ParseFile(
-  "scripts/start_job_seeker_auto.ps1",
-  [ref]$null,
-  [ref]$null
-) | Out-Null
-```
-
-Git 空白检查：
-
-```powershell
-git diff --check
-```
-
-## 项目结构
-
-```text
-goodjobs-main/
-├─ main.py                         # FastAPI 本地 API 和入口
-├─ cli_console.py                  # 人工 CLI、自动模式和启动控制
-├─ config.py                       # 配置加载、保存、环境变量 Key 支持
-├─ core.py                         # 岗位分析和历史去重
-├─ model_stream.py                 # Ollama/OpenAI 兼容模型调用
-├─ database.py                     # SQLite schema、迁移、事件和历史
-├─ runtime_state.py                # 运行状态、脚本心跳、模型状态
-├─ greeting_service.py             # 打招呼话术生成和保存
-├─ resume_service.py               # 简历解析
-├─ cache.py                        # 简历、画像、标签缓存
-├─ schema.py                       # API schema
-├─ tools.py                        # 通用工具和隐私脱敏
-├─ web_script.js                   # Tampermonkey 油猴脚本
-├─ start_job_seeker.bat            # 人工启动器
-├─ start_job_seeker_auto.bat       # 自动启动器
-├─ scripts/
-│  ├─ check_deps.py                # 启动器依赖检查
-│  ├─ self_check.py                # 项目自检
-│  ├─ start_job_seeker.ps1         # 人工启动器 PowerShell 实现
-│  └─ start_job_seeker_auto.ps1    # 自动启动器 PowerShell 实现
-├─ tests/                          # Python 和 userscript 策略测试
-├─ requirements.txt                # 运行依赖
-├─ requirements-dev.txt            # 测试依赖
-└─ package.json                    # userscript Node 测试入口
-```
+日常排查优先使用 `status`、`logs` 和 `doctor`。需要向开发者反馈问题时，可以使用 `report` 导出诊断信息；升级或大幅修改配置前使用 `backup` 保存本地数据。
 
 ## 致谢
 
-本项目基于 [goodjobs](https://github.com/gbcdby/goodjobs) 修改和再发布，原项目采用 MIT License。当前版本围绕本地人工配置、自动启动器、推荐 Tab 岗位发现、保守搜索频率和稳定打招呼流程做了进一步整理。
+感谢 [goodjobs](https://github.com/gbcdby/goodjobs) 原项目及贡献者。本项目在其基础上持续完善双平台岗位分析与自动化流程，并遵循 MIT License。
+
+同时感谢 Tampermonkey、FastAPI、Ollama 及相关开源项目提供的基础能力。

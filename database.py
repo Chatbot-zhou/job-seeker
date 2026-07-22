@@ -5,16 +5,18 @@ import re
 import shutil
 import sqlite3
 import threading
+import unicodedata
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from config import Config, ensure_data_dirs
 from tools import now_iso, redact_sensitive_urls, sanitize_log_value
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _MIGRATION_RESULTS: dict[str, dict[str, Any]] = {}
@@ -141,6 +143,57 @@ def _migrate_v5_event_hardening(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def normalize_job_identity(company: Any, title: Any) -> str:
+    def clean(value: Any) -> str:
+        text = unicodedata.normalize("NFKC", str(value or "")).lower()
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+
+    normalized_company = clean(company)
+    normalized_title = clean(title)
+    if not normalized_company or not normalized_title:
+        return ""
+    return f"{normalized_company}|{normalized_title}"
+
+
+def fallback_job_identity(platform: Any, external_job_id: Any, url: Any) -> str:
+    platform_name = str(platform or "boss").strip().lower() or "boss"
+    job_id = str(external_job_id or "").strip()
+    if job_id:
+        return f"{platform_name}:id:{job_id}"
+    raw_url = str(url or "").strip()
+    if raw_url:
+        try:
+            parsed = urlsplit(raw_url)
+            safe_url = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
+        except ValueError:
+            safe_url = raw_url.split("?", 1)[0].split("#", 1)[0]
+        if safe_url:
+            return f"{platform_name}:url:{safe_url}"
+    return ""
+
+
+def _migrate_v6_platform_jobs(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute("SELECT id, company, title, platform, external_job_id, url, identity_key FROM jobs").fetchall()
+    backfilled = 0
+    for row in rows:
+        platform = str(row["platform"] or "boss")
+        identity_key = (
+            str(row["identity_key"] or "").strip()
+            or normalize_job_identity(row["company"], row["title"])
+            or fallback_job_identity(platform, row["external_job_id"], row["url"])
+        )
+        conn.execute(
+            "UPDATE jobs SET platform = COALESCE(NULLIF(platform, ''), 'boss'), identity_key = ? WHERE id = ?",
+            (identity_key, int(row["id"])),
+        )
+        backfilled += 1
+    conn.execute("UPDATE actions SET platform = COALESCE(NULLIF(platform, ''), 'boss')")
+    return {
+        "to_version": 6,
+        "platform_jobs_backfilled": backfilled,
+    }
+
+
 def last_migration_result() -> dict[str, Any]:
     return dict(_MIGRATION_RESULTS.get(str(Path(Config.app_db_name).resolve()), {}))
 
@@ -191,6 +244,11 @@ def init_db() -> None:
                     resume_sent INTEGER DEFAULT 0,
                     hr_replied INTEGER DEFAULT 0,
                     error TEXT,
+                    platform TEXT DEFAULT 'boss',
+                    external_job_id TEXT DEFAULT '',
+                    identity_key TEXT DEFAULT '',
+                    application_state TEXT DEFAULT '',
+                    applied INTEGER DEFAULT 0,
                     run_id TEXT DEFAULT '',
                     created_at TEXT,
                     updated_at TEXT
@@ -209,6 +267,8 @@ def init_db() -> None:
                     payload_json TEXT,
                     result_json TEXT,
                     note TEXT,
+                    platform TEXT DEFAULT 'boss',
+                    idempotency_key TEXT DEFAULT '',
                     run_id TEXT DEFAULT '',
                     created_at TEXT,
                     updated_at TEXT
@@ -230,7 +290,14 @@ def init_db() -> None:
                 """
             )
             _ensure_column(conn, "jobs", "run_id TEXT DEFAULT ''")
+            _ensure_column(conn, "jobs", "platform TEXT DEFAULT 'boss'")
+            _ensure_column(conn, "jobs", "external_job_id TEXT DEFAULT ''")
+            _ensure_column(conn, "jobs", "identity_key TEXT DEFAULT ''")
+            _ensure_column(conn, "jobs", "application_state TEXT DEFAULT ''")
+            _ensure_column(conn, "jobs", "applied INTEGER DEFAULT 0")
             _ensure_column(conn, "actions", "run_id TEXT DEFAULT ''")
+            _ensure_column(conn, "actions", "platform TEXT DEFAULT 'boss'")
+            _ensure_column(conn, "actions", "idempotency_key TEXT DEFAULT ''")
             _ensure_column(conn, "events", "run_id TEXT DEFAULT ''")
             conn.execute(
                 """
@@ -254,12 +321,23 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_company_greeted ON jobs(company, greeted)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_run_id ON jobs(run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_platform_identity ON jobs(platform, identity_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_identity_key ON jobs(identity_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_platform_applied ON jobs(platform, applied)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_status_created_at ON actions(status, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_run_id ON actions(run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_platform_status ON actions(platform, status)")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_idempotency "
+                "ON actions(idempotency_key) WHERE idempotency_key != ''"
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id)")
             if old_version < 5:
                 migration_result = _migrate_v5_event_hardening(conn)
+            if old_version < 6:
+                migration_result.update(_migrate_v6_platform_jobs(conn))
+            if old_version < SCHEMA_VERSION:
                 migration_result["from_version"] = old_version
                 migration_result["backup_path"] = str(backup_path or "")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -281,6 +359,10 @@ def init_db() -> None:
 def upsert_job(job: dict[str, Any], analysis: dict[str, Any] | None = None, final_action: str = "") -> dict[str, Any]:
     init_db()
     url = job.get("url") or f"{job.get('company', '')}|{job.get('title', '')}|{job.get('salary', '')}"
+    platform = str(job.get("platform") or "boss")
+    identity_key = str(job.get("identity_key") or "").strip() or normalize_job_identity(
+        job.get("company", ""), job.get("title", "")
+    ) or fallback_job_identity(platform, job.get("external_job_id", ""), url)
     current_time = now_iso()
     analysis_json = json.dumps(analysis or {}, ensure_ascii=False)
     with closing(connect()) as conn:
@@ -288,9 +370,10 @@ def upsert_job(job: dict[str, Any], analysis: dict[str, Any] | None = None, fina
             """
             INSERT INTO jobs (
                 url, title, company, salary, city, detail, analysis_json,
-                recommendation, final_action, run_id, created_at, updated_at
+                recommendation, final_action, platform, external_job_id, identity_key,
+                application_state, applied, run_id, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 title=excluded.title,
                 company=excluded.company,
@@ -300,6 +383,11 @@ def upsert_job(job: dict[str, Any], analysis: dict[str, Any] | None = None, fina
                 analysis_json=excluded.analysis_json,
                 recommendation=excluded.recommendation,
                 final_action=CASE WHEN excluded.final_action != '' THEN excluded.final_action ELSE jobs.final_action END,
+                platform=excluded.platform,
+                external_job_id=CASE WHEN excluded.external_job_id != '' THEN excluded.external_job_id ELSE jobs.external_job_id END,
+                identity_key=CASE WHEN excluded.identity_key != '' THEN excluded.identity_key ELSE jobs.identity_key END,
+                application_state=CASE WHEN excluded.application_state != '' THEN excluded.application_state ELSE jobs.application_state END,
+                applied=CASE WHEN excluded.applied = 1 THEN 1 ELSE jobs.applied END,
                 run_id=CASE WHEN excluded.run_id != '' THEN excluded.run_id ELSE jobs.run_id END,
                 updated_at=excluded.updated_at
             """,
@@ -313,6 +401,11 @@ def upsert_job(job: dict[str, Any], analysis: dict[str, Any] | None = None, fina
                 analysis_json,
                 (analysis or {}).get("recommendation", ""),
                 final_action,
+                platform,
+                job.get("external_job_id", ""),
+                identity_key,
+                job.get("application_state", ""),
+                1 if job.get("applied") else 0,
                 job.get("run_id", ""),
                 current_time,
                 current_time,
@@ -329,14 +422,32 @@ def get_job(url: str) -> dict[str, Any] | None:
     return row_to_dict(row) if row else None
 
 
-def count_greeted_company(company: str) -> int:
+def get_job_by_identity(identity_key: str, *, exclude_platform: str = "") -> dict[str, Any] | None:
+    init_db()
+    identity_key = str(identity_key or "").strip()
+    if not identity_key:
+        return None
+    params: list[Any] = [identity_key]
+    where = "identity_key = ?"
+    if exclude_platform:
+        where += " AND platform != ?"
+        params.append(exclude_platform)
+    with closing(connect()) as conn:
+        row = conn.execute(
+            f"SELECT * FROM jobs WHERE {where} ORDER BY applied DESC, greeted DESC, updated_at DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def count_greeted_company(company: str, platform: str = "boss") -> int:
     init_db()
     if not company:
         return 0
     with closing(connect()) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS count FROM jobs WHERE company = ? AND greeted = 1",
-            (company,),
+            "SELECT COUNT(*) AS count FROM jobs WHERE company = ? AND platform = ? AND greeted = 1",
+            (company, platform),
         ).fetchone()
     return int(row["count"]) if row else 0
 
@@ -348,6 +459,8 @@ def update_job_status(
     greeted: bool | None = None,
     resume_sent: bool | None = None,
     hr_replied: bool | None = None,
+    applied: bool | None = None,
+    application_state: str = "",
     error: str = "",
 ) -> dict[str, Any] | None:
     init_db()
@@ -367,6 +480,12 @@ def update_job_status(
     if hr_replied is not None:
         updates.append("hr_replied = ?")
         values.append(1 if hr_replied else 0)
+    if applied is not None:
+        updates.append("applied = ?")
+        values.append(1 if applied else 0)
+    if application_state:
+        updates.append("application_state = ?")
+        values.append(application_state)
     if error:
         updates.append("error = ?")
         values.append(error)
@@ -384,13 +503,70 @@ def create_action(action: dict[str, Any]) -> dict[str, Any]:
     init_db()
     current_time = now_iso()
     with closing(connect()) as conn:
+        idempotency_key = str(action.get("idempotency_key") or "").strip()
+        existing_id = None
+        existing_state = ""
+        if idempotency_key:
+            row = conn.execute(
+                "SELECT id, status, payload_json FROM actions WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            existing_id = int(row["id"]) if row else None
+            if row:
+                try:
+                    existing_payload = json.loads(row["payload_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    existing_payload = {}
+                existing_state = str(
+                    existing_payload.get("transactionState")
+                    or existing_payload.get("state")
+                    or row["status"]
+                    or ""
+                )
+        if existing_id is not None:
+            incoming_payload = action.get("payload", {}) if isinstance(action.get("payload"), dict) else {}
+            incoming_state = str(
+                incoming_payload.get("transactionState")
+                or incoming_payload.get("state")
+                or action.get("status")
+                or ""
+            )
+            if (
+                (existing_state == "confirmed" and incoming_state != "confirmed")
+                or (existing_state in {"clicked", "unknown"} and incoming_state == "prepared")
+            ):
+                return get_action(existing_id) or {}
+            conn.execute(
+                """
+                UPDATE actions
+                SET action_type = ?, status = ?, job_url = ?, company = ?, title = ?,
+                    payload_json = ?, result_json = ?, note = ?, platform = ?, run_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    action.get("action_type", ""),
+                    action.get("status", "pending"),
+                    action.get("job_url", ""),
+                    action.get("company", ""),
+                    action.get("title", ""),
+                    json.dumps(action.get("payload", {}), ensure_ascii=False),
+                    json.dumps(action.get("result", {}), ensure_ascii=False),
+                    action.get("note", ""),
+                    action.get("platform", "boss"),
+                    action.get("run_id", ""),
+                    current_time,
+                    existing_id,
+                ),
+            )
+            conn.commit()
+            return get_action(existing_id) or {}
         cursor = conn.execute(
             """
             INSERT INTO actions (
                 action_type, status, job_url, company, title, payload_json,
-                result_json, note, run_id, created_at, updated_at
+                result_json, note, platform, idempotency_key, run_id, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action.get("action_type", ""),
@@ -401,6 +577,8 @@ def create_action(action: dict[str, Any]) -> dict[str, Any]:
                 json.dumps(action.get("payload", {}), ensure_ascii=False),
                 json.dumps(action.get("result", {}), ensure_ascii=False),
                 action.get("note", ""),
+                action.get("platform", "boss"),
+                idempotency_key,
                 action.get("run_id", ""),
                 current_time,
                 current_time,
@@ -472,7 +650,8 @@ def list_recent_processed_jobs(limit: int = 500, hours: int = 24) -> list[dict[s
     with closing(connect()) as conn:
         rows = conn.execute(
             """
-            SELECT url, title, company, recommendation, final_action, greeted, updated_at, error
+            SELECT url, title, company, platform, external_job_id, identity_key,
+                   recommendation, final_action, greeted, applied, application_state, updated_at, error
             FROM jobs
             WHERE url != '' AND updated_at >= ?
             ORDER BY updated_at DESC
@@ -481,6 +660,21 @@ def list_recent_processed_jobs(limit: int = 500, hours: int = 24) -> list[dict[s
             (cutoff, limit),
         ).fetchall()
     return [row_to_dict(row) for row in rows]
+
+
+def count_applications(*, run_id: str = "", day: str = "") -> int:
+    init_db()
+    params: list[Any] = []
+    where = "platform = 'zhaopin' AND applied = 1"
+    if run_id:
+        where += " AND run_id = ?"
+        params.append(run_id)
+    if day:
+        where += " AND substr(updated_at, 1, 10) = ?"
+        params.append(day)
+    with closing(connect()) as conn:
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM jobs WHERE {where}", tuple(params)).fetchone()
+    return int(row["count"]) if row else 0
 
 
 def create_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -640,6 +834,8 @@ def summarize_run(run_id: str) -> dict[str, Any]:
         "jobs_analyzed": counts.get("job_analyzed", 0) + counts.get("job_analyze_completed", 0),
         "greet_success": counts.get("greet_success", 0) + counts.get("message_sent", 0),
         "greet_unknown": counts.get("greet_delivery_unknown", 0),
+        "apply_success": counts.get("apply_confirmed", 0),
+        "apply_unknown": counts.get("apply_delivery_unknown", 0),
         "paused": counts.get("manual_intervention_pause", 0) + counts.get("platform_limit_pause", 0),
         "event_types": counts,
     }
@@ -760,6 +956,7 @@ def database_stats() -> dict[str, Any]:
         action_count = int(conn.execute("SELECT COUNT(*) FROM actions").fetchone()[0])
         open_run_count = int(conn.execute("SELECT COUNT(*) FROM runs WHERE ended_at IS NULL").fetchone()[0])
         interrupted_run_count = int(conn.execute("SELECT COUNT(*) FROM runs WHERE status = 'interrupted'").fetchone()[0])
+        applied_count = int(conn.execute("SELECT COUNT(*) FROM jobs WHERE applied = 1").fetchone()[0])
     return {
         "path": str(db_path),
         "size_bytes": db_path.stat().st_size if db_path.exists() else 0,
@@ -768,6 +965,7 @@ def database_stats() -> dict[str, Any]:
         "event_count": event_count,
         "job_count": job_count,
         "action_count": action_count,
+        "applied_count": applied_count,
         "open_run_count": open_run_count,
         "interrupted_run_count": interrupted_run_count,
     }

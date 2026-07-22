@@ -15,6 +15,7 @@ from tools import now_iso, sanitize_log_value
 
 
 SCRIPT_STALE_SECONDS = 15
+PLATFORM_NAMES = ("boss", "zhaopin")
 
 
 def _seconds_since(iso_time: str) -> int | None:
@@ -32,16 +33,12 @@ class RuntimeState:
         self.current_task = "idle"
         self.control = "paused"
         self.last_error = ""
-        self.script = {
-            "connected": False,
-            "page": "unknown",
-            "status": "offline",
-            "current_action": "",
-            "last_seen": "",
-            "stale": False,
-            "heartbeat_age_seconds": None,
-            "detail": {},
-        }
+        self.platform_controls = {platform: "running" for platform in PLATFORM_NAMES}
+        self.platform_pause_reasons = {platform: "" for platform in PLATFORM_NAMES}
+        self.platform_generations = {platform: 0 for platform in PLATFORM_NAMES}
+        self.platforms = {platform: self._blank_script(platform) for platform in PLATFORM_NAMES}
+        # Backward-compatible alias.  Existing callers historically saw BOSS only.
+        self.script = dict(self.platforms["boss"])
         self.model_warmup = {
             "status": "unknown",
             "provider": "",
@@ -60,11 +57,35 @@ class RuntimeState:
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self._subscribers: list[Queue] = []
         self._lock = threading.RLock()
-        self._last_persisted_script_status: tuple[str, str] | None = None
+        self._last_persisted_script_status: dict[str, tuple[str, str]] = {}
         self._once_event_keys: set[tuple[str, str, str]] = set()
 
     def _new_run_id(self) -> str:
         return f"run-{uuid.uuid4().hex[:12]}"
+
+    @staticmethod
+    def _blank_script(platform: str) -> dict[str, Any]:
+        return {
+            "platform": platform,
+            "connected": False,
+            "page": "unknown",
+            "page_kind": "",
+            "instance_id": "",
+            "status": "offline",
+            "current_action": "",
+            "last_seen": "",
+            "stale": False,
+            "heartbeat_age_seconds": None,
+            "detail": {},
+        }
+
+    @staticmethod
+    def _platform_name(platform: str | None) -> str:
+        return platform if platform in PLATFORM_NAMES else "boss"
+
+    @staticmethod
+    def _platform_enabled(platform: str) -> bool:
+        return bool(getattr(Config, f"{platform}_enabled", True))
 
     def log(self, message: str, level: str = "info", source: str = "backend") -> dict[str, Any]:
         return self.emit("log", message, source=source, level=level)
@@ -115,14 +136,15 @@ class RuntimeState:
         if event_type == "script_status":
             event_detail = safe_detail if isinstance(safe_detail, dict) else {}
             script_detail = event_detail.get("detail") or {}
+            platform = str(event_detail.get("platform", "boss"))
             signature = (
                 str(event_detail.get("page", "")),
                 str(event_detail.get("status", "")),
             )
             with self._lock:
-                persist_event = signature != self._last_persisted_script_status
+                persist_event = signature != self._last_persisted_script_status.get(platform)
                 if persist_event:
-                    self._last_persisted_script_status = signature
+                    self._last_persisted_script_status[platform] = signature
         try:
             import database
 
@@ -142,14 +164,29 @@ class RuntimeState:
         with self._lock:
             self.current_task = task
 
-    def update_script(self, page: str, status: str, current_action: str = "", detail: dict[str, Any] | None = None) -> None:
+    def update_script(
+        self,
+        page: str,
+        status: str,
+        current_action: str = "",
+        detail: dict[str, Any] | None = None,
+        *,
+        platform: str = "boss",
+        instance_id: str = "",
+        page_kind: str = "",
+    ) -> None:
+        platform = self._platform_name(platform)
         detail = dict(detail or {})
         with self._lock:
-            previous = dict(self.script)
+            previous = dict(self.platforms[platform])
             detail.setdefault("backendRunId", self.run_id)
-            self.script = {
+            detail.setdefault("platform", platform)
+            script = {
+                "platform": platform,
                 "connected": True,
                 "page": page,
+                "page_kind": page_kind or page,
+                "instance_id": instance_id,
                 "status": status,
                 "current_action": current_action,
                 "last_seen": now_iso(),
@@ -157,12 +194,15 @@ class RuntimeState:
                 "heartbeat_age_seconds": 0,
                 "detail": detail,
             }
+            self.platforms[platform] = script
+            if platform == "boss" or not self._platform_enabled("boss"):
+                self.script = dict(script)
             changed = (
                 previous.get("page") != page
                 or previous.get("status") != status
                 or previous.get("current_action") != current_action
             )
-            script_detail = dict(self.script)
+            script_detail = dict(script)
         if changed:
             self.emit(
                 "script_status",
@@ -171,9 +211,12 @@ class RuntimeState:
                 detail=script_detail,
             )
 
-    def script_snapshot(self) -> dict[str, Any]:
+    def script_snapshot(self, platform: str | None = None) -> dict[str, Any]:
+        selected = self._platform_name(platform) if platform else (
+            "boss" if self._platform_enabled("boss") else "zhaopin"
+        )
         with self._lock:
-            script = dict(self.script)
+            script = dict(self.platforms[selected])
         script["detail"] = dict(script.get("detail") or {})
         last_seen = script.get("last_seen")
         script["stale"] = False
@@ -192,6 +235,62 @@ class RuntimeState:
             script["current_action"] = f"脚本心跳超过 {age_seconds} 秒未更新"
         return script
 
+    def platform_control(self, platform: str) -> str:
+        platform = self._platform_name(platform)
+        with self._lock:
+            global_control = self.control
+            local_control = self.platform_controls.get(platform, "running")
+        if not self._platform_enabled(platform):
+            return "disabled"
+        if global_control != "running":
+            return global_control
+        return local_control
+
+    def platform_generation(self, platform: str) -> int:
+        platform = self._platform_name(platform)
+        with self._lock:
+            return int(self.platform_generations.get(platform, 0))
+
+    def platform_snapshots(self) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for platform in PLATFORM_NAMES:
+            snapshot = self.script_snapshot(platform)
+            with self._lock:
+                local_control = self.platform_controls.get(platform, "running")
+                pause_reason = self.platform_pause_reasons.get(platform, "")
+                generation = int(self.platform_generations.get(platform, 0))
+            snapshot.update(
+                {
+                    "enabled": self._platform_enabled(platform),
+                    "control": local_control,
+                    "effective_control": self.platform_control(platform),
+                    "pause_reason": pause_reason,
+                    "generation": generation,
+                }
+            )
+            result[platform] = snapshot
+        return result
+
+    def set_platform_control(self, platform: str, command: str, reason: str = "") -> None:
+        platform = self._platform_name(platform)
+        if command not in {"pause", "resume", "stop"}:
+            raise ValueError(f"不支持的平台控制命令: {command}")
+        with self._lock:
+            self.platform_controls[platform] = {
+                "pause": "paused",
+                "resume": "running",
+                "stop": "stopped",
+            }[command]
+            self.platform_pause_reasons[platform] = "" if command == "resume" else str(reason or "")
+            if command in {"pause", "stop"}:
+                self.platform_generations[platform] = int(self.platform_generations.get(platform, 0)) + 1
+        self.emit(
+            "platform_control",
+            f"平台控制命令: {platform} / {command}",
+            source="control",
+            detail={"platform": platform, "command": command, "reason": reason},
+        )
+
     def set_control(self, command: str, *, new_run: bool = False) -> None:
         previous_run_id = ""
         with self._lock:
@@ -199,6 +298,8 @@ class RuntimeState:
             if command == "pause":
                 self.control = "paused"
                 self.current_task = "paused"
+                for platform in PLATFORM_NAMES:
+                    self.platform_generations[platform] = int(self.platform_generations.get(platform, 0)) + 1
             elif command == "resume":
                 if new_run or self.control == "stopped" or not self.run_id:
                     self.run_id = self._new_run_id()
@@ -209,6 +310,8 @@ class RuntimeState:
             elif command == "stop":
                 self.control = "stopped"
                 self.current_task = "stopped"
+                for platform in PLATFORM_NAMES:
+                    self.platform_generations[platform] = int(self.platform_generations.get(platform, 0)) + 1
             current_run_id = self.run_id
             current_control = self.control
             current_run_started_at = self.run_started_at
@@ -242,22 +345,27 @@ class RuntimeState:
                 "updated_at": now_iso(),
             }
 
-    def control_payload(self) -> dict[str, Any]:
+    def control_payload(self, platform: str | None = None) -> dict[str, Any]:
         with self._lock:
             control = self.control
             run_id = self.run_id
             run_started_at = self.run_started_at
             current_task = self.current_task
-        should_start = control == "running"
+        selected = self._platform_name(platform) if platform else None
+        effective_control = self.platform_control(selected) if selected else control
+        should_start = effective_control == "running"
         return {
             "control": control,
             "run_id": run_id,
             "run_started_at": run_started_at,
             "current_task": current_task,
             "script": self.script_snapshot(),
+            "platform": selected,
+            "platform_control": effective_control if selected else "",
+            "platforms": self.platform_snapshots(),
             "should_start": should_start,
-            "should_pause": control == "paused",
-            "should_stop": control == "stopped",
+            "should_pause": effective_control == "paused",
+            "should_stop": effective_control in {"stopped", "disabled"},
             "message": {
                 "running": "CLI 已允许脚本开始或继续执行",
                 "paused": "CLI 已暂停脚本执行",
@@ -415,6 +523,7 @@ class RuntimeState:
                 "search_result_scroll_rounds": Config.search_result_scroll_rounds,
             },
             "script": self.script_snapshot(),
+            "platforms": self.platform_snapshots(),
             "autorun_schedule": {
                 "enabled": bool(getattr(Config, "auto_start_enabled", False)),
                 "time": str(getattr(Config, "auto_start_time", "09:00")),

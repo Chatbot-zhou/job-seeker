@@ -11,18 +11,19 @@ import sys
 import time
 import webbrowser
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from getpass import getpass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import database
 import greeting_service
 import resume_service
 from cache import cache
-from config import CONFIG_WAS_MISSING, Config
+from config import CONFIG_WAS_MISSING, Config, model_concurrency_fingerprint
 from runtime_state import runtime_state
 from tools import redact_privacy, redact_sensitive_urls, script_connect_hosts as build_script_connect_hosts
 
@@ -48,6 +49,7 @@ CLI_CONFIRM_ACTIONS: set[str] = {"greet_suggestion"}
 
 WEB_SCRIPT_PATH = Path(__file__).resolve().parent / "web_script.js"
 BOSS_SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
+ZHAOPIN_DEFAULT_URL = "https://www.zhaopin.com/recommend"
 SESSION_PREPARED = False
 BROWSER_OPEN_COOLDOWN_SECONDS = 60
 DEFAULT_AUTORUN_OLLAMA_MODEL = "qwen3:1.7b"
@@ -314,7 +316,7 @@ def print_config_preview(updates: dict[str, Any]) -> None:
     print(
         f"- 搜索: 冷却 {preview.get('search_round_cooldown_min_minutes', 1)}-{preview.get('search_round_cooldown_minutes')} 分钟 / "
         f"标签间隔 {preview.get('tag_search_delay_seconds')}-{preview.get('tag_search_delay_max_seconds')} 秒 / "
-        f"滚动 {preview.get('search_result_scroll_rounds')} 次"
+        f"列表扩展 {preview.get('search_result_scroll_rounds')} 次（BOSS 滚动 / 智联翻页）"
     )
     print(
         f"- 搜索预算: 每小时 {preview.get('max_search_submissions_per_hour')} 次 / "
@@ -323,6 +325,11 @@ def print_config_preview(updates: dict[str, Any]) -> None:
     print(
         f"- 推荐源: {preview.get('preferred_feed_mode')} / "
         f"每个自定义 Tab {format_feed_job_limit(preview.get('preferred_feed_max_jobs_per_tab'))}"
+    )
+    print(
+        f"- 平台: BOSS {'启用' if preview.get('boss_enabled', True) else '关闭'} / "
+        f"智联 {'启用' if preview.get('zhaopin_enabled', True) else '关闭'} / "
+        f"模型并发 {preview.get('model_max_concurrency', 1)}"
     )
 
 
@@ -401,7 +408,7 @@ def configure_search_safety_settings() -> None:
             int(current.get("max_search_submissions_per_day", 30)),
         ),
         "search_result_scroll_rounds": ask_int(
-            "每个推荐源或标签最多低频滚动读取次数 0-20",
+            "单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联翻页）",
             int(current.get("search_result_scroll_rounds", 20)),
         ),
         "preferred_feed_max_jobs_per_tab": ask_int(
@@ -454,6 +461,54 @@ def configure_log_display_settings() -> None:
         runtime_state.emit("config_saved", "日志与显示配置已保存", source="config", detail=Config.public_dict())
 
 
+def configure_platform_settings() -> None:
+    current = Config.as_dict()
+    raw_urls = ask(
+        "智联岗位列表网址（多个用英文逗号分隔）",
+        ",".join(current.get("zhaopin_job_urls") or [ZHAOPIN_DEFAULT_URL]),
+    )
+    urls = [item.strip() for item in raw_urls.split(",") if item.strip()]
+    minimum = ensure_range_int(
+        "智联投递最小间隔秒数",
+        int(current.get("zhaopin_apply_delay_min_seconds", 3)),
+        3,
+        60,
+    )
+    maximum = ensure_range_int(
+        "智联投递最大间隔秒数",
+        int(current.get("zhaopin_apply_delay_max_seconds", 10)),
+        3,
+        60,
+    )
+    if maximum < minimum:
+        maximum = minimum
+        print("[配置] 最大投递间隔不能小于最小间隔，已自动对齐。")
+    updates = {
+        "boss_enabled": ask_bool("启用 BOSS 直聘", bool(current.get("boss_enabled", True))),
+        "zhaopin_enabled": ask_bool("启用智联招聘", bool(current.get("zhaopin_enabled", True))),
+        "zhaopin_job_urls": urls or [ZHAOPIN_DEFAULT_URL],
+        "zhaopin_resume_name": ask("智联自动确认使用的简历名称（留空只允许唯一默认简历）", str(current.get("zhaopin_resume_name", ""))),
+        "zhaopin_apply_delay_min_seconds": minimum,
+        "zhaopin_apply_delay_max_seconds": maximum,
+        "zhaopin_max_applications_per_run": ensure_range_int(
+            "智联每轮本地投递上限（0 表示关闭）",
+            int(current.get("zhaopin_max_applications_per_run", 0)),
+            0,
+            1000,
+        ),
+        "zhaopin_max_applications_per_day": ensure_range_int(
+            "智联每日本地投递上限（0 表示关闭）",
+            int(current.get("zhaopin_max_applications_per_day", 0)),
+            0,
+            10000,
+        ),
+    }
+    print_config_preview(updates)
+    if ask_bool("保存平台与智联投递配置", True):
+        Config.save(updates)
+        runtime_state.emit("config_saved", "平台与智联投递配置已保存", source="config", detail=Config.public_dict())
+
+
 def configure_advanced_model_settings() -> None:
     current = Config.as_dict()
     updates = {
@@ -487,8 +542,9 @@ def configure_base() -> None:
         print("[2] 搜索与风控")
         print("[3] 自动启动时间")
         print("[4] 日志与显示")
-        print("[5] 高级模型参数")
-        print("[6] 查看当前摘要")
+        print("[5] 平台与智联投递")
+        print("[6] 高级模型参数")
+        print("[7] 查看当前摘要")
         choice = input("  选择 [Enter 退出]: ").strip()
         if not choice:
             return
@@ -501,8 +557,10 @@ def configure_base() -> None:
         elif choice == "4":
             configure_log_display_settings()
         elif choice == "5":
-            configure_advanced_model_settings()
+            configure_platform_settings()
         elif choice == "6":
+            configure_advanced_model_settings()
+        elif choice == "7":
             print_summary()
         else:
             print("[配置] 无效选择。")
@@ -573,7 +631,7 @@ def edit_session_settings() -> None:
     print(f"  搜索冷却: 随机 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分钟")
     print(f"  标签间隔: 随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒")
     print(f"  搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / 每日 {Config.max_search_submissions_per_day} 次")
-    print(f"  滚动扩展: {Config.search_result_scroll_rounds} 次")
+    print(f"  列表扩展: {Config.search_result_scroll_rounds} 次（BOSS 滚动 / 智联翻页）")
     print(
         f"  自定义推荐: {'启用' if Config.preferred_feed_mode != 'off' else '关闭'} / "
         f"每个 Tab {format_feed_job_limit(Config.preferred_feed_max_jobs_per_tab)}"
@@ -582,7 +640,7 @@ def edit_session_settings() -> None:
     print("[1] 修改岗位搜索标签")
     print("[2] 修改搜索冷却时间范围")
     print("[3] 修改标签随机搜索间隔")
-    print("[4] 修改滚动扩展次数")
+    print("[4] 修改列表扩展次数")
     print("[5] 修改自定义推荐 Tab 上限")
     print("[6] 修改关键词搜索预算")
     choice = input("  选择 [Enter 取消]: ").strip()
@@ -633,18 +691,18 @@ def edit_session_settings() -> None:
         print(f"[配置] 标签搜索间隔已更新为: 随机 {min_seconds}-{max_seconds} 秒")
     elif choice == "4":
         while True:
-            rounds = ask_int("每个推荐源或标签最多低频滚动读取次数 0-20", int(Config.search_result_scroll_rounds))
+            rounds = ask_int("单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联翻页）", int(Config.search_result_scroll_rounds))
             if not 0 <= rounds <= 20:
-                print("[配置] 滚动扩展次数只能设置为 0-20。")
+                print("[配置] 列表扩展次数只能设置为 0-20。")
                 continue
             break
         Config.save({"search_result_scroll_rounds": rounds})
         runtime_state.emit(
             "search_scroll_rounds_updated",
-            f"搜索滚动扩展调整为 {rounds} 次",
+            f"岗位列表扩展调整为 {rounds} 次",
             source="config",
         )
-        print(f"[配置] 搜索滚动扩展次数已更新为: {rounds}")
+        print(f"[配置] 岗位列表扩展次数已更新为: {rounds}")
     elif choice == "5":
         while True:
             limit = ask_int(
@@ -715,8 +773,21 @@ def prepare_session_start(force: bool = False) -> bool:
     global SESSION_PREPARED
     if SESSION_PREPARED and runtime_state.control != "stopped" and not force:
         return True
+    if not Config.boss_enabled and not Config.zhaopin_enabled:
+        print("[配置] BOSS 和智联均已关闭，请先在 config -> 平台与智联投递中启用至少一个平台。")
+        return False
 
     cache.load()
+    if not Config.boss_enabled:
+        SESSION_PREPARED = True
+        runtime_state.emit(
+            "session_config_saved",
+            f"本轮设置已确认: 智联岗位网址 {len(Config.zhaopin_job_urls)} 个",
+            source="config",
+            detail={"zhaopin_job_urls": Config.zhaopin_job_urls},
+        )
+        print(f"[配置] 本轮将使用 {len(Config.zhaopin_job_urls)} 个智联岗位列表网址。")
+        return True
     if not cache.tags:
         if not cache.resume.strip():
             print("[配置] 当前没有简历，无法生成本轮岗位标签。")
@@ -802,7 +873,7 @@ def needs_initialization() -> bool:
         CONFIG_WAS_MISSING
         or not cache.resume.strip()
         or not cache.cache_status()["profile_generated"]
-        or not greeting.get("confirmed")
+        or (Config.boss_enabled and not greeting.get("confirmed"))
     )
 
 
@@ -813,11 +884,12 @@ def run_initialization() -> None:
     setup_quick_start()
     ensure_resume()
     ensure_profile()
-    ensure_greeting()
+    if Config.boss_enabled:
+        ensure_greeting()
     print_summary()
     if ask_bool("确认以上配置并进入待启动状态", True):
         runtime_state.set_control("pause")
-        print("[控制] 初始化完成。打开 BOSS 搜索页后输入 start 开始自动化。")
+        print("[控制] 初始化完成。打开已启用平台岗位页后输入 start 开始自动化。")
     else:
         runtime_state.set_control("pause")
         print("[控制] 已暂停。可输入 config/resume/greeting 调整配置。")
@@ -868,7 +940,7 @@ def setup_quick_start() -> None:
             300,
         ),
         "search_result_scroll_rounds": ensure_range_int(
-            "每个推荐源或标签最多低频滚动读取次数 0-20",
+            "单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联翻页）",
             int(current.get("search_result_scroll_rounds", 20)),
             0,
             20,
@@ -1006,7 +1078,7 @@ def print_status_panel() -> None:
     search_strategy_label = (
         f"冷却 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes}分 / "
         f"间隔 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds}秒 / "
-        f"滚动 {Config.search_result_scroll_rounds}次 / "
+        f"列表扩展 {Config.search_result_scroll_rounds}次 / "
         f"预算 {script_detail.get('searchBudgetHourlyCount', 0)}/{script_detail.get('searchBudgetHourlyLimit') or Config.max_search_submissions_per_hour}时 "
         f"{script_detail.get('searchBudgetDailyCount', 0)}/{script_detail.get('searchBudgetDailyLimit') or Config.max_search_submissions_per_day}日"
     )
@@ -1016,14 +1088,22 @@ def print_status_panel() -> None:
         f" / {script_detail.get('feedTabProcessedCount', 0)}/"
         f"{format_feed_job_limit(script_detail.get('feedTabMaxJobs') if script_detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
     )
-    scroll_label = (
-        f"{script_detail.get('scrollMode') or '未选择'} / "
-        f"{script_detail.get('scrollTarget') or '-'} / "
-        f"第 {script_detail.get('scrollRound', 0)} 轮 / "
-        f"{script_detail.get('lastScrollOutcome') or '-'} / "
-        f"位置 {script_detail.get('scrollBefore', 0)}->{script_detail.get('scrollAfter', 0)} / "
-        f"岗位 {script_detail.get('scrollJobCountBefore', 0)}->{script_detail.get('scrollJobCountAfter', 0)}"
-    )
+    if script_detail.get("platform") == "zhaopin" or script_detail.get("listMode") == "pagination":
+        scroll_label = (
+            f"pagination / 第 {script_detail.get('pageNumber') or '?'} 页 / "
+            f"翻页 {script_detail.get('pageTurnCount', 0)} 次 / "
+            f"{script_detail.get('lastPageOutcome') or '-'} / "
+            f"岗位 {script_detail.get('pageJobCountBefore', 0)}->{script_detail.get('pageJobCountAfter', 0)}"
+        )
+    else:
+        scroll_label = (
+            f"{script_detail.get('scrollMode') or '未选择'} / "
+            f"{script_detail.get('scrollTarget') or '-'} / "
+            f"第 {script_detail.get('scrollRound', 0)} 轮 / "
+            f"{script_detail.get('lastScrollOutcome') or '-'} / "
+            f"位置 {script_detail.get('scrollBefore', 0)}->{script_detail.get('scrollAfter', 0)} / "
+            f"岗位 {script_detail.get('scrollJobCountBefore', 0)}->{script_detail.get('scrollJobCountAfter', 0)}"
+        )
     if script_detail.get("cooldownUntil"):
         search_strategy_label = _format_script_cooldown(script_detail)
 
@@ -1047,7 +1127,7 @@ def print_status_panel() -> None:
         print(f"- 阈值与统计: {Config.score_threshold} 分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}")
         print(f"- 搜索策略: {search_strategy_label}")
         print(f"- 岗位来源: {source_label}")
-        print(f"- 岗位滚动: {scroll_label}")
+        print(f"- 列表扩展: {scroll_label}")
         print(f"- 油猴脚本版本: {script_version_label}")
         print(f"- 定时启动: {schedule_label}")
         print(f"- 准备状态: 简历 {_icon(resume_ok)} / 画像 {_icon(profile_ok)} / 话术 {_icon(greeting_ok)} / 脚本 {_icon(script_ok)} / 控制 {control}")
@@ -1066,7 +1146,7 @@ def print_status_panel() -> None:
 ║  评分阈值    {Config.score_threshold}分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}{' ' * 18}║
 ║  搜索策略    {search_strategy_label[:48]:<48}║
 ║  岗位来源    {source_label[:48]:<48}║
-║  岗位滚动    {scroll_label[:48]:<48}║
+║  列表扩展    {scroll_label[:48]:<48}║
 ║  定时启动    {schedule_label:<48}║
 ║  评分令牌    关思考 {Config.job_score_num_predict_think_off} / 开思考 {Config.job_score_num_predict_think_on}{' ' * 18}║
 ║  温度/top_p  {Config.model_temperature} / {Config.model_top_p}{' ' * 38}║
@@ -1112,9 +1192,21 @@ def print_summary() -> None:
         print(f"- OpenAI 模型类型: {Config.external_model_profile}")
     print(f"- 最低匹配度阈值: {Config.score_threshold}")
     print(
+        f"- 平台: BOSS {'启用' if Config.boss_enabled else '关闭'} / "
+        f"智联 {'启用' if Config.zhaopin_enabled else '关闭'}"
+    )
+    if Config.zhaopin_enabled:
+        print(
+            f"- 智联: 列表 {len(Config.zhaopin_job_urls)} 个 / "
+            f"投递间隔 {Config.zhaopin_apply_delay_min_seconds}-{Config.zhaopin_apply_delay_max_seconds} 秒 / "
+            f"本轮上限 {Config.zhaopin_max_applications_per_run or '关闭'} / "
+            f"每日上限 {Config.zhaopin_max_applications_per_day or '关闭'}"
+        )
+    print(f"- 模型队列并发上限: {Config.model_max_concurrency}")
+    print(
         f"- 搜索策略: 无新岗位随机冷却 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分钟 / "
         f"标签间隔随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
-        f"滚动扩展 {Config.search_result_scroll_rounds} 次"
+        f"列表扩展 {Config.search_result_scroll_rounds} 次（BOSS 滚动 / 智联翻页）"
     )
     print(
         f"- 关键词搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / "
@@ -1152,6 +1244,26 @@ def api_health_url() -> str:
     return f"http://{Config.server_host}:{Config.server_port}/health"
 
 
+def request_control(command: str, platform: str | None = None, *, new_run: bool = False) -> dict[str, Any]:
+    body: dict[str, Any] = {"command": command, "new_run": new_run}
+    if platform:
+        body["platform"] = platform
+        body["reason"] = "CLI 平台控制"
+    request = Request(
+        f"http://{Config.server_host}:{Config.server_port}/control",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=5.0) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def request_status() -> dict[str, Any]:
+    with urlopen(f"http://{Config.server_host}:{Config.server_port}/status", timeout=5.0) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def browser_open_stamp_path(name: str) -> Path:
     # Keep this in data/cache to match the PowerShell launchers.
     return Path(Config.tags_name).parent / f"browser_open_{name}.stamp"
@@ -1185,15 +1297,15 @@ def wait_for_api_ready(timeout_seconds: float = 20.0) -> bool:
 def show_startup_next_steps() -> None:
     print("\n[启动] 下一步:")
     print(f"  1. 确认油猴脚本已安装或更新: {script_install_url()}")
-    print("  2. 刷新 BOSS 搜索页，等待 CLI 显示脚本就绪")
+    print("  2. 刷新已启用平台的岗位列表页，等待 CLI 显示脚本就绪")
     print("  3. 输入 start，确认岗位标签和运行配置后开始")
 
 
 def show_autorun_next_steps() -> None:
     print("\n[启动] 自动运行模式")
     print(f"  1. 已尝试打开油猴脚本安装/更新页: {script_install_url()}")
-    print("  2. 已尝试打开 BOSS 搜索页")
-    print("  3. 等待油猴脚本心跳，脚本在线后自动开始运行")
+    print("  2. 已尝试打开已启用平台的岗位列表页")
+    print("  3. 等待任一已启用平台的油猴脚本心跳，在线后自动开始运行")
 
 
 def auto_start_schedule_status(now: datetime | None = None) -> dict[str, Any]:
@@ -1290,19 +1402,26 @@ def wait_for_auto_start_schedule() -> bool:
 
 
 def maybe_open_startup_pages(*, always_open_userscript: bool = False) -> None:
-    """每次启动自动打开 BOSS 搜索页；脚本安装页按模式和冷却策略打开。"""
+    """打开已启用平台的调度页；脚本安装页按模式和冷却策略打开。"""
     if not wait_for_api_ready():
         print("[启动] 本地 API 未在限定时间内就绪，已跳过自动打开。")
         return
-    # 每次启动都打开 BOSS 搜索页
-    if should_open_browser_page("boss_search"):
+    if Config.boss_enabled and should_open_browser_page("boss_search"):
         try:
             webbrowser.open(BOSS_SEARCH_URL, new=2)
             print("[启动] 已打开 BOSS 搜索页。")
         except Exception as exc:
             print(f"[启动] 打开 BOSS 搜索页失败: {exc}")
-    else:
+    elif Config.boss_enabled:
         print("[启动] 60 秒内已打开过 BOSS 搜索页，本次跳过自动打开。")
+    if Config.zhaopin_enabled and Config.zhaopin_job_urls and should_open_browser_page("zhaopin_search"):
+        try:
+            webbrowser.open(Config.zhaopin_job_urls[0], new=2)
+            print("[启动] 已打开智联岗位列表页。")
+        except Exception as exc:
+            print(f"[启动] 打开智联岗位列表页失败: {exc}")
+    elif Config.zhaopin_enabled:
+        print("[启动] 60 秒内已打开过智联岗位列表页，本次跳过自动打开。")
     if (always_open_userscript or CONFIG_WAS_MISSING) and should_open_browser_page("userscript"):
         try:
             webbrowser.open(script_install_url(), new=2)
@@ -1317,8 +1436,13 @@ def maybe_open_startup_pages(*, always_open_userscript: bool = False) -> None:
 def wait_for_script_ready(timeout_seconds: float = 120.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        script = runtime_state.script_snapshot()
-        if script.get("connected"):
+        snapshots = runtime_state.platform_snapshots()
+        enabled = []
+        if Config.boss_enabled:
+            enabled.append("boss")
+        if Config.zhaopin_enabled:
+            enabled.append("zhaopin")
+        if any(snapshots.get(platform, {}).get("connected") for platform in enabled):
             return True
         time.sleep(1)
     return False
@@ -1346,7 +1470,7 @@ def show_script_install() -> None:
     if meta_version != runtime_version:
         print("- 提醒: 元数据版本和运行版本不一致，请先更新油猴脚本。")
     print(f"- 需要 @connect: {', '.join(build_script_connect_hosts(url))}")
-    print("- 用法: 在浏览器打开安装地址，按篡改猴提示安装或更新，然后刷新 BOSS 搜索页。")
+    print("- 用法: 在浏览器打开安装地址，按篡改猴提示安装或更新，然后刷新 BOSS/智联岗位列表页。")
     print("- 验证: CLI 应显示脚本就绪，并且 status/doctor 中的脚本版本等于运行版本。")
     try:
         webbrowser.open(url, new=2)
@@ -1357,30 +1481,71 @@ def show_script_install() -> None:
 
 def show_status() -> None:
     print_status_panel()
-    # 补充脚本会话细节（面板中已包含基本连接状态，这里追加会话计数和版本）
-    detail = runtime_state.script_snapshot().get("detail") or {}
-    if detail:
-        print(f"  会话详情: 本轮成功 {detail.get('sessionGreetCount', 0)} | "
-              f"今日成功 {detail.get('dailyGreetCount', 0)} | "
-              f"脚本版本 {detail.get('version', '-')} | "
-              f"会话ID {detail.get('localSessionRunId') or detail.get('runId') or '-'}")
-    if not runtime_state.script_snapshot().get("connected"):
-        print("  提示: 请打开或刷新 BOSS 搜索页，并确认油猴脚本已启用。")
+    snapshots = runtime_state.platform_snapshots()
+    for platform, label in (("boss", "BOSS"), ("zhaopin", "智联")):
+        script = snapshots[platform]
+        detail = script.get("detail") or {}
+        state = "在线" if script.get("connected") else ("心跳过期" if script.get("stale") else "离线")
+        count = detail.get("sessionGreetCount", 0) if platform == "boss" else detail.get("runApplyCount", 0)
+        print(
+            f"  {label}: {'启用' if script.get('enabled') else '关闭'} | {state} | "
+            f"控制 {script.get('effective_control')} | {script.get('page') or '-'} | "
+            f"本轮成功 {count} | {script.get('current_action') or '空闲'}"
+        )
+        if detail:
+            if platform == "zhaopin" or detail.get("listMode") == "pagination":
+                print(
+                    f"    翻页: 当前第 {detail.get('pageNumber') or '?'} 页 | "
+                    f"已翻 {detail.get('pageTurnCount', 0)} 次 | "
+                    f"结果 {detail.get('lastPageOutcome') or '-'} | "
+                    f"岗位 {detail.get('pageJobCountBefore', 0)}->{detail.get('pageJobCountAfter', 0)}"
+                )
+            else:
+                print(
+                    f"    滚动: {detail.get('scrollMode') or '未选择'} | "
+                    f"第 {detail.get('scrollRound', 0)} 轮 | "
+                    f"结果 {detail.get('lastScrollOutcome') or '-'} | "
+                    f"岗位 {detail.get('scrollJobCountBefore', 0)}->{detail.get('scrollJobCountAfter', 0)}"
+                )
+        if script.get("pause_reason"):
+            print(f"    暂停原因: {script.get('pause_reason')}")
+    if not any(item.get("connected") for item in snapshots.values() if item.get("enabled")):
+        print("  提示: 请打开或刷新已启用平台的岗位列表页，并确认油猴脚本已启用。")
+    try:
+        model_queue = request_status().get("model_queue") or {}
+        print(
+            f"  模型队列: 并发 {model_queue.get('limit', Config.model_max_concurrency)} | "
+            f"活动 {model_queue.get('active', 0)} | 排队 {model_queue.get('queued', 0)} | "
+            f"平台等待 {model_queue.get('queued_by_platform') or {}}"
+        )
+    except (OSError, URLError, ValueError):
+        print(f"  模型队列: 并发 {Config.model_max_concurrency} | 状态暂不可读")
 
 
-def show_control_result(command: str) -> None:
+def show_control_result(command: str, platform: str | None = None) -> None:
     global SESSION_PREPARED
-    new_run = command == "resume" and (not SESSION_PREPARED or runtime_state.control == "stopped")
+    new_run = not platform and command == "resume" and (not SESSION_PREPARED or runtime_state.control == "stopped")
     if new_run:
         if not prepare_session_start(force=True):
             return
-    runtime_state.set_control(command, new_run=new_run)
-    if command == "stop":
+    try:
+        payload = request_control(command, platform, new_run=new_run)
+    except (OSError, URLError, ValueError) as exc:
+        print(f"[控制] API 控制请求失败，使用本地状态回退: {exc}")
+        if platform:
+            runtime_state.set_platform_control(platform, command, "CLI 平台控制")
+        else:
+            runtime_state.set_control(command, new_run=new_run)
+        payload = runtime_state.control_payload(platform)
+    if not platform and command == "stop":
         SESSION_PREPARED = False
-    payload = runtime_state.control_payload()
-    script = payload["script"]
-    print(f"[控制] {payload['message']}")
-    print(f"[控制] 当前状态: {payload['control']} / 任务: {payload['current_task']}")
+    script = payload["platforms"][platform] if platform else payload["script"]
+    if platform:
+        print(f"[控制] {platform} 已执行 {command}，其他平台不受影响。")
+        print(f"[控制] 平台状态: {script.get('effective_control')} / 全局状态: {payload['control']}")
+    else:
+        print(f"[控制] {payload['message']}")
+        print(f"[控制] 当前状态: {payload['control']} / 任务: {payload['current_task']}")
     if script.get("connected"):
         print(
             f"[脚本] 在线: {script.get('page')} / {script.get('status')} / "
@@ -1391,9 +1556,9 @@ def show_control_result(command: str) -> None:
             f"[脚本] 心跳过期: {script.get('page')} / {script.get('status')} / "
             f"{script.get('current_action') or '空闲'}"
         )
-        print("[脚本] 请刷新 BOSS 搜索页，确认 CLI 出现新的脚本心跳后再 start。")
+        print(f"[脚本] 请刷新 {'对应平台' if platform else '已启用平台'}的岗位列表页，确认出现新心跳后再继续。")
     else:
-        print("[脚本] 未连接。请打开或刷新 BOSS 搜索页，等待 CLI 出现脚本心跳后再 start。")
+        print(f"[脚本] 未连接。请打开或刷新{'对应平台' if platform else '已启用平台'}的岗位列表页。")
 
 
 def handle_pending_action(action: dict[str, Any]) -> None:
@@ -1573,6 +1738,41 @@ def show_backup() -> None:
     print("[备份] 备份不包含明文 API Key，但包含简历、画像、话术和历史数据库，请妥善保存。")
 
 
+def show_doctor_concurrency() -> None:
+    """对当前模型端点发起两个并行的轻量真实生成请求。"""
+    from model_stream import model_warmup_check
+
+    print("[并发诊断] 正在同时执行 2 个轻量真实生成请求，请稍候...")
+    started = time.monotonic()
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-doctor") as executor:
+        futures = [executor.submit(model_warmup_check) for _ in range(2)]
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append({"status": "error", "error": str(exc)})
+    elapsed = round(time.monotonic() - started, 3)
+    for index, result in enumerate(results, 1):
+        print(
+            f"- 请求 {index}: {'成功' if result.get('status') == 'ready' else '失败'} / "
+            f"{result.get('latency_seconds', '-')}s / {result.get('error') or result.get('model') or '-'}"
+        )
+    passed = len(results) == 2 and all(item.get("status") == "ready" for item in results)
+    print(f"- 总耗时: {elapsed}s / 结果: {'通过' if passed else '未通过'}")
+    if not passed:
+        Config.save({"model_max_concurrency": 1, "model_concurrency_profile": ""})
+        print("[并发诊断] 已保持模型并发为 1。")
+        return
+    if ask_bool("当前模型通过并发诊断，是否将模型并发上限改为 2", False):
+        fingerprint = model_concurrency_fingerprint(Config.as_dict())
+        Config.save({"model_max_concurrency": 2, "model_concurrency_profile": fingerprint})
+        print("[并发诊断] 已启用并发 2；模型来源、地址或模型名变化后会自动回落到 1。")
+    else:
+        Config.save({"model_max_concurrency": 1, "model_concurrency_profile": ""})
+        print("[并发诊断] 已保留并发 1。")
+
+
 def show_doctor() -> None:
     from model_stream import model_warmup_check
 
@@ -1614,6 +1814,7 @@ def show_doctor() -> None:
         f"- 模型参数: temp={Config.model_temperature} / top_p={Config.model_top_p} / "
         f"repeat_penalty={Config.model_repeat_penalty} / freq_penalty={Config.model_frequency_penalty}"
     )
+    print(f"- 模型队列并发上限: {Config.model_max_concurrency}（使用 doctor concurrency 诊断并解锁）")
     balanced_search = (
         1 <= Config.search_round_cooldown_min_minutes <= Config.search_round_cooldown_minutes <= 5
         and Config.tag_search_delay_seconds >= 20
@@ -1629,9 +1830,17 @@ def show_doctor() -> None:
     )
     if not balanced_search:
         issues.append(("搜索配置偏离当前推荐", "运行 config -> 搜索与风控，建议使用 1-5 分钟随机冷却、20-45 秒间隔、每小时 6 次和每日 30 次预算"))
+    snapshots = runtime_state.platform_snapshots()
     script = runtime_state.script_snapshot()
     state = "在线" if script.get("connected") else ("心跳过期" if script.get("stale") else "离线")
-    print(f"- 油猴脚本: {state}")
+    print(f"- 油猴脚本兼容状态: {state}")
+    for platform, label in (("boss", "BOSS"), ("zhaopin", "智联")):
+        platform_script = snapshots[platform]
+        platform_state = "在线" if platform_script.get("connected") else ("心跳过期" if platform_script.get("stale") else "离线")
+        print(
+            f"  {label}: {'启用' if platform_script.get('enabled') else '关闭'} / {platform_state} / "
+            f"控制={platform_script.get('effective_control')} / 原因={platform_script.get('pause_reason') or '-'}"
+        )
     print(f"  页面/状态/动作: {script.get('page')} / {script.get('status')} / {script.get('current_action') or '空闲'}")
     if script.get("heartbeat_age_seconds") is not None:
         print(f"  最近心跳: {script.get('heartbeat_age_seconds')} 秒前")
@@ -1664,13 +1873,22 @@ def show_doctor() -> None:
             f"{detail.get('feedTabProcessedCount', 0)}/"
             f"{format_feed_job_limit(detail.get('feedTabMaxJobs') if detail.get('feedTabMaxJobs') is not None else Config.preferred_feed_max_jobs_per_tab)}"
         )
-        print(
-            f"  岗位滚动: {detail.get('scrollMode') or '未选择'} / "
-            f"{detail.get('scrollTarget') or '-'} / round={detail.get('scrollRound', 0)} / "
-            f"{detail.get('lastScrollOutcome') or '-'} / "
-            f"位置 {detail.get('scrollBefore', 0)}->{detail.get('scrollAfter', 0)} / "
-            f"岗位 {detail.get('scrollJobCountBefore', 0)}->{detail.get('scrollJobCountAfter', 0)}"
-        )
+        if detail.get("platform") == "zhaopin" or detail.get("listMode") == "pagination":
+            print(
+                f"  智联翻页: 当前第 {detail.get('pageNumber') or '?'} 页 / "
+                f"turn={detail.get('pageTurnCount', 0)} / "
+                f"{detail.get('lastPageOutcome') or '-'} / "
+                f"岗位 {detail.get('pageJobCountBefore', 0)}->{detail.get('pageJobCountAfter', 0)} / "
+                f"按钮 {detail.get('pageTarget') or '-'}"
+            )
+        else:
+            print(
+                f"  岗位滚动: {detail.get('scrollMode') or '未选择'} / "
+                f"{detail.get('scrollTarget') or '-'} / round={detail.get('scrollRound', 0)} / "
+                f"{detail.get('lastScrollOutcome') or '-'} / "
+                f"位置 {detail.get('scrollBefore', 0)}->{detail.get('scrollAfter', 0)} / "
+                f"岗位 {detail.get('scrollJobCountBefore', 0)}->{detail.get('scrollJobCountAfter', 0)}"
+            )
         print(
             f"  搜索冷却: {_format_script_cooldown(detail)} / "
             f"范围 {detail.get('cooldownMinMinutes') or Config.search_round_cooldown_min_minutes}-"
@@ -1720,7 +1938,7 @@ def show_doctor() -> None:
                 f"弹窗拦截 {recent_counts.get('job_detail_popup_blocked', 0)}"
             )
         if recent_counts.get("job_detail_popup_blocked", 0):
-            issues.append(("浏览器可能拦截了详情页弹窗", "允许 zhipin.com 弹出窗口，或保持 BOSS 页面为当前浏览器的正常标签"))
+            issues.append(("浏览器可能拦截了详情页弹窗", "允许已启用招聘平台弹出后台详情页窗口"))
         if recent_counts.get("search_scroll_target_missing", 0) or recent_counts.get("search_result_scroll_all_targets_failed", 0):
             issues.append(("最近出现岗位列表滚动失败", "先更新油猴脚本并刷新 BOSS 页面；若仍失败，贴 doctor 中的滚动日志"))
         if recent_counts.get("backend_unavailable_pause", 0) or recent_counts.get("loop_failed", 0):
@@ -1735,11 +1953,11 @@ def show_doctor() -> None:
         print("- API Key 来源: data/config.json（建议迁移到 OPENAI_API_KEY 环境变量）")
         issues.append(("API Key 仍保存在本地配置文件", "先设置 OPENAI_API_KEY 并验证可用，再清空 data/config.json 中的 openai_api_key"))
     if script.get("stale"):
-        print("- 建议: 刷新 BOSS 搜索页，等待 CLI 出现新的脚本心跳后再输入 start。")
-        issues.append(("油猴脚本心跳过期", "刷新 BOSS 搜索页，确认脚本状态重新在线"))
+        print("- 建议: 刷新已启用平台的岗位列表页，等待 CLI 出现新的脚本心跳后再输入 start。")
+        issues.append(("油猴脚本心跳过期", "刷新已启用平台的岗位列表页，确认脚本状态重新在线"))
     elif not script.get("connected"):
-        print("- 建议: 打开或刷新 BOSS 搜索页，确认脚本头包含 @connect 127.0.0.1 和 @connect localhost。")
-        issues.append(("油猴脚本未连接", "运行 script 更新脚本，然后打开或刷新 BOSS 搜索页"))
+        print("- 建议: 打开或刷新已启用平台的岗位列表页，确认脚本头包含 @connect 127.0.0.1 和 @connect localhost。")
+        issues.append(("油猴脚本未连接", "运行 script 更新脚本，然后打开或刷新已启用平台岗位页"))
     greeting = greeting_service.get_greeting()
     cache.load()
     print(f"- 简历: {'已保存' if cache.resume.strip() else '未保存'}")
@@ -1750,7 +1968,7 @@ def show_doctor() -> None:
         issues.append(("简历未保存", "运行 resume 上传并确认简历"))
     elif not cache.cache_status()["profile_generated"]:
         issues.append(("简历画像或标签未生成", "运行 profile 生成画像，或运行 tags 手动确认标签"))
-    if not greeting.get("confirmed"):
+    if Config.boss_enabled and not greeting.get("confirmed"):
         issues.append(("打招呼话术未确认", "运行 greeting 生成或编辑话术"))
     autorun = runtime_state.as_dict(cache.status(), cache.cache_status()).get("autorun") or {}
     if autorun.get("blocked"):
@@ -1845,6 +2063,8 @@ def model_ready_for_autorun() -> bool:
 
 def auto_prepare_saved_configuration() -> bool:
     cache.load()
+    if not Config.boss_enabled and not Config.zhaopin_enabled:
+        return block_autorun("没有启用任何招聘平台", next_action="运行 config -> 平台与智联投递，启用至少一个平台")
     if not cache.resume.strip():
         print("[配置] 未找到已保存简历。请先运行 start_job_seeker.bat 完成人工配置。")
         return block_autorun("未找到已保存简历，自动运行已暂停", next_action="运行 start_job_seeker.bat 配置简历")
@@ -1867,7 +2087,7 @@ def auto_prepare_saved_configuration() -> bool:
             return block_autorun(f"自动生成画像失败: {exc}", next_action="运行人工启动器 profile 检查画像")
 
     greeting = greeting_service.get_greeting()
-    if not greeting.get("confirmed"):
+    if Config.boss_enabled and not greeting.get("confirmed"):
         print("[配置] 缺少打招呼话术，正在用已配置模型自动生成...")
         try:
             draft = greeting_service.generate_greeting("自动运行")
@@ -1877,7 +2097,7 @@ def auto_prepare_saved_configuration() -> bool:
             return block_autorun(f"自动生成打招呼话术失败: {exc}", next_action="运行人工启动器 greeting 确认话术")
 
     cache.load()
-    if not cache.tags:
+    if Config.boss_enabled and not cache.tags:
         print("[配置] 岗位标签为空。请先运行人工启动器 tags。")
         return block_autorun("岗位标签为空，自动运行已暂停", next_action="运行人工启动器 tags 配置岗位标签")
     runtime_state.emit(
@@ -1886,7 +2106,10 @@ def auto_prepare_saved_configuration() -> bool:
         source="startup",
         detail={"tags": cache.tags},
     )
-    print(f"[配置] 自动运行将使用岗位标签: {'、'.join(cache.tags)}")
+    if Config.boss_enabled:
+        print(f"[配置] 自动运行将使用岗位标签: {'、'.join(cache.tags)}")
+    if Config.zhaopin_enabled:
+        print(f"[配置] 智联将轮询 {len(Config.zhaopin_job_urls)} 个岗位列表网址。")
     return True
 
 
@@ -1914,8 +2137,11 @@ def show_help() -> None:
   greeting      重新生成/编辑打招呼用语
   start         开始或继续运行
   resume-run    start 的兼容别名
-  pause         暂停运行
-  stop          停止自动化
+  pause         全局暂停运行
+  stop          全局停止自动化
+  pause boss|zhaopin    只暂停指定平台
+  resume boss|zhaopin   只恢复指定平台
+  stop boss|zhaopin     只停止指定平台
   actions       处理待确认动作
   history       显示最近历史
   logs          显示最近日志
@@ -1923,7 +2149,8 @@ def show_help() -> None:
   report        生成脱敏诊断文件
   backup        备份配置、简历、缓存和数据库
   script        显示篡改猴脚本安装/更新地址
-  doctor        检查依赖、Ollama 和油猴连接
+  doctor        检查依赖、模型和两个平台油猴连接
+  doctor concurrency    执行两个真实请求并诊断模型并发能力
   help          显示帮助
   quit          退出 CLI
 """.strip()
@@ -1933,20 +2160,24 @@ def show_help() -> None:
 def command_loop() -> None:
     show_help()
     while True:
-        command = input("\njob-seeker> ").strip().lower()
-        if not command:
+        raw_command = input("\njob-seeker> ").strip().lower()
+        if not raw_command:
             continue
+        parts = raw_command.split()
+        command = parts[0]
+        platform = parts[1] if len(parts) == 2 and parts[1] in {"boss", "zhaopin"} else None
         if command == "status":
             show_status()
         elif command == "setup":
             setup_quick_start()
             ensure_resume()
             ensure_profile()
-            ensure_greeting()
+            if Config.boss_enabled:
+                ensure_greeting()
             print_summary()
         elif command == "config":
             configure_base()
-        elif command == "resume":
+        elif command == "resume" and len(parts) == 1:
             ensure_resume()
         elif command == "profile":
             edit_profile()
@@ -1957,12 +2188,14 @@ def command_loop() -> None:
             edit_tags()
         elif command == "greeting":
             edit_greeting()
-        elif command in {"start", "resume-run"}:
+        elif command in {"start", "resume-run"} and len(parts) == 1:
             show_control_result("resume")
-        elif command == "pause":
-            show_control_result("pause")
-        elif command == "stop":
-            show_control_result("stop")
+        elif command == "resume" and platform:
+            show_control_result("resume", platform)
+        elif command == "pause" and (len(parts) == 1 or platform):
+            show_control_result("pause", platform)
+        elif command == "stop" and (len(parts) == 1 or platform):
+            show_control_result("stop", platform)
         elif command == "actions":
             handle_pending_actions_once()
         elif command == "history":
@@ -1977,7 +2210,9 @@ def command_loop() -> None:
             show_backup()
         elif command == "script":
             show_script_install()
-        elif command == "doctor":
+        elif command == "doctor" and len(parts) == 2 and parts[1] == "concurrency":
+            show_doctor_concurrency()
+        elif command == "doctor" and len(parts) == 1:
             show_doctor()
         elif command == "help":
             show_help()
@@ -2032,7 +2267,7 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
         print("\n[退出] 定时等待已取消，正在关闭服务...")
         shutdown_autorun()
         return 130
-    print("[3/6] 打开油猴脚本和 BOSS 搜索页...")
+    print("[3/6] 打开油猴脚本和已启用平台岗位页...")
     maybe_open_startup_pages(always_open_userscript=True)
     show_autorun_next_steps()
     print("[4/6] 检查模型、简历、画像、标签和话术...")
@@ -2048,8 +2283,8 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
     print_status_panel()
     print("[6/6] 等待油猴脚本连接，最长等待 120 秒...")
     if not wait_for_script_ready(120):
-        block_autorun("油猴脚本未连接，自动运行已暂停", next_action="安装/更新油猴脚本，登录 BOSS 并刷新搜索页")
-        print("[脚本] 油猴脚本未连接。请确认已安装/启用脚本、BOSS 已登录，并刷新搜索页。")
+        block_autorun("油猴脚本未连接，自动运行已暂停", next_action="安装/更新油猴脚本，登录至少一个已启用平台并刷新岗位页")
+        print("[脚本] 油猴脚本未连接。请确认已安装/启用脚本、平台已登录，并刷新岗位列表页。")
         if should_open_browser_page("userscript"):
             try:
                 webbrowser.open(script_install_url(), new=2)

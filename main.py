@@ -28,6 +28,7 @@ import resume_service
 from cache import cache
 from config import Config
 from core import SCORING_VERSION, analyze_job
+from model_queue import FairModelQueue, ModelQueueCancelled
 from runtime_state import runtime_state
 from schema import (
     ActionCreate,
@@ -46,6 +47,7 @@ from tools import script_connect_hosts
 BASE_DIR = Path(__file__).resolve().parent
 WEB_SCRIPT_PATH = BASE_DIR / "web_script.js"
 MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-model")
+MODEL_QUEUE = FairModelQueue(lambda: int(getattr(Config, "model_max_concurrency", 1)))
 MODEL_EXECUTOR_SHUTDOWN = False
 ALLOW_REMOTE_API_ENV = "JOB_SEEKER_ALLOW_REMOTE"
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
@@ -229,7 +231,7 @@ def missing_profile_analysis(reason: str) -> dict[str, Any]:
     }
 
 
-def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, Any]) -> None:
+def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, Any]) -> bool:
     """Pause automation when the model is unavailable for several jobs in a row."""
     global MODEL_SCORE_FAILURE_STREAK
     risks = {str(risk) for risk in analysis.get("risks") or []}
@@ -240,7 +242,7 @@ def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, A
             streak = MODEL_SCORE_FAILURE_STREAK
         else:
             MODEL_SCORE_FAILURE_STREAK = 0
-            return
+            return False
     runtime_state.emit(
         "model_score_failure_streak",
         f"模型评分连续失败 {streak}/{MODEL_SCORE_FAILURE_PAUSE_THRESHOLD}: {job.get('title', '')}",
@@ -272,6 +274,8 @@ def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, A
                 "reason": analysis.get("match_reason", ""),
             },
         )
+        return True
+    return False
 
 
 def script_base_url() -> str:
@@ -325,6 +329,7 @@ async def status():
     result = runtime_state.as_dict(cache.status(), cache.cache_status())
     result["database"] = database.database_stats()
     result["run_summary"] = database.summarize_run(runtime_state.run_id)
+    result["model_queue"] = MODEL_QUEUE.snapshot()
     result["diagnostics"] = {
         "recent_event_counts_24h": database.recent_event_counts(
             24,
@@ -475,17 +480,32 @@ async def greeting_variants():
 
 @app.post("/script/heartbeat", summary="脚本心跳")
 async def script_heartbeat(payload: ScriptHeartbeat):
-    runtime_state.update_script(payload.page, payload.status, payload.current_action, payload.detail)
+    runtime_state.update_script(
+        payload.page,
+        payload.status,
+        payload.current_action,
+        payload.detail,
+        platform=payload.platform,
+        instance_id=payload.instance_id,
+        page_kind=payload.page_kind,
+    )
     if payload.status == "error":
         runtime_state.log(payload.current_action or "脚本上报错误", level="error", source="script")
-    payload = runtime_state.control_payload()
-    payload.update({"ok": True, "config": Config.public_dict()})
-    return payload
+    response = runtime_state.control_payload(payload.platform)
+    response.update({"ok": True, "config": Config.public_dict(), "model_queue": MODEL_QUEUE.snapshot()})
+    return response
 
 
 @app.post("/control", summary="暂停/继续/停止")
 async def control(payload: ControlUpdate):
+    if payload.platform:
+        runtime_state.set_platform_control(payload.platform, payload.command, payload.reason)
+        if payload.command in {"pause", "stop"}:
+            await MODEL_QUEUE.cancel_platform(payload.platform, payload.reason or f"{payload.platform} 已{payload.command}")
+        return runtime_state.control_payload(payload.platform)
     runtime_state.set_control(payload.command, new_run=payload.new_run)
+    if payload.command in {"pause", "stop"}:
+        await MODEL_QUEUE.cancel_all("全局任务已暂停或停止")
     return runtime_state.control_payload()
 
 
@@ -493,6 +513,9 @@ async def control(payload: ControlUpdate):
 async def jobs_analyze(payload: JobAnalyzeRequest):
     cache.load()
     job = payload.model_dump()
+    platform = str(job.get("platform") or "boss")
+    platform_generation = runtime_state.platform_generation(platform)
+    job["identity_key"] = database.normalize_job_identity(job.get("company", ""), job.get("title", ""))
     existing_job = database.get_job(job.get("url", ""))
     blocked_reason = blocked_by_history(job, existing_job)
     final_action = "already_contacted" if job.get("talked") else ""
@@ -512,14 +535,17 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
             "match_reason": blocked_reason,
             "blocked_reason": blocked_reason,
         }
+    elif runtime_state.platform_control(platform) != "running":
+        analysis = missing_profile_analysis("平台当前处于暂停或停止状态")
+        analysis["platform_action"] = "skip"
     elif not cache.user_detail.strip():
         analysis = missing_profile_analysis("请先生成并确认用户详情")
     else:
-        greeting = greeting_service.get_greeting()
-        confirmed_greeting = greeting["active_content"] if greeting.get("confirmed") else ""
-        loop = asyncio.get_running_loop()
+        greeting = greeting_service.get_greeting() if platform == "boss" else {}
+        confirmed_greeting = greeting.get("active_content", "") if greeting.get("confirmed") else ""
         try:
-            analysis = await loop.run_in_executor(
+            analysis = await MODEL_QUEUE.run(
+                platform,
                 MODEL_EXECUTOR,
                 analyze_job,
                 job,
@@ -527,15 +553,34 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
                 confirmed_greeting,
                 cache.profile,
             )
+        except ModelQueueCancelled as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             if "cannot schedule new futures" in str(exc) or "shutdown" in str(exc).lower():
                 runtime_state.log("服务正在关闭，跳过当前分析任务", source="model", level="warn")
                 analysis = missing_profile_analysis("服务关闭中，分析被中断")
             else:
                 raise
-        update_model_score_failure_streak(analysis, job)
+        model_globally_paused = update_model_score_failure_streak(analysis, job)
+        if model_globally_paused:
+            await MODEL_QUEUE.cancel_all("模型评分连续失败，已全局暂停")
         if analysis.get("total_score", 0) <= 0 and analysis.get("risks"):
             final_action = final_action or "model_failed_skip"
+        if (
+            runtime_state.platform_control(platform) != "running"
+            or runtime_state.platform_generation(platform) != platform_generation
+        ):
+            analysis["platform_action"] = "skip"
+            analysis["blocked_reason"] = "平台已暂停，评分结果已作废"
+            analysis["match_reason"] = "平台已暂停，评分结果已作废"
+        else:
+            analysis["platform_action"] = (
+                ("apply" if platform == "zhaopin" else "greet")
+                if analysis.get("recommendation") == "greet"
+                else "skip"
+            )
+    if "platform_action" not in analysis:
+        analysis["platform_action"] = "skip"
     job["run_id"] = runtime_state.run_id
     saved_job = database.upsert_job(job, analysis, final_action=final_action)
     if job.get("talked"):
@@ -553,11 +598,37 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
 async def create_action(payload: ActionCreate):
     action_data = payload.model_dump()
     action_data["run_id"] = runtime_state.run_id
+    if payload.job_url and not database.get_job(payload.job_url):
+        database.upsert_job(
+            {
+                "url": payload.job_url,
+                "title": payload.title,
+                "company": payload.company,
+                "platform": payload.platform,
+                "external_job_id": payload.external_job_id,
+                "run_id": runtime_state.run_id,
+            }
+        )
     action = database.create_action(action_data)
     if payload.action_type in {"greet", "send_greeting"} and payload.status in {"completed", "approved"}:
         database.update_job_status(payload.job_url, final_action="greeted", greeted=True)
     if payload.action_type == "already_contacted" and payload.status in {"completed", "approved"}:
         database.update_job_status(payload.job_url, final_action="already_contacted", greeted=True)
+    if payload.platform == "zhaopin" and payload.action_type in {"apply", "already_applied"}:
+        transaction_state = str(payload.payload.get("transactionState") or payload.payload.get("state") or "")
+        confirmed = payload.action_type == "already_applied" or transaction_state == "confirmed" or payload.status == "completed"
+        database.update_job_status(
+            payload.job_url,
+            final_action="already_applied" if payload.action_type == "already_applied" else ("applied" if confirmed else ""),
+            applied=True if confirmed else None,
+            application_state="confirmed" if confirmed else (transaction_state or payload.status),
+        )
+    if payload.platform == "zhaopin" and payload.action_type == "apply_delivery_unknown":
+        database.update_job_status(
+            payload.job_url,
+            final_action="apply_delivery_unknown",
+            application_state="unknown",
+        )
     runtime_state.log(f"动作已创建: {payload.action_type}", source="action")
     return action
 
@@ -612,6 +683,24 @@ async def get_introduce():
 
 
 def blocked_by_history(job: dict[str, Any], existing_job: dict[str, Any] | None) -> str:
+    platform = str(job.get("platform") or "boss")
+    if existing_job and existing_job.get("applied"):
+        return "该职位已投递，跳过重复投递"
+    if existing_job and str(existing_job.get("application_state") or "") in {"clicked", "unknown"}:
+        return "该职位已有未确认的投递事务，禁止重复点击"
+    identity_key = str(job.get("identity_key") or "")
+    cross_platform_job = database.get_job_by_identity(identity_key, exclude_platform=platform)
+    cross_platform_terminal = bool(
+        cross_platform_job
+        and (
+            cross_platform_job.get("greeted")
+            or cross_platform_job.get("applied")
+            or str(cross_platform_job.get("application_state") or "") in {"clicked", "unknown", "confirmed"}
+        )
+    )
+    if cross_platform_job and (cross_platform_terminal or recently_processed(cross_platform_job)):
+        action = cross_platform_job.get("final_action") or cross_platform_job.get("recommendation") or "已处理"
+        return f"同公司同职位已在其他平台处理，跳过重复操作: {action}"
     if not Config.skip_contacted_companies:
         return ""
     if job.get("talked"):
@@ -622,7 +711,7 @@ def blocked_by_history(job: dict[str, Any], existing_job: dict[str, Any] | None)
         action = existing_job.get("final_action") or existing_job.get("recommendation") or "已处理"
         return f"该职位近期已处理，跳过重复打开: {action}"
     company = job.get("company", "")
-    if company and database.count_greeted_company(company) >= int(Config.max_contacts_per_company):
+    if platform == "boss" and company and database.count_greeted_company(company, platform="boss") >= int(Config.max_contacts_per_company):
         return f"公司已达到联系上限: {company}"
     return ""
 
