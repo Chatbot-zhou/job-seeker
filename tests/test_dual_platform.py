@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -103,6 +104,138 @@ def test_model_queue_fifo_limit_and_platform_cancellation() -> None:
         executor.shutdown(wait=True)
 
     asyncio.run(scenario())
+
+
+def test_process_model_gate_serializes_scoring_and_warmup(monkeypatch) -> None:
+    import model_stream
+    from config import Config
+
+    monkeypatch.setattr(Config, "model_max_concurrency", 1)
+    monkeypatch.setattr(model_stream, "_model_emit", lambda *args, **kwargs: {})
+    gate = model_stream.ModelExecutionGate()
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    order: list[str] = []
+
+    def work(kind: str, platform: str) -> None:
+        nonlocal active, peak
+        with gate.acquire(kind=kind, platform=platform):
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                order.append(kind)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(work, "warmup", "system")
+        second = executor.submit(work, "job_score", "boss")
+        first.result()
+        second.result()
+
+    assert peak == 1
+    assert set(order) == {"warmup", "job_score"}
+    assert gate.snapshot()["active"] == 0
+    assert gate.snapshot()["queued"] == 0
+
+
+def test_boss_and_zhaopin_use_the_same_scoring_input(monkeypatch) -> None:
+    import core
+
+    captured: list[tuple[str, str, dict]] = []
+
+    def fake_score(job_text: str, user_detail: str, *, event_detail=None):
+        captured.append((job_text, user_detail, dict(event_detail or {})))
+        return {"学历专业": 70, "技术栈": 80, "项目经验": 60}, "ok"
+
+    monkeypatch.setattr(core, "calculate_job_score", fake_score)
+    shared_job = {
+        "title": "AI 应用工程师",
+        "company": "示例科技",
+        "salary": "20-30K",
+        "city": "杭州",
+        "detail": "负责 Agent 与 RAG 应用开发",
+    }
+    boss = core.analyze_job({**shared_job, "platform": "boss", "model_request_id": "boss-1"}, "用户画像")
+    zhaopin = core.analyze_job(
+        {**shared_job, "platform": "zhaopin", "model_request_id": "zhaopin-1"},
+        "用户画像",
+    )
+
+    assert captured[0][:2] == captured[1][:2]
+    assert captured[0][2]["platform"] == "boss"
+    assert captured[1][2]["platform"] == "zhaopin"
+    assert boss["score_breakdown"] == zhaopin["score_breakdown"]
+    assert boss["scoring_version"] == zhaopin["scoring_version"] == core.SCORING_VERSION
+
+
+def test_platform_userscript_endpoints_are_isolated() -> None:
+    import main
+
+    boss = main.render_userscript("boss")
+    zhaopin = main.render_userscript("zhaopin")
+
+    assert "// @name         Job Seeker - BOSS" in boss
+    assert "// @match        https://www.zhipin.com/*" in boss
+    assert "https://www.zhaopin.com/*" not in boss
+    assert "/userscripts/boss.user.js" in boss
+    assert "// @name         Job Seeker - 智联招聘" in zhaopin
+    assert "// @match        https://www.zhaopin.com/*" in zhaopin
+    assert "// @match        https://passport.zhaopin.com/*" in zhaopin
+    assert "https://www.zhipin.com/*" not in zhaopin
+    assert "/userscripts/zhaopin.user.js" in zhaopin
+
+
+def test_startup_entry_scope_only_enables_selected_platform(monkeypatch) -> None:
+    import cli_console
+    from config import Config
+
+    monkeypatch.setattr(cli_console, "STARTUP_PLATFORM_SCOPE", "zhaopin")
+    monkeypatch.setattr(Config, "boss_enabled", True)
+    monkeypatch.setattr(Config, "zhaopin_enabled", True)
+    assert cli_console.startup_platform_enabled("boss") is False
+    assert cli_console.startup_platform_enabled("zhaopin") is True
+
+
+def test_page_panel_can_start_a_platform_without_cli(monkeypatch) -> None:
+    import database
+    import main
+    from runtime_state import RuntimeState
+    from schema import ControlUpdate
+
+    state = RuntimeState()
+    monkeypatch.setattr(database, "upsert_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(database, "finish_run", lambda *args, **kwargs: {})
+    monkeypatch.setattr(database, "create_event", lambda event: event)
+    monkeypatch.setattr(main, "runtime_state", state)
+    monkeypatch.setattr(main.cache, "load", lambda: None)
+    monkeypatch.setattr(main.cache, "_profile", {"user_detail": "已确认用户画像", "tags": []})
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(main, "MODEL_EXECUTOR", executor)
+    monkeypatch.setattr(
+        main,
+        "model_warmup_check",
+        lambda: {"status": "ready", "model": "test", "provider": "ollama"},
+    )
+
+    try:
+        result = asyncio.run(
+            main.control(
+                ControlUpdate(
+                    command="start",
+                    platform="zhaopin",
+                    reason="页面控制面板开始",
+                )
+            )
+        )
+    finally:
+        executor.shutdown(wait=True)
+
+    assert result["control"] == "running"
+    assert result["platform_control"] == "running"
+    assert result["should_start"] is True
 
 
 def test_v6_jobs_and_apply_actions_are_idempotent(tmp_path, monkeypatch) -> None:

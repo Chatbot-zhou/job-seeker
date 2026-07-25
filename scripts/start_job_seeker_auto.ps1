@@ -1,4 +1,6 @@
 param(
+    [ValidateSet("all", "boss", "zhaopin")]
+    [string]$Platform = "all",
     [switch]$NoOpen
 )
 
@@ -12,6 +14,7 @@ try {
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BossUrl = "https://www.zhipin.com/web/geek/jobs"
+$ZhaopinDefaultUrl = "https://www.zhaopin.com/recommend"
 $OpenCooldownSeconds = 60
 $DefaultOllamaModel = "qwen3:1.7b"
 
@@ -241,31 +244,55 @@ function Test-OpenCooldown {
 }
 
 function Open-StartupPages {
-    param([int]$Port)
+    param(
+        [int]$Port,
+        [string]$SelectedPlatform
+    )
     if ($NoOpen) {
         return
     }
-    $scriptUrl = "http://127.0.0.1:${Port}/web_script.user.js"
-    if (Test-OpenCooldown "userscript") {
-        Write-Info "Opening userscript install/update page: $scriptUrl"
-        Start-Process $scriptUrl | Out-Null
-    } else {
-        Write-Warn "Userscript page was opened recently; skipping duplicate open."
+    $platforms = if ($SelectedPlatform -eq "all") { @("boss", "zhaopin") } else { @($SelectedPlatform) }
+    foreach ($name in $platforms) {
+        $scriptUrl = "http://127.0.0.1:${Port}/userscripts/${name}.user.js"
+        if (Test-OpenCooldown "userscript_$name") {
+            Write-Info "Opening $name userscript install/update page: $scriptUrl"
+            Start-Process $scriptUrl | Out-Null
+        } else {
+            Write-Warn "$name userscript page was opened recently; skipping duplicate open."
+        }
     }
-    if (Test-OpenCooldown "boss_search") {
+    if ($SelectedPlatform -in @("all", "boss") -and (Test-OpenCooldown "boss_search")) {
         Write-Info "Opening BOSS search page: $BossUrl"
         Start-Process $BossUrl | Out-Null
-    } else {
+    } elseif ($SelectedPlatform -in @("all", "boss")) {
         Write-Warn "BOSS search page was opened recently; skipping duplicate open."
+    }
+    if ($SelectedPlatform -in @("all", "zhaopin") -and (Test-OpenCooldown "zhaopin_search")) {
+        $zhaopinUrl = $ZhaopinDefaultUrl
+        if ($null -ne $script:config -and $script:config.zhaopin_job_urls -and $script:config.zhaopin_job_urls.Count -gt 0) {
+            $zhaopinUrl = [string]$script:config.zhaopin_job_urls[0]
+        }
+        Write-Info "Opening Zhaopin jobs page: $zhaopinUrl"
+        Start-Process $zhaopinUrl | Out-Null
+    } elseif ($SelectedPlatform -in @("all", "zhaopin")) {
+        Write-Warn "Zhaopin jobs page was opened recently; skipping duplicate open."
     }
 }
 
 function Resume-ExistingJobSeeker {
-    param([int]$Port)
+    param(
+        [int]$Port,
+        [string]$SelectedPlatform
+    )
     try {
-        $body = @{ command = "resume"; new_run = $true } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/control" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5 | Out-Null
-        Write-Info "Existing Job Seeker service resumed with a new run."
+        $requestBody = if ($SelectedPlatform -eq "all") {
+            @{ command = "resume"; new_run = $true; reason = "自动启动全部平台" }
+        } else {
+            @{ command = "start"; platform = $SelectedPlatform; reason = "自动启动 $SelectedPlatform 平台" }
+        }
+        $body = $requestBody | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/control" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 40 | Out-Null
+        Write-Info "Existing Job Seeker service resumed for: $SelectedPlatform."
         return $true
     } catch {
         Write-Warn "Failed to resume existing Job Seeker service: $($_.Exception.Message)"
@@ -382,12 +409,12 @@ if (Test-TcpPort $port) {
         Write-Warn "Job Seeker is already running on port $port. Attaching to the existing backend."
         $existingStatus = Get-ExistingJobSeekerStatus $port
         if (Test-ExistingJobSeekerReady $existingStatus) {
-            Resume-ExistingJobSeeker $port | Out-Null
+            Resume-ExistingJobSeeker $port $Platform | Out-Null
         } else {
             Write-Warn "Existing backend is alive, but saved configuration is not fully ready. It will not be resumed automatically."
             Write-Warn "Open http://127.0.0.1:${port}/status or use start_job_seeker.bat to finish configuration."
         }
-        Open-StartupPages $port
+        Open-StartupPages $port $Platform
         Write-Info "Existing backend is attached. You can monitor: http://127.0.0.1:${port}/status"
         Pause-And-Exit 0
     }
@@ -412,6 +439,7 @@ if ($provider -eq "openai" -and -not $openaiKey) {
 Write-Info "Starting Job Seeker auto-run..."
 Write-Info "This mode uses saved configuration and starts automatically after the userscript connects."
 $mainPy = Join-Path $ProjectRoot "main.py"
+$env:JOB_SEEKER_ENTRY_PLATFORM = $Platform
 & $pythonExe $mainPy autorun
 $exitCode = $LASTEXITCODE
 

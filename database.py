@@ -677,6 +677,78 @@ def count_applications(*, run_id: str = "", day: str = "") -> int:
     return int(row["count"]) if row else 0
 
 
+def reconcile_stale_application_actions(*, stale_minutes: int = 10) -> dict[str, Any]:
+    """Move abandoned Zhaopin post-click transactions to an explicit unknown state."""
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, int(stale_minutes)))).isoformat()
+    current_time = now_iso()
+    action_ids: list[int] = []
+    job_urls: list[str] = []
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, job_url
+            FROM actions
+            WHERE platform = 'zhaopin'
+              AND action_type = 'apply'
+              AND status = 'clicked'
+              AND updated_at < ?
+            ORDER BY id
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            action_id = int(row["id"])
+            job_url = str(row["job_url"] or "")
+            action_ids.append(action_id)
+            if job_url:
+                job_urls.append(job_url)
+            conn.execute(
+                """
+                UPDATE actions
+                SET status = 'unknown',
+                    note = CASE
+                        WHEN note = '' THEN '程序退出前未确认投递结果，已自动标记为结果未知'
+                        ELSE note
+                    END,
+                    result_json = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'clicked'
+                """,
+                (
+                    json.dumps(
+                        {
+                            "transactionState": "unknown",
+                            "reason": "stale_clicked_reconciled",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    current_time,
+                    action_id,
+                ),
+            )
+            if job_url:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET application_state = 'unknown',
+                        final_action = 'apply_delivery_unknown',
+                        updated_at = ?
+                    WHERE url = ?
+                      AND platform = 'zhaopin'
+                      AND application_state = 'clicked'
+                    """,
+                    (current_time, job_url),
+                )
+        conn.commit()
+    return {
+        "count": len(action_ids),
+        "action_ids": action_ids,
+        "job_urls": job_urls,
+        "cutoff": cutoff,
+    }
+
+
 def create_event(event: dict[str, Any]) -> dict[str, Any]:
     init_db()
     current_time = event.get("time") or now_iso()

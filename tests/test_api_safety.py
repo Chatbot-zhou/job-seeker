@@ -59,7 +59,8 @@ def test_userscript_is_served_as_utf8(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 200
     assert "charset=utf-8" in response.headers["content-type"].lower()
-    assert "@description  Job Seeker 篡改猴插件" in response.text
+    assert "@description  Job Seeker BOSS 直聘通道" in response.text
+    assert "@namespace    http://tampermonkey.net/" in response.text
 
 
 def test_platform_heartbeat_and_control_are_isolated(tmp_path, monkeypatch) -> None:

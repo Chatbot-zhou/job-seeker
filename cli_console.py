@@ -54,6 +54,9 @@ SESSION_PREPARED = False
 BROWSER_OPEN_COOLDOWN_SECONDS = 60
 DEFAULT_AUTORUN_OLLAMA_MODEL = "qwen3:1.7b"
 OLLAMA_PULL_TIMEOUT_SECONDS = 1800
+STARTUP_PLATFORM_SCOPE = str(os.getenv("JOB_SEEKER_ENTRY_PLATFORM", "all")).strip().lower()
+if STARTUP_PLATFORM_SCOPE not in {"all", "boss", "zhaopin"}:
+    STARTUP_PLATFORM_SCOPE = "all"
 
 DETAIL_EVENT_TYPES = {
     "message_send_failed",
@@ -76,6 +79,26 @@ COMPACT_SCRIPT_STATUS_KEYWORDS = (
     "职位列表已处理完毕",
     "详情页已启动",
 )
+
+
+def startup_platform_enabled(platform: str) -> bool:
+    if platform not in {"boss", "zhaopin"}:
+        return False
+    return bool(getattr(Config, f"{platform}_enabled", True)) and (
+        STARTUP_PLATFORM_SCOPE == "all" or STARTUP_PLATFORM_SCOPE == platform
+    )
+
+
+def apply_startup_platform_scope() -> None:
+    for platform in ("boss", "zhaopin"):
+        if startup_platform_enabled(platform):
+            runtime_state.set_platform_control(platform, "resume", f"{platform} 启动入口")
+        else:
+            runtime_state.set_platform_control(
+                platform,
+                "stop",
+                f"当前使用 {STARTUP_PLATFORM_SCOPE} 启动入口，未启动该通道",
+            )
 
 
 def log_verbosity() -> str:
@@ -773,12 +796,12 @@ def prepare_session_start(force: bool = False) -> bool:
     global SESSION_PREPARED
     if SESSION_PREPARED and runtime_state.control != "stopped" and not force:
         return True
-    if not Config.boss_enabled and not Config.zhaopin_enabled:
+    if not startup_platform_enabled("boss") and not startup_platform_enabled("zhaopin"):
         print("[配置] BOSS 和智联均已关闭，请先在 config -> 平台与智联投递中启用至少一个平台。")
         return False
 
     cache.load()
-    if not Config.boss_enabled:
+    if not startup_platform_enabled("boss"):
         SESSION_PREPARED = True
         runtime_state.emit(
             "session_config_saved",
@@ -873,7 +896,7 @@ def needs_initialization() -> bool:
         CONFIG_WAS_MISSING
         or not cache.resume.strip()
         or not cache.cache_status()["profile_generated"]
-        or (Config.boss_enabled and not greeting.get("confirmed"))
+        or (startup_platform_enabled("boss") and not greeting.get("confirmed"))
     )
 
 
@@ -884,12 +907,12 @@ def run_initialization() -> None:
     setup_quick_start()
     ensure_resume()
     ensure_profile()
-    if Config.boss_enabled:
+    if startup_platform_enabled("boss"):
         ensure_greeting()
     print_summary()
     if ask_bool("确认以上配置并进入待启动状态", True):
         runtime_state.set_control("pause")
-        print("[控制] 初始化完成。打开已启用平台岗位页后输入 start 开始自动化。")
+        print("[控制] 初始化完成。可在平台页面左下角点击开始，或在 CLI 输入 start。")
     else:
         runtime_state.set_control("pause")
         print("[控制] 已暂停。可输入 config/resume/greeting 调整配置。")
@@ -1121,7 +1144,7 @@ def print_status_panel() -> None:
     if simple_status:
         print("\n[状态] Job Seeker")
         print(f"- 服务地址: http://{Config.server_host}:{Config.server_port}")
-        print(f"- 脚本地址: http://{Config.server_host}:{Config.server_port}/web_script.user.js")
+        print(f"- 脚本目录: http://{Config.server_host}:{Config.server_port}/userscripts/")
         print(f"- 模型: {model_label} / {model_status}")
         print(f"- 思考模式: 评分 {scoring_think} / 画像标签 {scoring_think} / 打招呼 {greeting_think}")
         print(f"- 阈值与统计: {Config.score_threshold} 分 / 本轮成功 {script_detail.get('sessionGreetCount', 0)} / 今日成功 {script_detail.get('dailyGreetCount', 0)}")
@@ -1138,7 +1161,7 @@ def print_status_panel() -> None:
 ║              Job Seeker 状态面板                              ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  服务地址    http://{Config.server_host}:{Config.server_port:<45}║
-║  脚本地址    http://{Config.server_host}:{Config.server_port}/web_script.user.js{' ' * (30 - len(str(Config.server_port)))}║
+║  脚本目录    http://{Config.server_host}:{Config.server_port}/userscripts/{' ' * (31 - len(str(Config.server_port)))}║
 ╠══════════════════════════════════════════════════════════════╣
 ║  模型        {model_label:<48}║
 ║  模型状态    {model_status:<48}║
@@ -1236,8 +1259,20 @@ def print_summary() -> None:
     print(f"- 话术: {greeting.get('active_content', '')[:80]}")
 
 
-def script_install_url() -> str:
-    return f"http://{Config.server_host}:{Config.server_port}/web_script.user.js"
+def script_install_url(platform: str = "boss") -> str:
+    selected = platform if platform in {"boss", "zhaopin"} else "boss"
+    return f"http://{Config.server_host}:{Config.server_port}/userscripts/{selected}.user.js"
+
+
+def script_install_urls() -> dict[str, str]:
+    platforms = [
+        platform
+        for platform in ("boss", "zhaopin")
+        if startup_platform_enabled(platform)
+    ]
+    if not platforms:
+        platforms = ["boss", "zhaopin"]
+    return {platform: script_install_url(platform) for platform in platforms}
 
 
 def api_health_url() -> str:
@@ -1296,14 +1331,16 @@ def wait_for_api_ready(timeout_seconds: float = 20.0) -> bool:
 
 def show_startup_next_steps() -> None:
     print("\n[启动] 下一步:")
-    print(f"  1. 确认油猴脚本已安装或更新: {script_install_url()}")
+    print("  1. 确认当前入口对应的油猴脚本已安装或更新:")
+    for platform, url in script_install_urls().items():
+        print(f"     - {platform}: {url}")
     print("  2. 刷新已启用平台的岗位列表页，等待 CLI 显示脚本就绪")
     print("  3. 输入 start，确认岗位标签和运行配置后开始")
 
 
 def show_autorun_next_steps() -> None:
     print("\n[启动] 自动运行模式")
-    print(f"  1. 已尝试打开油猴脚本安装/更新页: {script_install_url()}")
+    print("  1. 已尝试打开当前入口对应的油猴脚本安装/更新页")
     print("  2. 已尝试打开已启用平台的岗位列表页")
     print("  3. 等待任一已启用平台的油猴脚本心跳，在线后自动开始运行")
 
@@ -1406,31 +1443,37 @@ def maybe_open_startup_pages(*, always_open_userscript: bool = False) -> None:
     if not wait_for_api_ready():
         print("[启动] 本地 API 未在限定时间内就绪，已跳过自动打开。")
         return
-    if Config.boss_enabled and should_open_browser_page("boss_search"):
+    if startup_platform_enabled("boss") and should_open_browser_page("boss_search"):
         try:
             webbrowser.open(BOSS_SEARCH_URL, new=2)
             print("[启动] 已打开 BOSS 搜索页。")
         except Exception as exc:
             print(f"[启动] 打开 BOSS 搜索页失败: {exc}")
-    elif Config.boss_enabled:
+    elif startup_platform_enabled("boss"):
         print("[启动] 60 秒内已打开过 BOSS 搜索页，本次跳过自动打开。")
-    if Config.zhaopin_enabled and Config.zhaopin_job_urls and should_open_browser_page("zhaopin_search"):
+    if startup_platform_enabled("zhaopin") and Config.zhaopin_job_urls and should_open_browser_page("zhaopin_search"):
         try:
             webbrowser.open(Config.zhaopin_job_urls[0], new=2)
             print("[启动] 已打开智联岗位列表页。")
         except Exception as exc:
             print(f"[启动] 打开智联岗位列表页失败: {exc}")
-    elif Config.zhaopin_enabled:
+    elif startup_platform_enabled("zhaopin"):
         print("[启动] 60 秒内已打开过智联岗位列表页，本次跳过自动打开。")
-    if (always_open_userscript or CONFIG_WAS_MISSING) and should_open_browser_page("userscript"):
+    meta_version, _ = read_script_versions()
+    for platform, url in script_install_urls().items():
+        stamp_name = (
+            f"userscript_{platform}"
+            if always_open_userscript or CONFIG_WAS_MISSING
+            else f"userscript_{platform}_{meta_version}"
+        )
+        cooldown = BROWSER_OPEN_COOLDOWN_SECONDS if always_open_userscript else 3650 * 24 * 60 * 60
+        if not should_open_browser_page(stamp_name, cooldown_seconds=cooldown):
+            continue
         try:
-            webbrowser.open(script_install_url(), new=2)
-            if always_open_userscript:
-                print("[启动] 已打开脚本安装/更新页。")
-            else:
-                print("[启动] 首次运行，已打开脚本安装页（后续输入 script 命令可重新打开）。")
+            webbrowser.open(url, new=2)
+            print(f"[启动] 已打开 {platform} 脚本安装/更新页。")
         except Exception as exc:
-            print(f"[启动] 打开脚本安装页失败: {exc}")
+            print(f"[启动] 打开 {platform} 脚本安装页失败: {exc}")
 
 
 def wait_for_script_ready(timeout_seconds: float = 120.0) -> bool:
@@ -1438,9 +1481,9 @@ def wait_for_script_ready(timeout_seconds: float = 120.0) -> bool:
     while time.monotonic() < deadline:
         snapshots = runtime_state.platform_snapshots()
         enabled = []
-        if Config.boss_enabled:
+        if startup_platform_enabled("boss"):
             enabled.append("boss")
-        if Config.zhaopin_enabled:
+        if startup_platform_enabled("zhaopin"):
             enabled.append("zhaopin")
         if any(snapshots.get(platform, {}).get("connected") for platform in enabled):
             return True
@@ -1462,18 +1505,21 @@ def read_script_versions() -> tuple[str, str]:
 
 def show_script_install() -> None:
     meta_version, runtime_version = read_script_versions()
-    url = script_install_url()
+    urls = script_install_urls()
     print("[脚本] 篡改猴安装/更新")
-    print(f"- 安装地址: {url}")
+    for platform, url in urls.items():
+        print(f"- {platform} 安装地址: {url}")
     print(f"- 元数据版本: {meta_version}")
     print(f"- 运行版本: {runtime_version}")
     if meta_version != runtime_version:
         print("- 提醒: 元数据版本和运行版本不一致，请先更新油猴脚本。")
-    print(f"- 需要 @connect: {', '.join(build_script_connect_hosts(url))}")
-    print("- 用法: 在浏览器打开安装地址，按篡改猴提示安装或更新，然后刷新 BOSS/智联岗位列表页。")
+    first_url = next(iter(urls.values()))
+    print(f"- 需要 @connect: {', '.join(build_script_connect_hosts(first_url))}")
+    print("- 用法: 分别安装需要的平台脚本，然后刷新对应岗位列表页。")
     print("- 验证: CLI 应显示脚本就绪，并且 status/doctor 中的脚本版本等于运行版本。")
     try:
-        webbrowser.open(url, new=2)
+        for url in urls.values():
+            webbrowser.open(url, new=2)
         print("- 已尝试在浏览器中打开安装地址。")
     except Exception as exc:
         print(f"- 自动打开失败: {exc}")
@@ -1517,6 +1563,12 @@ def show_status() -> None:
             f"  模型队列: 并发 {model_queue.get('limit', Config.model_max_concurrency)} | "
             f"活动 {model_queue.get('active', 0)} | 排队 {model_queue.get('queued', 0)} | "
             f"平台等待 {model_queue.get('queued_by_platform') or {}}"
+        )
+        execution_gate = model_queue.get("execution_gate") or {}
+        print(
+            f"  模型执行门: 活动 {execution_gate.get('active', 0)} | "
+            f"排队 {execution_gate.get('queued', 0)} | "
+            f"类型 {execution_gate.get('active_by_kind') or {}}"
         )
     except (OSError, URLError, ValueError):
         print(f"  模型队列: 并发 {Config.model_max_concurrency} | 状态暂不可读")
@@ -1746,7 +1798,7 @@ def show_doctor_concurrency() -> None:
     started = time.monotonic()
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-doctor") as executor:
-        futures = [executor.submit(model_warmup_check) for _ in range(2)]
+        futures = [executor.submit(model_warmup_check, bypass_gate=True) for _ in range(2)]
         for future in as_completed(futures):
             try:
                 results.append(future.result())
@@ -2063,7 +2115,7 @@ def model_ready_for_autorun() -> bool:
 
 def auto_prepare_saved_configuration() -> bool:
     cache.load()
-    if not Config.boss_enabled and not Config.zhaopin_enabled:
+    if not startup_platform_enabled("boss") and not startup_platform_enabled("zhaopin"):
         return block_autorun("没有启用任何招聘平台", next_action="运行 config -> 平台与智联投递，启用至少一个平台")
     if not cache.resume.strip():
         print("[配置] 未找到已保存简历。请先运行 start_job_seeker.bat 完成人工配置。")
@@ -2087,7 +2139,7 @@ def auto_prepare_saved_configuration() -> bool:
             return block_autorun(f"自动生成画像失败: {exc}", next_action="运行人工启动器 profile 检查画像")
 
     greeting = greeting_service.get_greeting()
-    if Config.boss_enabled and not greeting.get("confirmed"):
+    if startup_platform_enabled("boss") and not greeting.get("confirmed"):
         print("[配置] 缺少打招呼话术，正在用已配置模型自动生成...")
         try:
             draft = greeting_service.generate_greeting("自动运行")
@@ -2097,7 +2149,7 @@ def auto_prepare_saved_configuration() -> bool:
             return block_autorun(f"自动生成打招呼话术失败: {exc}", next_action="运行人工启动器 greeting 确认话术")
 
     cache.load()
-    if Config.boss_enabled and not cache.tags:
+    if startup_platform_enabled("boss") and not cache.tags:
         print("[配置] 岗位标签为空。请先运行人工启动器 tags。")
         return block_autorun("岗位标签为空，自动运行已暂停", next_action="运行人工启动器 tags 配置岗位标签")
     runtime_state.emit(
@@ -2106,9 +2158,9 @@ def auto_prepare_saved_configuration() -> bool:
         source="startup",
         detail={"tags": cache.tags},
     )
-    if Config.boss_enabled:
+    if startup_platform_enabled("boss"):
         print(f"[配置] 自动运行将使用岗位标签: {'、'.join(cache.tags)}")
-    if Config.zhaopin_enabled:
+    if startup_platform_enabled("zhaopin"):
         print(f"[配置] 智联将轮询 {len(Config.zhaopin_job_urls)} 个岗位列表网址。")
     return True
 
@@ -2172,7 +2224,7 @@ def command_loop() -> None:
             setup_quick_start()
             ensure_resume()
             ensure_profile()
-            if Config.boss_enabled:
+            if startup_platform_enabled("boss"):
                 ensure_greeting()
             print_summary()
         elif command == "config":
@@ -2227,6 +2279,7 @@ def run_cli(app, shutdown_callback: Callable[[], None] | None = None) -> None:
     database.init_db()
     cache.load()
     start_event_printer()
+    apply_startup_platform_scope()
     runtime_state.emit("cli_start", "Job Seeker CLI 启动", source="startup")
     run_initialization()
     server = start_api_server(app)
@@ -2250,6 +2303,7 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
     database.init_db()
     cache.load()
     start_event_printer()
+    apply_startup_platform_scope()
     runtime_state.emit("autorun_start", "Job Seeker 自动运行启动", source="startup")
     print("[1/6] 启动本地 API 服务...")
     server = start_api_server(app)
@@ -2285,12 +2339,14 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
     if not wait_for_script_ready(120):
         block_autorun("油猴脚本未连接，自动运行已暂停", next_action="安装/更新油猴脚本，登录至少一个已启用平台并刷新岗位页")
         print("[脚本] 油猴脚本未连接。请确认已安装/启用脚本、平台已登录，并刷新岗位列表页。")
-        if should_open_browser_page("userscript"):
+        for platform, url in script_install_urls().items():
+            if not should_open_browser_page(f"userscript_{platform}"):
+                continue
             try:
-                webbrowser.open(script_install_url(), new=2)
-                print("[脚本] 已再次打开油猴脚本安装/更新页。")
+                webbrowser.open(url, new=2)
+                print(f"[脚本] 已再次打开 {platform} 油猴脚本安装/更新页。")
             except Exception as exc:
-                print(f"[脚本] 打开油猴脚本安装/更新页失败: {exc}")
+                print(f"[脚本] 打开 {platform} 油猴脚本安装/更新页失败: {exc}")
         try:
             keep_process_alive()
         finally:

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.26.31
+// @version      2026.07.25.1
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -24,7 +24,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.06.26.31',
+        scriptVersion: '2026.07.25.1',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -1074,6 +1074,50 @@
             }
             return '';
         },
+        companyNameFromJobCard(node, title = '', salary = '') {
+            if (!node) return '';
+            const card = node.closest?.(
+                '.job-card-box,.job-card-wrapper,[class*="job-card"],[class*="jobCard"],'
+                + '[class*="position-item"],[class*="positionItem"],[class*="job-item"],[class*="jobItem"]'
+            ) || node;
+            const selectors = [
+                '.company-name', '.company-info .name', '.company-card .name',
+                '[class*="companyName"]', '[class*="company-name"]',
+                '[class*="companyTitle"]', '[class*="company-title"]',
+                '[data-testid*="company"]', '[ka*="company"]',
+            ];
+            for (const selector of selectors) {
+                let candidates = [];
+                try {
+                    candidates = Array.from(card.querySelectorAll?.(selector) || []);
+                } catch (e) {
+                    continue;
+                }
+                for (const candidate of candidates) {
+                    const company = this.sanitizeCompanyName(
+                        this.normalizedText(candidate),
+                        title,
+                        salary,
+                    );
+                    if (company) return company;
+                }
+            }
+            return '';
+        },
+        analysisScoreSummary(analysis = {}) {
+            const education = Number(analysis.education_score || analysis.score_breakdown?.education || 0);
+            const skill = Number(analysis.skill_score || analysis.score_breakdown?.skill || 0);
+            const experience = Number(analysis.experience_score || analysis.score_breakdown?.experience || 0);
+            const total = Number(analysis.total_score || 0);
+            return `学历专业 ${education} / 技术栈 ${skill} / 项目经验 ${experience} / 加权匹配度 ${total}`;
+        },
+        platformActionLabel(action = '') {
+            return {
+                greet: '打招呼',
+                apply: '立即投递',
+                skip: '跳过',
+            }[String(action || '')] || String(action || '跳过');
+        },
         isBackendUnavailableError(value) {
             const text = String(value?.message || value || '').toLowerCase();
             if (!text) return false;
@@ -1793,7 +1837,7 @@
 
     // 日志记录
     class Logger {
-        constructor(startFn, pauseFn) {
+        constructor(startFn, pauseFn, stopFn) {
             // 校验回调函数
             if (startFn && typeof startFn !== 'function') {
                 throw new Error('参数错误：startFn 应为函数');
@@ -1801,11 +1845,15 @@
             if (pauseFn && typeof pauseFn !== 'function') {
                 throw new Error('参数错误：pauseFn 应为函数');
             }
+            if (stopFn && typeof stopFn !== 'function') {
+                throw new Error('参数错误：stopFn 应为函数');
+            }
             // 创建元素
             const ctn = document.createElement('div');
             const btnBox = document.createElement('div');
             const clearBtn = document.createElement('div');
             const runBtn = document.createElement('div');
+            const stopBtn = document.createElement('div');
             const foldBtn = document.createElement('div');
             const msgList = document.createElement('div');
             ctn.dataset.jobSeekerOverlay = '1';
@@ -1828,7 +1876,7 @@
                 align-items: center;
                 justify-content: flex-end;
             `;
-            clearBtn.style.cssText = runBtn.style.cssText = foldBtn.style.cssText = `
+            clearBtn.style.cssText = runBtn.style.cssText = stopBtn.style.cssText = foldBtn.style.cssText = `
                 width: 60px;
                 height: 32px;
                 line-height: 32px;
@@ -1846,32 +1894,50 @@
             `;
             clearBtn.innerText = "清空";
             runBtn.innerText = "开始";
+            stopBtn.innerText = "结束";
             foldBtn.innerText = "收起";
             document.body.appendChild(ctn);
             ctn.appendChild(btnBox);
             btnBox.appendChild(clearBtn);
             btnBox.appendChild(runBtn);
+            if (stopFn) btnBox.appendChild(stopBtn);
             btnBox.appendChild(foldBtn);
             ctn.appendChild(msgList);
             this.ctn = ctn;
             this.list = msgList;
             this.runBtn = runBtn;
+            this.stopBtn = stopBtn;
             this.clearBtn = clearBtn;
             this.__startFn = startFn || (() => void 0);
             this.__pauseFn = pauseFn || (() => void 0);
+            this.__stopFn = stopFn || (() => void 0);
             this.__pause = true;
+            this.__stopped = true;
             clearBtn.addEventListener('click', () => this.clear());
             runBtn.addEventListener('click', async () => {
                 const nextPaused = !this.__pause;
-                this.setPaused(nextPaused);
+                const previousPaused = this.__pause;
                 try {
                     if (nextPaused) {
                         await this.__pauseFn();
+                        this.setPaused(true);
                     } else {
                         await this.__startFn();
+                        this.__stopped = false;
+                        this.setPaused(false);
                     }
                 } catch (e) {
+                    this.setPaused(previousPaused);
                     this.add(`控制命令发送失败: ${e}`);
+                }
+            });
+            stopBtn.addEventListener('click', async () => {
+                try {
+                    await this.__stopFn();
+                    this.setStopped(true);
+                    this.add('当前平台已结束，可点击开始重新运行');
+                } catch (e) {
+                    this.add(`结束命令发送失败: ${e}`);
                 }
             });
             foldBtn.addEventListener('click', () => {
@@ -1888,7 +1954,12 @@
 
         setPaused(paused) {
             this.__pause = Boolean(paused);
-            this.runBtn.innerText = this.__pause ? "继续" : "暂停";
+            this.runBtn.innerText = this.__pause ? (this.__stopped ? "开始" : "继续") : "暂停";
+        }
+
+        setStopped(stopped = true) {
+            this.__stopped = Boolean(stopped);
+            this.setPaused(Boolean(stopped) || this.__pause);
         }
 
         add(message) {
@@ -1976,6 +2047,7 @@
             let elsLen = 0;
             const seenJobHrefs = new Set();
             const backendProcessedHrefs = new Set();
+            const jobCardMetadata = new Map();
             let lastJobListEventKey = '';
             let searchRoundId = 0;
             let tagsCheckedThisRound = new Set();
@@ -2409,8 +2481,7 @@
 
             // 日志启动/暂停事件
             const logger = new Logger(async () => {
-                const res = await api.heartbeat('search', this.pause ? 'paused' : 'idle', '等待 CLI start', scriptHeartbeatDetail());
-                applyBackendConfig(res.config);
+                const res = await api.control('start', '用户在 BOSS 页面控制面板点击开始');
                 lastBackendRunId = res.run_id || lastBackendRunId;
                 if (res.control === 'running' || res.should_start) {
                     if (!(await ensureSearchLease('手动启动'))) return;
@@ -2420,12 +2491,16 @@
                     started ? loop() : main();
                     return;
                 }
-                logger.setPaused(true);
-                this.pause = true;
-                logger.add('请回到 CLI 输入 start，确认岗位标签和运行配置后开始');
+                throw new Error(res.message || '后端未允许 BOSS 通道开始');
             }, async () => {
-                await api.control('pause');
+                await api.control('pause', '用户在 BOSS 页面控制面板点击暂停');
                 this.pause = true;
+            }, async () => {
+                await api.control('stop', '用户在 BOSS 页面控制面板点击结束');
+                this.pause = true;
+                started = false;
+                tools.endGreetSession();
+                releaseSearchLease();
             });
 
             const noteBackendOffline = (message) => {
@@ -2538,7 +2613,7 @@
                     if (!this.pause) logger.add('CLI 已停止自动化');
                     tools.endGreetSession();
                     releaseSearchLease();
-                    logger.setPaused(true);
+                    logger.setStopped(true);
                     this.pause = true;
                     return false;
                 }
@@ -4182,9 +4257,24 @@
                         if (!aList.length) {
                             aList = Array.from(document.querySelectorAll('a[href*="/job_detail/"]'));
                         }
-                        return Array.from(
-                            new Set(Array.from(aList).map(a => tools.hrefFromJobNode(a)).filter(Boolean))
-                        );
+                        const hrefs = [];
+                        for (const anchor of Array.from(aList)) {
+                            const href = tools.hrefFromJobNode(anchor);
+                            if (!href) continue;
+                            const key = tools.jobIdentityKey(href);
+                            const card = anchor.closest?.(
+                                '.job-card-box,.job-card-wrapper,[class*="job-card"],[class*="jobCard"]'
+                            ) || anchor;
+                            const title = tools.normalizedText(anchor);
+                            const salaryNode = card.querySelector?.('.salary,[class*="salary"]');
+                            const salary = tools.normalizedText(salaryNode);
+                            const company = tools.companyNameFromJobCard(card, title, salary);
+                            if (key && (company || title || salary)) {
+                                jobCardMetadata.set(key, { company, title, salary });
+                            }
+                            hrefs.push(href);
+                        }
+                        return Array.from(new Set(hrefs));
                     };
                     let hrefs = collect();
                     const unseen = href => {
@@ -5114,6 +5204,9 @@
                     setSearchAction(`获取职位详情: ${href}`);
                     const jobInfo = await getJobInfoWithRetry(href);
                     jobInfo.url = tools.jobIdentityUrl(href) || href;
+                    const cardMetadata = jobCardMetadata.get(tools.jobIdentityKey(href)) || {};
+                    if (!jobInfo.company && cardMetadata.company) jobInfo.company = cardMetadata.company;
+                    if (!jobInfo.salary && cardMetadata.salary) jobInfo.salary = cardMetadata.salary;
 
                     if (!(await syncControlFromBackend(`暂停检查: 已读取职位详情 ${jobInfo.title}`))) {
                         finishJobProgress('暂停停止');
@@ -5132,7 +5225,11 @@
 
                     logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`);
                     setSearchAction(`分析职位: ${jobInfo.title}`);
-                    await api.event('job_analysis_started', `开始分析职位: ${jobInfo.title}`, 'script', 'info', { title: jobInfo.title, salary: jobInfo.salary });
+                    await api.event('job_analysis_started', `开始分析职位: ${jobInfo.title}`, 'script', 'info', {
+                        title: jobInfo.title,
+                        company: jobInfo.company || '',
+                        salary: jobInfo.salary,
+                    });
                     const analysis = await api.analyzeJob({
                         title: jobInfo.title,
                         salary: jobInfo.salary,
@@ -5144,10 +5241,21 @@
                         talked_reason: jobInfo.talked_reason || '',
                     });
                     const score = analysis.total_score;
-                    logger.add(`匹配度: ${score}`);
+                    logger.add(`评分结果: ${tools.analysisScoreSummary(analysis)}`);
                     if (analysis.match_reason) logger.add(`判断原因: ${analysis.match_reason}`);
-                    if (analysis.recommendation) logger.add(`推荐动作: ${analysis.recommendation}`);
-                    await api.event('job_analysis_finished', `职位分析完成: ${jobInfo.title} / ${score}`, 'script', 'info', { title: jobInfo.title, score, recommendation: analysis.recommendation, risks: analysis.risks || [] });
+                    logger.add(`推荐动作: ${tools.platformActionLabel(analysis.platform_action || 'skip')}`);
+                    await api.event('job_analysis_finished', `职位分析完成: ${jobInfo.title} / ${score}`, 'script', 'info', {
+                        title: jobInfo.title,
+                        company: jobInfo.company || '',
+                        score,
+                        educationScore: Number(analysis.education_score || 0),
+                        skillScore: Number(analysis.skill_score || 0),
+                        experienceScore: Number(analysis.experience_score || 0),
+                        scoringVersion: analysis.scoring_version || '',
+                        platformAction: analysis.platform_action || 'skip',
+                        recommendation: analysis.recommendation,
+                        risks: analysis.risks || [],
+                    });
                     if (analysis.risks && analysis.risks.length) {
                         logger.add(`风险点: ${analysis.risks.join('；')}`);
                     }
@@ -5342,7 +5450,7 @@
 
             // 初始化
             const init = async () => {
-                const res = await api.heartbeat('search', 'idle', '等待 CLI start', scriptHeartbeatDetail());
+                const res = await api.heartbeat('search', 'idle', '等待页面控制面板或 CLI 开始', scriptHeartbeatDetail());
                 applyBackendConfig(res.config);
                 lastBackendRunId = res.run_id || lastBackendRunId;
                 lastBackendControl = res.control || lastBackendControl;
@@ -5357,7 +5465,7 @@
                     threshold: OPTIONS.thread,
                     sessionGreetCount: tools.getSessionGreetCount(),
                 });
-                logger.add('等待 CLI 输入 start 开始自动化');
+                logger.add('可点击左下角“开始”，也可在 CLI 输入 start');
                 if (res.should_start || res.control === 'running') {
                     if (!(await ensureSearchLease('初始化自动继续'))) return;
                     await ensureSessionForBackendRun(lastBackendRunId, 'init_running');
@@ -6777,10 +6885,14 @@
                 this.pause = true;
                 this.running = false;
                 this.releaseLease();
+                if (response.should_stop) this.logger?.setStopped(true);
+                else this.logger?.setPaused(true);
                 return false;
             }
             if (response.should_start) {
                 this.pause = false;
+                this.logger?.setStopped(false);
+                this.logger?.setPaused(false);
                 return true;
             }
             return false;
@@ -6899,7 +7011,26 @@
                 const identity = tools.zhaopinJobIdentityUrl(href);
                 if (!identity || identities.has(identity)) continue;
                 identities.add(identity);
-                candidates.push({ navigationUrl: href, identity, externalJobId, element: node, inline: false });
+                const card = node.closest?.(
+                    '[class*="job-card"],[class*="jobCard"],[class*="position-item"],'
+                    + '[class*="positionItem"],[class*="job-item"],[class*="jobItem"]'
+                ) || node;
+                const title = this.firstText(card, [
+                    '[class*="job-name"]', '[class*="jobName"]', '[class*="position-name"]',
+                    '[class*="positionName"]', '[class*="title"]',
+                ]) || tools.normalizedText(node);
+                const salary = this.firstText(card, ['[class*="salary"]', '[class*="wage"]']);
+                const company = tools.companyNameFromJobCard(card, title, salary);
+                candidates.push({
+                    navigationUrl: href,
+                    identity,
+                    externalJobId,
+                    element: node,
+                    inline: false,
+                    company,
+                    cardTitle: title,
+                    cardSalary: salary,
+                });
             }
             if (!candidates.length) {
                 const inlineNodes = Array.from(document.querySelectorAll(
@@ -6915,7 +7046,21 @@
                     const identity = externalJobId ? `zhaopin:inline:${externalJobId}` : `zhaopin:inline:${index}:${text}`;
                     if (identities.has(identity)) return;
                     identities.add(identity);
-                    candidates.push({ navigationUrl: '', identity, externalJobId, element: node, inline: true });
+                    const title = this.firstText(node, [
+                        '[class*="job-name"]', '[class*="jobName"]', '[class*="position-name"]',
+                        '[class*="positionName"]', '[class*="title"]',
+                    ]);
+                    const salary = this.firstText(node, ['[class*="salary"]', '[class*="wage"]']);
+                    candidates.push({
+                        navigationUrl: '',
+                        identity,
+                        externalJobId,
+                        element: node,
+                        inline: true,
+                        company: tools.companyNameFromJobCard(node, title, salary),
+                        cardTitle: title,
+                        cardSalary: salary,
+                    });
                 });
             }
             return candidates;
@@ -7363,6 +7508,8 @@
             this.resetDetailCompatibilityFailures();
             jobInfo.url = jobInfo.url || candidate.identity;
             jobInfo.external_job_id = jobInfo.external_job_id || candidate.externalJobId;
+            if (!jobInfo.company && candidate.company) jobInfo.company = candidate.company;
+            if (!jobInfo.salary && candidate.cardSalary) jobInfo.salary = candidate.cardSalary;
             this.currentJob = { ...candidate, title: jobInfo.title, externalJobId: jobInfo.external_job_id };
             if (jobInfo.alreadyApplied) {
                 const idempotencyKey = `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`;
@@ -7379,6 +7526,12 @@
                 return;
             }
             this.logger?.add(`智联开始评分: ${jobInfo.title}`);
+            await this.api.event('job_analysis_started', `开始分析职位: ${jobInfo.title}`, 'script', 'info', {
+                title: jobInfo.title,
+                company: jobInfo.company || '',
+                salary: jobInfo.salary || '',
+                jobId: jobInfo.external_job_id || '',
+            });
             const analysis = await this.api.analyzeJob({
                 title: jobInfo.title,
                 salary: jobInfo.salary || '',
@@ -7391,12 +7544,21 @@
             });
             const score = Number(analysis.total_score || 0);
             jobInfo.score = score;
-            this.logger?.add(`智联匹配度: ${score}`);
+            this.logger?.add(`评分结果: ${tools.analysisScoreSummary(analysis)}`);
+            if (analysis.match_reason) this.logger?.add(`判断原因: ${analysis.match_reason}`);
+            this.logger?.add(`推荐动作: ${tools.platformActionLabel(analysis.platform_action || 'skip')}`);
             await this.api.event('job_analysis_finished', `智联职位分析完成: ${jobInfo.title} / ${score}`, 'script', 'info', {
                 title: jobInfo.title,
+                company: jobInfo.company || '',
                 jobId: jobInfo.external_job_id,
                 score,
+                educationScore: Number(analysis.education_score || 0),
+                skillScore: Number(analysis.skill_score || 0),
+                experienceScore: Number(analysis.experience_score || 0),
+                scoringVersion: analysis.scoring_version || '',
                 platformAction: analysis.platform_action || '',
+                recommendation: analysis.recommendation || '',
+                risks: analysis.risks || [],
             });
             if (!(await this.syncControl(`智联评分完成: ${jobInfo.title}`))) return;
             const shouldApply = score >= OPTIONS.thread
@@ -7589,10 +7751,16 @@
                 if (from === this.targets.detail) this.resolvePending(this.types.APPLY_RESULT, data || {});
             });
             this.logger = new Logger(
-                async () => this.api.control('resume'),
+                async () => this.api.control('start', '用户在智联页面控制面板点击开始'),
                 async () => this.api.control('pause', '用户在智联页面点击暂停'),
+                async () => {
+                    await this.api.control('stop', '用户在智联页面控制面板点击结束');
+                    this.pause = true;
+                    this.running = false;
+                    this.releaseLease();
+                },
             );
-            this.logger.add('智联招聘脚本已就绪，等待 CLI start');
+            this.logger.add('智联招聘脚本已就绪，可从页面控制面板开始');
             const ready = await this.syncControl('智联岗位列表已连接');
             if (!this.urls.length) {
                 await this.pausePlatform('未配置有效的智联岗位列表网址', 'zhaopin_config_invalid');
@@ -7694,6 +7862,9 @@
             isLikelyCustomFeedName: (text) => tools.isLikelyCustomFeedName(text),
             isStrongCustomFeedName: (text) => tools.isStrongCustomFeedName(text),
             sanitizeCompanyName: (value, title, salary) => tools.sanitizeCompanyName(value, title, salary),
+            companyNameFromJobCard: (node, title, salary) => tools.companyNameFromJobCard(node, title, salary),
+            analysisScoreSummary: (analysis) => tools.analysisScoreSummary(analysis),
+            platformActionLabel: (action) => tools.platformActionLabel(action),
             isBackendUnavailableError: (value) => tools.isBackendUnavailableError(value),
             jobIdentityUrl: (value) => tools.jobIdentityUrl(value),
             jobIdFromValue: (value) => tools.jobIdFromValue(value),

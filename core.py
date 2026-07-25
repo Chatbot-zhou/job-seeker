@@ -29,6 +29,7 @@ def _stream_messages(
     model: str | None = None,
     format_schema: dict[str, Any] | None = None,
     early_stop: str | None = None,
+    event_detail: dict[str, Any] | None = None,
 ) -> str:
     return stream_ollama_chat(
         label,
@@ -37,6 +38,7 @@ def _stream_messages(
         model=model or Config.think_model,
         format_schema=format_schema,
         early_stop=early_stop,
+        event_detail=event_detail,
     )
 
 
@@ -94,6 +96,7 @@ def _analysis_from_weighted_score(
     greeting: str = "",
     match_reason: str = "",
     risks: list[str] | None = None,
+    model_error_kind: str = "",
 ) -> dict[str, Any]:
     education_score = _clamp_score(education_score)
     skill_score = _clamp_score(skill_score)
@@ -119,6 +122,13 @@ def _analysis_from_weighted_score(
         decision_source="single_call_weighted_score",
         match_reason=reason,
         blocked_reason=reason if recommendation == "skip" else "",
+        scoring_version=SCORING_VERSION,
+        score_breakdown={
+            "education": education_score,
+            "skill": skill_score,
+            "experience": experience_score,
+        },
+        model_error_kind=model_error_kind,
     ).model_dump()
 
 
@@ -241,7 +251,28 @@ def _should_stop_score_strategy_retries(error_text: str) -> bool:
     return _is_nonretryable_model_config_error(error_text) or _is_model_connectivity_error(error_text)
 
 
-def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int] | None, str]:
+def build_job_score_messages(job_text: str, user_detail: str) -> list[dict[str, str]]:
+    """Build the one platform-neutral prompt used by every job channel."""
+    return [
+        {"role": "system", "content": JOB_SCORE_BREAKDOWN},
+        {
+            "role": "user",
+            "content": f"# 岗位详情\n{job_text}\n\n# 用户画像\n{redact_privacy(user_detail)}",
+        },
+    ]
+
+
+def _model_failure_result(error_text: str) -> str:
+    text = str(error_text or "").strip()
+    return text if text.startswith("模型调用失败") else f"模型调用失败: {text}"
+
+
+def calculate_job_score(
+    job_text: str,
+    user_detail: str,
+    *,
+    event_detail: dict[str, Any] | None = None,
+) -> tuple[dict[str, int] | None, str]:
     """单次岗位评分：模型输出三项分数，系统负责加权。
 
     三级策略重试：
@@ -252,13 +283,7 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
     令牌数无限制（-1），由 early_stop 在检测到完整输出后主动截断，
     120s 超时作为兜底。
     """
-    messages = [
-        {"role": "system", "content": JOB_SCORE_BREAKDOWN},
-        {
-            "role": "user",
-            "content": f"# 岗位详情\n{job_text}\n\n# 用户画像\n{redact_privacy(user_detail)}",
-        },
-    ]
+    messages = build_job_score_messages(job_text, user_detail)
     # 令牌无限制：early_stop 会在检测到完整三行/JSON 后主动截断，无需令牌限长
     first_think = not bool(getattr(Config, "disable_model_thinking", True))
 
@@ -271,12 +296,13 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
             model=Config.think_model,
             options=_score_options(think=first_think),
             early_stop="job_score",
+            event_detail=event_detail,
         )
     except Exception as exc:
         last_call_error = str(exc)
         if _should_stop_score_strategy_retries(last_call_error):
             runtime_state.log(f"评分模型当前不可用: {exc}，本岗位停止评分重试", source="model")
-            return None, f"模型调用失败: {last_call_error}"
+            return None, _model_failure_result(last_call_error)
         runtime_state.log(f"评分第1次调用异常: {exc}，进入第2次重试（关闭思考）…", source="model")
         content = ""
     reply = extract_llm_reply(content)
@@ -294,12 +320,13 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
         content = _stream_messages(
             "计算职位匹配度", messages,
             model=Config.think_model, options=options_2, early_stop="job_score",
+            event_detail=event_detail,
         )
     except Exception as exc:
         last_call_error = str(exc)
         if _should_stop_score_strategy_retries(last_call_error):
             runtime_state.log(f"评分模型当前不可用: {exc}，本岗位停止评分重试", source="model")
-            return None, f"模型调用失败: {last_call_error}"
+            return None, _model_failure_result(last_call_error)
         runtime_state.log(f"评分第2次调用异常: {exc}，进入第3次重试（关闭思考+调整温度）…", source="model")
         content = ""
     reply = extract_llm_reply(content)
@@ -317,14 +344,15 @@ def calculate_job_score(job_text: str, user_detail: str) -> tuple[dict[str, int]
         content = _stream_messages(
             "计算职位匹配度", messages,
             model=Config.think_model, options=options_3, early_stop="job_score",
+            event_detail=event_detail,
         )
     except Exception as exc:
         last_call_error = str(exc)
         runtime_state.log(f"评分第3次调用异常: {exc}，已无更多重试", source="model")
-        return None, f"模型调用失败: {last_call_error}"
+        return None, _model_failure_result(last_call_error)
     reply = extract_llm_reply(content)
     if not reply and last_call_error:
-        return None, f"模型调用失败: {last_call_error}"
+        return None, _model_failure_result(last_call_error)
     return _parse_score_breakdown(reply), reply
 
 
@@ -342,8 +370,20 @@ def analyze_job(
         f"# 城市\n{job.get('city', '')}\n\n"
         f"# 职位描述\n{_clip_text(job.get('detail', ''), int(Config.job_detail_max_chars))}"
     )
+    model_event_detail = {
+        "platform": str(job.get("platform") or "boss"),
+        "model_request_id": str(job.get("model_request_id") or ""),
+        "external_job_id": str(job.get("external_job_id") or ""),
+        "job_title": str(job.get("title") or ""),
+        "job_company": str(job.get("company") or ""),
+        "scoring_version": SCORING_VERSION,
+    }
     try:
-        scores, raw_reply = calculate_job_score(job_text, user_detail)
+        scores, raw_reply = calculate_job_score(
+            job_text,
+            user_detail,
+            event_detail=model_event_detail,
+        )
         if scores is None:
             reply_text = raw_reply.replace("\n", " ").strip()
             if reply_text:
@@ -351,6 +391,11 @@ def analyze_job(
             else:
                 summary = "模型没有返回内容（已重试3次，建议增大评分令牌数或关闭模型思考）"
             model_risk = "模型调用失败" if summary.startswith("模型调用失败") else "模型评分格式错误"
+            model_error_kind = (
+                "connectivity"
+                if _is_model_connectivity_error(summary)
+                else ("format" if model_risk == "模型评分格式错误" else "call")
+            )
             return _analysis_from_weighted_score(
                 0,
                 0,
@@ -358,6 +403,7 @@ def analyze_job(
                 greeting=greeting,
                 match_reason=f"{model_risk}，已跳过。模型原始输出: {summary}",
                 risks=[model_risk],
+                model_error_kind=model_error_kind,
             )
         return _analysis_from_weighted_score(
             scores["学历专业"],

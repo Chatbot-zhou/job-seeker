@@ -177,6 +177,33 @@ test('Zhaopin adapter normalizes identity, paginates safely, isolates apply sema
   assert.match(source, /location\.hostname === 'www\.zhaopin\.com'/);
 });
 
+test('platform panels can start pause and stop without requiring CLI start', () => {
+  assert.match(source, /api\.control\('start', '用户在 BOSS 页面控制面板点击开始'\)/);
+  assert.match(source, /this\.api\.control\('start', '用户在智联页面控制面板点击开始'\)/);
+  assert.match(source, /stopBtn\.innerText = "结束"/);
+  assert.match(source, /当前平台已结束，可点击开始重新运行/);
+  assert.doesNotMatch(source, /请回到 CLI 输入 start/);
+});
+
+test('both platforms render the same score breakdown and card company fallback', () => {
+  const analysis = {
+    education_score: 70,
+    skill_score: 80,
+    experience_score: 60,
+    total_score: 72,
+  };
+  assert.equal(
+    hooks.analysisScoreSummary(analysis),
+    '学历专业 70 / 技术栈 80 / 项目经验 60 / 加权匹配度 72',
+  );
+  assert.equal(hooks.platformActionLabel('greet'), '打招呼');
+  assert.equal(hooks.platformActionLabel('apply'), '立即投递');
+  assert.match(source, /companyNameFromJobCard/);
+  assert.match(source, /jobCardMetadata/);
+  assert.match(source, /candidate\.company/);
+  assert.match(source, /scoringVersion: analysis\.scoring_version/);
+});
+
 test('cooldown resumes once and returns to preferred feeds before keyword search', () => {
   assert.match(source, /tryAcquireCooldownResumeLock/);
   assert.match(source, /markCooldownResumeDone/);

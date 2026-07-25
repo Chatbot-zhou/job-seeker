@@ -7,6 +7,7 @@ import asyncio
 import os
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
@@ -29,6 +30,7 @@ from cache import cache
 from config import Config
 from core import SCORING_VERSION, analyze_job
 from model_queue import FairModelQueue, ModelQueueCancelled
+from model_stream import model_execution_snapshot, model_warmup_check
 from runtime_state import runtime_state
 from schema import (
     ActionCreate,
@@ -46,6 +48,25 @@ from tools import script_connect_hosts
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_SCRIPT_PATH = BASE_DIR / "web_script.js"
+USERSCRIPT_DEFINITIONS = {
+    "boss": {
+        "name": "Job Seeker - BOSS",
+        "description": "Job Seeker BOSS 直聘通道",
+        "matches": ("https://www.zhipin.com/*",),
+        "icon": "https://www.google.com/s2/favicons?sz=64&domain=zhipin.com",
+        "path": "/userscripts/boss.user.js",
+    },
+    "zhaopin": {
+        "name": "Job Seeker - 智联招聘",
+        "description": "Job Seeker 智联招聘通道",
+        "matches": (
+            "https://www.zhaopin.com/*",
+            "https://passport.zhaopin.com/*",
+        ),
+        "icon": "https://www.google.com/s2/favicons?sz=64&domain=zhaopin.com",
+        "path": "/userscripts/zhaopin.user.js",
+    },
+}
 MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-model")
 MODEL_QUEUE = FairModelQueue(lambda: int(getattr(Config, "model_max_concurrency", 1)))
 MODEL_EXECUTOR_SHUTDOWN = False
@@ -80,6 +101,7 @@ async def lifespan(app: FastAPI):
     database.init_db()
     migration = database.last_migration_result()
     stale_runs = database.reconcile_stale_runs(stale_minutes=10, exclude_run_id=runtime_state.run_id)
+    stale_applications = database.reconcile_stale_application_actions(stale_minutes=10)
     company_repair = database.repair_invalid_company_names()
     database.upsert_run(runtime_state.run_id, control=runtime_state.control, started_at=runtime_state.run_started_at)
     cleanup = database.prune_old_events(normal_days=7, important_days=30)
@@ -92,6 +114,14 @@ async def lifespan(app: FastAPI):
             f"已将 {stale_runs['count']} 个未正常结束的旧任务标记为 interrupted",
             source="database",
             detail={"count": stale_runs["count"], "stale_minutes": 10},
+        )
+    if stale_applications.get("count"):
+        runtime_state.emit(
+            "stale_application_reconciled",
+            f"已将 {stale_applications['count']} 条未完成投递标记为结果未知",
+            source="database",
+            level="warning",
+            detail=stale_applications,
         )
     if migration.get("compacted_events") or migration.get("sanitized_events"):
         runtime_state.emit(
@@ -236,6 +266,8 @@ def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, A
     global MODEL_SCORE_FAILURE_STREAK
     risks = {str(risk) for risk in analysis.get("risks") or []}
     failed = bool(risks.intersection({"模型调用失败", "模型评分格式错误"}))
+    model_error_kind = str(analysis.get("model_error_kind") or "")
+    threshold = 1 if model_error_kind == "connectivity" else MODEL_SCORE_FAILURE_PAUSE_THRESHOLD
     with MODEL_SCORE_FAILURE_LOCK:
         if failed:
             MODEL_SCORE_FAILURE_STREAK += 1
@@ -245,20 +277,23 @@ def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, A
             return False
     runtime_state.emit(
         "model_score_failure_streak",
-        f"模型评分连续失败 {streak}/{MODEL_SCORE_FAILURE_PAUSE_THRESHOLD}: {job.get('title', '')}",
+        f"模型评分连续失败 {streak}/{threshold}: {job.get('title', '')}",
         source="model",
         level="warning",
         detail={
             "streak": streak,
-            "threshold": MODEL_SCORE_FAILURE_PAUSE_THRESHOLD,
+            "threshold": threshold,
+            "platform": str(job.get("platform") or "boss"),
+            "model_request_id": str(job.get("model_request_id") or ""),
+            "model_error_kind": model_error_kind,
             "job_url": job.get("url", ""),
             "job_title": job.get("title", ""),
             "risks": list(risks),
             "reason": analysis.get("match_reason", ""),
         },
     )
-    if streak >= MODEL_SCORE_FAILURE_PAUSE_THRESHOLD:
-        runtime_state.set_control("pause")
+    if streak >= threshold:
+        runtime_state.set_control("pause", reason="model_unavailable")
         runtime_state.emit(
             "model_score_degraded_pause",
             "模型评分连续失败，已暂停自动化。请先检查模型服务/API 地址/Key，再继续运行。",
@@ -266,9 +301,12 @@ def update_model_score_failure_streak(analysis: dict[str, Any], job: dict[str, A
             level="error",
             detail={
                 "streak": streak,
-                "threshold": MODEL_SCORE_FAILURE_PAUSE_THRESHOLD,
+                "threshold": threshold,
                 "provider": Config.model_provider,
                 "model": Config.think_model,
+                "platform": str(job.get("platform") or "boss"),
+                "model_request_id": str(job.get("model_request_id") or ""),
+                "model_error_kind": model_error_kind,
                 "last_job_url": job.get("url", ""),
                 "last_job_title": job.get("title", ""),
                 "reason": analysis.get("match_reason", ""),
@@ -282,18 +320,42 @@ def script_base_url() -> str:
     return f"http://{Config.server_host}:{Config.server_port}"
 
 
-def render_userscript() -> str:
+def render_userscript(platform: str = "boss") -> str:
     if not WEB_SCRIPT_PATH.exists():
         fail("web_script.js 不存在", 404)
+    definition = USERSCRIPT_DEFINITIONS.get(platform)
+    if not definition:
+        fail("不支持的脚本平台", 404)
     base_url = script_base_url()
     script = WEB_SCRIPT_PATH.read_text(encoding="utf-8")
-    script = script.replace("http://127.0.0.1:33333/web_script.user.js", f"{base_url}/web_script.user.js")
     script = script.replace("serverHost: 'http://127.0.0.1:33333'", f"serverHost: '{base_url}'")
     lines = script.splitlines()
     connect_hosts = script_connect_hosts(base_url)
+    canonical_url = f"{base_url}{definition['path']}"
     rendered_lines: list[str] = []
     inserted_connect = False
+    inserted_matches = False
     for line in lines:
+        if line.startswith("// @name "):
+            rendered_lines.append(f"// @name         {definition['name']}")
+            continue
+        if line.startswith("// @description"):
+            rendered_lines.append(f"// @description  {definition['description']}")
+            continue
+        if line.startswith("// @match"):
+            if not inserted_matches:
+                rendered_lines.extend(f"// @match        {match}" for match in definition["matches"])
+                inserted_matches = True
+            continue
+        if line.startswith("// @icon"):
+            rendered_lines.append(f"// @icon         {definition['icon']}")
+            continue
+        if line.startswith("// @updateURL"):
+            rendered_lines.append(f"// @updateURL    {canonical_url}")
+            continue
+        if line.startswith("// @downloadURL"):
+            rendered_lines.append(f"// @downloadURL  {canonical_url}")
+            continue
         if line.startswith("// @connect"):
             if not inserted_connect:
                 rendered_lines.extend(f"// @connect      {host}" for host in connect_hosts)
@@ -309,7 +371,11 @@ async def index():
         "message": "Job Seeker CLI API is running",
         "health": "/health",
         "status": "/status",
-        "userscript": "/web_script.user.js",
+        "userscripts": {
+            platform: definition["path"]
+            for platform, definition in USERSCRIPT_DEFINITIONS.items()
+        },
+        "legacy_userscript": "/web_script.user.js",
     }
 
 
@@ -320,7 +386,17 @@ async def health():
 
 @app.get("/web_script.user.js", summary="安装或更新篡改猴脚本")
 async def web_script_user_js():
-    return PlainTextResponse(render_userscript(), media_type="application/javascript; charset=utf-8")
+    return PlainTextResponse(render_userscript("boss"), media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/userscripts/boss.user.js", summary="安装或更新 BOSS 篡改猴脚本")
+async def boss_userscript():
+    return PlainTextResponse(render_userscript("boss"), media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/userscripts/zhaopin.user.js", summary="安装或更新智联篡改猴脚本")
+async def zhaopin_userscript():
+    return PlainTextResponse(render_userscript("zhaopin"), media_type="application/javascript; charset=utf-8")
 
 
 @app.get("/status", summary="系统状态")
@@ -329,7 +405,10 @@ async def status():
     result = runtime_state.as_dict(cache.status(), cache.cache_status())
     result["database"] = database.database_stats()
     result["run_summary"] = database.summarize_run(runtime_state.run_id)
-    result["model_queue"] = MODEL_QUEUE.snapshot()
+    result["model_queue"] = {
+        **MODEL_QUEUE.snapshot(),
+        "execution_gate": model_execution_snapshot(),
+    }
     result["diagnostics"] = {
         "recent_event_counts_24h": database.recent_event_counts(
             24,
@@ -492,18 +571,64 @@ async def script_heartbeat(payload: ScriptHeartbeat):
     if payload.status == "error":
         runtime_state.log(payload.current_action or "脚本上报错误", level="error", source="script")
     response = runtime_state.control_payload(payload.platform)
-    response.update({"ok": True, "config": Config.public_dict(), "model_queue": MODEL_QUEUE.snapshot()})
+    response.update(
+        {
+            "ok": True,
+            "config": Config.public_dict(),
+            "model_queue": {
+                **MODEL_QUEUE.snapshot(),
+                "execution_gate": model_execution_snapshot(),
+            },
+        }
+    )
     return response
 
 
-@app.post("/control", summary="暂停/继续/停止")
+@app.post("/control", summary="开始/暂停/继续/停止")
 async def control(payload: ControlUpdate):
+    if payload.command == "start":
+        platform = str(payload.platform or "boss")
+        cache.load()
+        if not bool(getattr(Config, f"{platform}_enabled", True)):
+            raise HTTPException(status_code=409, detail=f"{platform} 通道未启用")
+        if not cache.user_detail.strip():
+            raise HTTPException(status_code=409, detail="请先在 CLI 完成简历画像与用户详情配置")
+        if platform == "boss":
+            greeting = greeting_service.get_greeting()
+            if not cache.tags:
+                raise HTTPException(status_code=409, detail="BOSS 岗位标签为空，请先完成标签配置")
+            if not greeting.get("confirmed"):
+                raise HTTPException(status_code=409, detail="BOSS 打招呼话术尚未确认")
+        if runtime_state.control != "running":
+            loop = asyncio.get_running_loop()
+            warmup = await loop.run_in_executor(MODEL_EXECUTOR, model_warmup_check)
+            runtime_state.model_warmup.update(warmup)
+            if warmup.get("status") != "ready":
+                runtime_state.set_control(
+                    "pause",
+                    reason=f"model_unavailable: {warmup.get('error') or '模型检查失败'}",
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"模型尚未就绪: {warmup.get('error') or '连接检查失败'}",
+                )
+            runtime_state.set_control(
+                "resume",
+                new_run=True,
+                reason=payload.reason or "网页控制面板开始运行",
+            )
+        runtime_state.set_platform_control(
+            platform,
+            "resume",
+            payload.reason or "网页控制面板开始运行",
+        )
+        return runtime_state.control_payload(platform)
     if payload.platform:
         runtime_state.set_platform_control(payload.platform, payload.command, payload.reason)
         if payload.command in {"pause", "stop"}:
             await MODEL_QUEUE.cancel_platform(payload.platform, payload.reason or f"{payload.platform} 已{payload.command}")
         return runtime_state.control_payload(payload.platform)
-    runtime_state.set_control(payload.command, new_run=payload.new_run)
+    runtime_state.set_control(payload.command, new_run=payload.new_run, reason=payload.reason)
     if payload.command in {"pause", "stop"}:
         await MODEL_QUEUE.cancel_all("全局任务已暂停或停止")
     return runtime_state.control_payload()
@@ -543,6 +668,20 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
     else:
         greeting = greeting_service.get_greeting() if platform == "boss" else {}
         confirmed_greeting = greeting.get("active_content", "") if greeting.get("confirmed") else ""
+        model_request_id = f"analysis-{uuid.uuid4().hex[:12]}"
+        job["model_request_id"] = model_request_id
+        runtime_state.emit(
+            "model_queue_enqueued",
+            f"岗位评分已进入模型队列: {platform} / {job.get('title', '')}",
+            source="model",
+            detail={
+                "platform": platform,
+                "model_request_id": model_request_id,
+                "external_job_id": str(job.get("external_job_id") or ""),
+                "job_title": str(job.get("title") or ""),
+                "queue": MODEL_QUEUE.snapshot(),
+            },
+        )
         try:
             analysis = await MODEL_QUEUE.run(
                 platform,
@@ -553,7 +692,30 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
                 confirmed_greeting,
                 cache.profile,
             )
+            runtime_state.emit(
+                "model_queue_completed",
+                f"岗位评分已离开模型队列: {platform} / {job.get('title', '')}",
+                source="model",
+                detail={
+                    "platform": platform,
+                    "model_request_id": model_request_id,
+                    "external_job_id": str(job.get("external_job_id") or ""),
+                    "job_title": str(job.get("title") or ""),
+                },
+            )
         except ModelQueueCancelled as exc:
+            runtime_state.emit(
+                "model_queue_cancelled",
+                f"岗位评分排队已取消: {platform} / {job.get('title', '')}",
+                source="model",
+                level="warning",
+                detail={
+                    "platform": platform,
+                    "model_request_id": model_request_id,
+                    "job_title": str(job.get("title") or ""),
+                    "reason": str(exc),
+                },
+            )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             if "cannot schedule new futures" in str(exc) or "shutdown" in str(exc).lower():
@@ -581,6 +743,16 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
             )
     if "platform_action" not in analysis:
         analysis["platform_action"] = "skip"
+    analysis.setdefault("scoring_version", SCORING_VERSION)
+    analysis.setdefault(
+        "score_breakdown",
+        {
+            "education": int(analysis.get("education_score") or 0),
+            "skill": int(analysis.get("skill_score") or 0),
+            "experience": int(analysis.get("experience_score") or 0),
+        },
+    )
+    analysis.setdefault("model_error_kind", "")
     job["run_id"] = runtime_state.run_id
     saved_job = database.upsert_job(job, analysis, final_action=final_action)
     if job.get("talked"):
@@ -589,7 +761,16 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
         "job_analyzed",
         f"职位已分析: {payload.company} {payload.title}",
         source="job",
-        detail={"analysis": analysis, "job": job},
+        detail={
+            "platform": platform,
+            "model_request_id": str(job.get("model_request_id") or ""),
+            "external_job_id": str(job.get("external_job_id") or ""),
+            "scoring_version": analysis.get("scoring_version", SCORING_VERSION),
+            "score_breakdown": analysis.get("score_breakdown", {}),
+            "platform_action": analysis.get("platform_action", "skip"),
+            "analysis": analysis,
+            "job": job,
+        },
     )
     return {"analysis": analysis, "job": saved_job}
 

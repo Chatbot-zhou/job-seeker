@@ -26,6 +26,9 @@ class JobAnalysis(BaseModel):
     match_reason: str = ""
     blocked_reason: str = ""
     platform_action: str = ""
+    scoring_version: str = ""
+    score_breakdown: dict[str, int] = Field(default_factory=dict)
+    model_error_kind: str = ""
 
 
 class ResumeUpdate(BaseModel):
@@ -85,7 +88,7 @@ class ActionDecision(BaseModel):
 
 
 class ControlUpdate(BaseModel):
-    command: str = Field(pattern="^(pause|resume|stop)$")
+    command: str = Field(pattern="^(start|pause|resume|stop)$")
     new_run: bool = False
     platform: str | None = Field(default=None, pattern="^(boss|zhaopin)$")
     reason: str = ""

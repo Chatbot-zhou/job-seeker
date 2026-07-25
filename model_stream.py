@@ -5,6 +5,10 @@ import queue
 import re
 import threading
 import time
+import uuid
+from collections import Counter, deque
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -29,6 +33,121 @@ OPENAI_THINKING_CONTROL_LOCK = threading.Lock()
 OLLAMA_THINK_PARAMETER_UNSUPPORTED: set[str] = set()
 OLLAMA_THINK_PARAMETER_LOCK = threading.Lock()
 THINKING_SUPPRESSION_MESSAGE = "请直接输出最终答案，不要输出任何思考过程、分析或推理。"
+_MODEL_EVENT_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("model_event_context", default={})
+
+
+def _model_event_detail(detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {**_MODEL_EVENT_CONTEXT.get(), **(detail or {})}
+
+
+def _model_emit(
+    event_type: str,
+    message: str,
+    *,
+    source: str = "model",
+    level: str = "info",
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return runtime_state.emit(
+        event_type,
+        message,
+        source=source,
+        level=level,
+        detail=_model_event_detail(detail),
+    )
+
+
+class ModelExecutionGate:
+    """Process-wide fair gate shared by scoring, warmup and setup calls."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.RLock())
+        self._waiters: deque[tuple[str, str, str]] = deque()
+        self._active = 0
+        self._active_by_platform: Counter[str] = Counter()
+        self._active_by_kind: Counter[str] = Counter()
+
+    @staticmethod
+    def limit() -> int:
+        try:
+            value = int(getattr(Config, "model_max_concurrency", 1))
+        except (TypeError, ValueError):
+            value = 1
+        return max(1, min(2, value))
+
+    @contextmanager
+    def acquire(
+        self,
+        *,
+        kind: str,
+        platform: str,
+        bypass: bool = False,
+    ):
+        if bypass:
+            yield
+            return
+        ticket_id = f"gate-{uuid.uuid4().hex[:12]}"
+        normalized_platform = platform if platform in {"boss", "zhaopin"} else "system"
+        started_at = time.monotonic()
+        with self._condition:
+            self._waiters.append((ticket_id, normalized_platform, kind))
+            while (
+                not self._waiters
+                or self._waiters[0][0] != ticket_id
+                or self._active >= self.limit()
+            ):
+                self._condition.wait(timeout=1)
+            self._waiters.popleft()
+            self._active += 1
+            self._active_by_platform[normalized_platform] += 1
+            self._active_by_kind[kind] += 1
+        waited_seconds = round(time.monotonic() - started_at, 3)
+        if waited_seconds >= 0.05:
+            _model_emit(
+                "model_execution_wait_finished",
+                f"模型执行等待结束: {kind} / {waited_seconds}s",
+                detail={
+                    "platform": normalized_platform,
+                    "kind": kind,
+                    "waited_seconds": waited_seconds,
+                    "ticket_id": ticket_id,
+                },
+            )
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active = max(0, self._active - 1)
+                if self._active_by_platform.get(normalized_platform, 0) > 1:
+                    self._active_by_platform[normalized_platform] -= 1
+                else:
+                    self._active_by_platform.pop(normalized_platform, None)
+                if self._active_by_kind.get(kind, 0) > 1:
+                    self._active_by_kind[kind] -= 1
+                else:
+                    self._active_by_kind.pop(kind, None)
+                self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            queued_by_platform = Counter(platform for _, platform, _ in self._waiters)
+            queued_by_kind = Counter(kind for _, _, kind in self._waiters)
+            return {
+                "limit": self.limit(),
+                "active": self._active,
+                "queued": len(self._waiters),
+                "active_by_platform": dict(self._active_by_platform),
+                "queued_by_platform": dict(queued_by_platform),
+                "active_by_kind": dict(self._active_by_kind),
+                "queued_by_kind": dict(queued_by_kind),
+            }
+
+
+MODEL_EXECUTION_GATE = ModelExecutionGate()
+
+
+def model_execution_snapshot() -> dict[str, Any]:
+    return MODEL_EXECUTION_GATE.snapshot()
 
 
 class ModelRepetitionError(RuntimeError):
@@ -388,7 +507,7 @@ def iter_openai_chat_chunks(
         if thinking_control_applied and openai_thinking_control_unsupported(payload, body):
             first_time = mark_openai_thinking_control_unsupported(model)
             if first_time:
-                runtime_state.emit(
+                _model_emit(
                     "model_thinking_control_retry",
                     "OpenAI 模型不支持当前思考控制参数，已移除后重试；后续同模型将直接跳过该参数",
                     source="model",
@@ -400,7 +519,7 @@ def iter_openai_chat_chunks(
             return
         unsupported_key = unsupported_openai_parameter(payload, body)
         if unsupported_key:
-            runtime_state.emit(
+            _model_emit(
                 "model_parameter_fallback",
                 f"OpenAI 模型不支持参数 {unsupported_key}，已移除后重试",
                 source="model",
@@ -490,7 +609,7 @@ def iter_ollama_chat_chunks(
         mark_ollama_think_parameter_unsupported(model)
         kwargs.pop("think", None)
         if was_disabling_think:
-            runtime_state.emit(
+            _model_emit(
                 "model_thinking_control_retry",
                 "Ollama 不支持 think 参数，已通过系统提示词 + 限制生成长度来抑制思考",
                 source="model",
@@ -506,7 +625,7 @@ def iter_ollama_chat_chunks(
                     original = 2048
                 kwargs["options"]["num_predict"] = min(original, 400)
         else:
-            runtime_state.emit(
+            _model_emit(
                 "model_thinking_control_retry",
                 "Ollama 不支持当前思考控制参数，已移除后重试",
                 source="model",
@@ -514,7 +633,7 @@ def iter_ollama_chat_chunks(
         try:
             yield from emit_chunks(kwargs)
         except RuntimeError as fallback_exc:
-            runtime_state.emit(
+            _model_emit(
                 "model_thinking_control_failed",
                 "Ollama 移除 think 参数后重试仍失败",
                 source="model",
@@ -723,6 +842,35 @@ def stream_ollama_chat(
     model: str | None = None,
     format_schema: dict[str, Any] | None = None,
     early_stop: str | None = None,
+    event_detail: dict[str, Any] | None = None,
+) -> str:
+    context_detail = dict(event_detail or {})
+    platform = str(context_detail.get("platform") or "system")
+    token = _MODEL_EVENT_CONTEXT.set(context_detail)
+    try:
+        with MODEL_EXECUTION_GATE.acquire(
+            kind="job_score" if early_stop == "job_score" else "model_call",
+            platform=platform,
+        ):
+            return _stream_ollama_chat_impl(
+                label,
+                messages,
+                options=options,
+                model=model,
+                format_schema=format_schema,
+                early_stop=early_stop,
+            )
+    finally:
+        _MODEL_EVENT_CONTEXT.reset(token)
+
+
+def _stream_ollama_chat_impl(
+    label: str,
+    messages: list[dict[str, str]],
+    options: dict[str, Any] | None = None,
+    model: str | None = None,
+    format_schema: dict[str, Any] | None = None,
+    early_stop: str | None = None,
 ) -> str:
     selected_model = model or Config.think_model
     base_options = configured_model_options(options)
@@ -749,7 +897,8 @@ def stream_ollama_chat(
                 if not stop_event.is_set():
                     result_queue.put(("error", exc))
 
-        thread = threading.Thread(target=worker, daemon=True)
+        worker_context = copy_context()
+        thread = threading.Thread(target=lambda: worker_context.run(worker), daemon=True)
         thread.start()
         return thread
 
@@ -757,7 +906,7 @@ def stream_ollama_chat(
         retry_no = attempt
         if retry_no <= max_internal_retries:
             message = f"模型调用{reason}: {label}，第 {retry_no}/{max_internal_retries} 次重试"
-            runtime_state.emit(
+            _model_emit(
                 "model_retry",
                 message,
                 source="model",
@@ -777,7 +926,7 @@ def stream_ollama_chat(
     def repetition_retry_message(reason: str, attempt: int, attempt_options: dict[str, Any]) -> None:
         if attempt <= MODEL_MAX_RETRIES:
             message = f"模型输出疑似重复循环: {label}，第 {attempt}/{MODEL_MAX_RETRIES} 次重试"
-            runtime_state.emit(
+            _model_emit(
                 "model_repetition_retry",
                 message,
                 source="model",
@@ -793,7 +942,7 @@ def stream_ollama_chat(
             )
             print(f"\n[模型] 模型疑似重复，正在重试 {attempt}/{MODEL_MAX_RETRIES}", flush=True)
 
-    runtime_state.emit("model_started", f"{label} 开始", source="model")
+    _model_emit("model_started", f"{label} 开始")
     print(f"\n[模型] {label}", flush=True)
     print(f"[模型] provider={Config.model_provider} model={selected_model}", flush=True)
 
@@ -813,7 +962,7 @@ def stream_ollama_chat(
         has_chunk = False
         next_wait_notice = 10
         if attempt > 1:
-            runtime_state.emit(
+            _model_emit(
                 "model_attempt_started",
                 f"{label} 第 {attempt}/{total_attempts} 次调用开始",
                 source="model",
@@ -835,7 +984,7 @@ def stream_ollama_chat(
                 print("", flush=True)
                 timeout_reason = "未收到任何响应" if not has_chunk else f"已收到 {len(content)} 字符但未完成"
                 last_error = TimeoutError(f"{label} 超过 {timeout_seconds} 秒未完成（{timeout_reason}）")
-                runtime_state.emit(
+                _model_emit(
                     "model_timeout",
                     f"模型调用超时: {label}（{timeout_reason}）",
                     source="model",
@@ -877,7 +1026,7 @@ def stream_ollama_chat(
                         stop_event.set()
                         printer.flush()
                         print("", flush=True)
-                        runtime_state.emit(
+                        _model_emit(
                             "model_early_stop",
                             f"岗位评分已取得标准三项评分，提前结束模型读取: {label}",
                             source="model",
@@ -885,7 +1034,7 @@ def stream_ollama_chat(
                         )
                         if Config.log_verbosity != "debug":
                             print("[模型] 岗位评分已取得标准三项评分，提前结束模型读取", flush=True)
-                        runtime_state.emit("model_finished", f"{label} 完成", source="model")
+                        _model_emit("model_finished", f"{label} 完成")
                         return score_block
                 repetition_reason = guard.feed(chunk)
                 if repetition_reason:
@@ -894,7 +1043,7 @@ def stream_ollama_chat(
                     print("", flush=True)
                     # 评分调用：返回已累积内容，由上层 calculate_job_score 解析失败后触发策略重试（关思考）
                     if early_stop == "job_score":
-                        runtime_state.emit(
+                        _model_emit(
                             "model_repetition_detected",
                             f"模型输出疑似重复循环: {label}，返回内容由上层策略重试",
                             source="model",
@@ -908,10 +1057,10 @@ def stream_ollama_chat(
                                 "preview": compact_model_text(content),
                             },
                         )
-                        runtime_state.emit("model_finished", f"{label} 完成（检测到重复，返回内容）", source="model")
+                        _model_emit("model_finished", f"{label} 完成（检测到重复，返回内容）")
                         return content
                     last_error = ModelRepetitionError(repetition_reason)
-                    runtime_state.emit(
+                    _model_emit(
                         "model_repetition_detected",
                         f"模型输出疑似重复循环: {label}",
                         source="model",
@@ -939,7 +1088,7 @@ def stream_ollama_chat(
 
             printer.flush()
             print("", flush=True)
-            runtime_state.emit("model_finished", f"{label} 完成", source="model")
+            _model_emit("model_finished", f"{label} 完成")
             return content
 
     message = (
@@ -947,7 +1096,7 @@ def stream_ollama_chat(
         if max_internal_retries
         else f"模型调用失败: {label}，本次调用未成功"
     )
-    runtime_state.emit(
+    _model_emit(
         "model_failed",
         f"{message}: {last_error}",
         source="model",
@@ -965,7 +1114,20 @@ def stream_ollama_chat(
     raise RuntimeError(f"{message}: {last_error}")
 
 
-def model_warmup_check() -> dict[str, Any]:
+def model_warmup_check(*, bypass_gate: bool = False) -> dict[str, Any]:
+    token = _MODEL_EVENT_CONTEXT.set({"platform": "system", "model_call_kind": "warmup"})
+    try:
+        with MODEL_EXECUTION_GATE.acquire(
+            kind="warmup",
+            platform="system",
+            bypass=bypass_gate,
+        ):
+            return _model_warmup_check_impl()
+    finally:
+        _MODEL_EVENT_CONTEXT.reset(token)
+
+
+def _model_warmup_check_impl() -> dict[str, Any]:
     """启动时快速检测模型连通性与延迟。"""
     from tools import now_iso
 

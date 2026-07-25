@@ -1,4 +1,6 @@
 param(
+    [ValidateSet("all", "boss", "zhaopin")]
+    [string]$Platform = "all",
     [switch]$NoOpen
 )
 
@@ -12,6 +14,7 @@ try {
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BossUrl = "https://www.zhipin.com/web/geek/jobs"
+$ZhaopinDefaultUrl = "https://www.zhaopin.com/recommend"
 $OpenCooldownSeconds = 60
 
 function Write-Info {
@@ -112,19 +115,35 @@ function Test-OpenCooldown {
 }
 
 function Open-StartupPages {
-    param([int]$Port)
-    $scriptUrl = "http://127.0.0.1:${Port}/web_script.user.js"
-    if (Test-OpenCooldown "userscript") {
-        Write-Info "Opening userscript install/update page: $scriptUrl"
-        Start-Process $scriptUrl | Out-Null
-    } else {
-        Write-Warn "Userscript page was opened recently; skipping duplicate open."
+    param(
+        [int]$Port,
+        [string]$SelectedPlatform
+    )
+    $platforms = if ($SelectedPlatform -eq "all") { @("boss", "zhaopin") } else { @($SelectedPlatform) }
+    foreach ($name in $platforms) {
+        $scriptUrl = "http://127.0.0.1:${Port}/userscripts/${name}.user.js"
+        if (Test-OpenCooldown "userscript_$name") {
+            Write-Info "Opening $name userscript install/update page: $scriptUrl"
+            Start-Process $scriptUrl | Out-Null
+        } else {
+            Write-Warn "$name userscript page was opened recently; skipping duplicate open."
+        }
     }
-    if (Test-OpenCooldown "boss_search") {
+    if ($SelectedPlatform -in @("all", "boss") -and (Test-OpenCooldown "boss_search")) {
         Write-Info "Opening BOSS search page: $BossUrl"
         Start-Process $BossUrl | Out-Null
-    } else {
+    } elseif ($SelectedPlatform -in @("all", "boss")) {
         Write-Warn "BOSS search page was opened recently; skipping duplicate open."
+    }
+    if ($SelectedPlatform -in @("all", "zhaopin") -and (Test-OpenCooldown "zhaopin_search")) {
+        $zhaopinUrl = $ZhaopinDefaultUrl
+        if ($null -ne $script:config -and $script:config.zhaopin_job_urls -and $script:config.zhaopin_job_urls.Count -gt 0) {
+            $zhaopinUrl = [string]$script:config.zhaopin_job_urls[0]
+        }
+        Write-Info "Opening Zhaopin jobs page: $zhaopinUrl"
+        Start-Process $zhaopinUrl | Out-Null
+    } elseif ($SelectedPlatform -in @("all", "zhaopin")) {
+        Write-Warn "Zhaopin jobs page was opened recently; skipping duplicate open."
     }
 }
 
@@ -186,7 +205,7 @@ if (Test-TcpPort $port) {
     if (Test-JobSeekerHealth $port) {
         Write-Warn "Job Seeker is already running on port $port. This launcher will not start another backend."
         if (-not $NoOpen) {
-            Open-StartupPages $port
+            Open-StartupPages $port $Platform
         }
         Pause-And-Exit 0
     }
@@ -217,6 +236,7 @@ if ($provider -eq "openai" -and -not $openaiKey) {
 
 Write-Info "Starting Job Seeker CLI..."
 $mainPy = Join-Path $ProjectRoot "main.py"
+$env:JOB_SEEKER_ENTRY_PLATFORM = $Platform
 & $pythonExe $mainPy
 $exitCode = $LASTEXITCODE
 

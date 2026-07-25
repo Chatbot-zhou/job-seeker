@@ -32,6 +32,7 @@ class RuntimeState:
         self.run_started_at = self.started_at
         self.current_task = "idle"
         self.control = "paused"
+        self.control_reason = ""
         self.last_error = ""
         self.platform_controls = {platform: "running" for platform in PLATFORM_NAMES}
         self.platform_pause_reasons = {platform: "" for platform in PLATFORM_NAMES}
@@ -291,12 +292,13 @@ class RuntimeState:
             detail={"platform": platform, "command": command, "reason": reason},
         )
 
-    def set_control(self, command: str, *, new_run: bool = False) -> None:
+    def set_control(self, command: str, *, new_run: bool = False, reason: str = "") -> None:
         previous_run_id = ""
         with self._lock:
             previous_run_id = self.run_id
             if command == "pause":
                 self.control = "paused"
+                self.control_reason = str(reason or "")
                 self.current_task = "paused"
                 for platform in PLATFORM_NAMES:
                     self.platform_generations[platform] = int(self.platform_generations.get(platform, 0)) + 1
@@ -306,9 +308,11 @@ class RuntimeState:
                     self.run_started_at = now_iso()
                 self.clear_autorun_blocked()
                 self.control = "running"
+                self.control_reason = ""
                 self.current_task = "idle"
             elif command == "stop":
                 self.control = "stopped"
+                self.control_reason = str(reason or "")
                 self.current_task = "stopped"
                 for platform in PLATFORM_NAMES:
                     self.platform_generations[platform] = int(self.platform_generations.get(platform, 0)) + 1
@@ -351,6 +355,7 @@ class RuntimeState:
             run_id = self.run_id
             run_started_at = self.run_started_at
             current_task = self.current_task
+            control_reason = self.control_reason
         selected = self._platform_name(platform) if platform else None
         effective_control = self.platform_control(selected) if selected else control
         should_start = effective_control == "running"
@@ -359,6 +364,7 @@ class RuntimeState:
             "run_id": run_id,
             "run_started_at": run_started_at,
             "current_task": current_task,
+            "control_reason": control_reason,
             "script": self.script_snapshot(),
             "platform": selected,
             "platform_control": effective_control if selected else "",
