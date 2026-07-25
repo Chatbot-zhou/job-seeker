@@ -41,7 +41,6 @@ Job Seeker 是一个运行在本机的双平台求职辅助工具，目前支持
    - `start_boss.bat`：只启动 BOSS。
    - `start_zhaopin.bat`：只启动智联。
    - `start_all.bat`：同时启动两个平台。
-   - 原 `start_job_seeker.bat` 保持兼容，等同于 `start_all.bat`。
 
 2. 执行 `config`，确认平台、模型、评分阈值和投递参数。
 3. 执行 `resume` 导入或更新简历内容，再用 `profile` 检查识别结果。
@@ -61,7 +60,7 @@ Job Seeker 是一个运行在本机的双平台求职辅助工具，目前支持
 7. 安装或更新用户脚本后刷新平台页面，回到控制台执行 `status`，确认对应平台已经连接。
 8. 点击平台页面左下角面板的“开始”，或在控制台执行 `start`。面板还可以暂停、继续或结束当前平台，不影响另一平台。
 
-日常自动运行可使用 `start_boss_auto.bat`、`start_zhaopin_auto.bat` 或 `start_all_auto.bat`。原 `start_job_seeker_auto.bat` 等同于启动全部平台。
+三个启动器都只负责准备后端和打开对应平台页面。是否正式开始处理岗位，统一由网页左下角面板控制，避免误启动，也不再区分容易混淆的“手动版”和“自动版”。
 
 ## 平台流程
 

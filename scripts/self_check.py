@@ -145,6 +145,21 @@ def check_gitignore_allows_tests() -> None:
     assert "test.*" not in lines
 
 
+def check_launcher_entries() -> None:
+    expected = {
+        "start_all.bat": "all",
+        "start_boss.bat": "boss",
+        "start_zhaopin.bat": "zhaopin",
+    }
+    launchers = {path.name for path in ROOT.glob("start_*.bat")}
+    assert launchers == set(expected), f"unexpected launchers: {sorted(launchers)}"
+    for filename, platform in expected.items():
+        content = (ROOT / filename).read_text(encoding="utf-8-sig")
+        assert "scripts\\start_job_seeker.ps1" in content
+        assert f"-Platform {platform}" in content
+        assert "_auto" not in content.lower()
+
+
 def main() -> int:
     checks = [
         check_dependencies,
@@ -155,6 +170,7 @@ def main() -> int:
         check_userscript_version_sync,
         check_diagnostic_redaction,
         check_gitignore_allows_tests,
+        check_launcher_entries,
     ]
     for check in checks:
         check()

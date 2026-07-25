@@ -2118,8 +2118,8 @@ def auto_prepare_saved_configuration() -> bool:
     if not startup_platform_enabled("boss") and not startup_platform_enabled("zhaopin"):
         return block_autorun("没有启用任何招聘平台", next_action="运行 config -> 平台与智联投递，启用至少一个平台")
     if not cache.resume.strip():
-        print("[配置] 未找到已保存简历。请先运行 start_job_seeker.bat 完成人工配置。")
-        return block_autorun("未找到已保存简历，自动运行已暂停", next_action="运行 start_job_seeker.bat 配置简历")
+        print("[配置] 未找到已保存简历。请先运行 start_all.bat 完成人工配置。")
+        return block_autorun("未找到已保存简历，自动运行已暂停", next_action="运行 start_all.bat 配置简历")
     if not model_ready_for_autorun():
         return block_autorun(
             "模型配置不可用，自动运行已暂停",

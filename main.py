@@ -934,8 +934,9 @@ def print_usage() -> None:
                 "  python main.py --help       显示本帮助",
                 "",
                 "推荐入口:",
-                "  start_job_seeker.bat        人工配置和排查",
-                "  start_job_seeker_auto.bat   自动运行",
+                "  start_all.bat               启动全部平台",
+                "  start_boss.bat              只启动 BOSS",
+                "  start_zhaopin.bat           只启动智联",
             ]
         )
     )
@@ -948,7 +949,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         raise SystemExit(run_api_only())
     if len(sys.argv) > 1 and sys.argv[1] in {"agent", "mcp"}:
-        print("[Job Seeker] 当前版本不再提供 agent/MCP 入口。请使用 start_job_seeker_auto.bat 自动运行，或使用 start_job_seeker.bat 人工配置。")
+        print("[Job Seeker] 请使用 start_all.bat、start_boss.bat 或 start_zhaopin.bat 启动，然后在网页面板控制运行。")
         raise SystemExit(2)
     from cli_console import run_autorun, run_cli
 

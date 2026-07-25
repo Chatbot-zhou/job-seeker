@@ -412,7 +412,7 @@ if (Test-TcpPort $port) {
             Resume-ExistingJobSeeker $port $Platform | Out-Null
         } else {
             Write-Warn "Existing backend is alive, but saved configuration is not fully ready. It will not be resumed automatically."
-            Write-Warn "Open http://127.0.0.1:${port}/status or use start_job_seeker.bat to finish configuration."
+            Write-Warn "Open http://127.0.0.1:${port}/status or use start_all.bat to finish configuration."
         }
         Open-StartupPages $port $Platform
         Write-Info "Existing backend is attached. You can monitor: http://127.0.0.1:${port}/status"
