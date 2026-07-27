@@ -70,9 +70,44 @@ def test_run_summary_uses_run_id(tmp_path, monkeypatch) -> None:
             "run_id": "run-test",
         }
     )
+    database.create_action(
+        {
+            "action_type": "greet",
+            "status": "completed",
+            "job_url": "https://www.zhipin.com/job_detail/boss-summary.html",
+            "platform": "boss",
+            "idempotency_key": "boss-summary-greet",
+            "payload": {},
+            "run_id": "run-test",
+        }
+    )
+    database.create_action(
+        {
+            "action_type": "apply",
+            "status": "confirmed",
+            "job_url": "https://www.zhaopin.com/jobdetail/zhaopin-summary.htm",
+            "platform": "zhaopin",
+            "idempotency_key": "zhaopin-summary-apply",
+            "payload": {"transactionState": "confirmed"},
+            "run_id": "run-test",
+        }
+    )
+    database.create_action(
+        {
+            "action_type": "greet_delivery_unknown",
+            "status": "unknown",
+            "job_url": "https://www.zhipin.com/job_detail/boss-unknown.html",
+            "platform": "boss",
+            "idempotency_key": "boss-summary-unknown",
+            "payload": {},
+            "run_id": "run-test",
+        }
+    )
     summary = database.finish_run("run-test", control="paused")
     assert summary["event_count"] == 1
     assert summary["error_count"] == 1
+    assert summary["greet_success"] == 1
+    assert summary["apply_success"] == 1
     assert summary["greet_unknown"] == 1
 
 
@@ -337,7 +372,7 @@ def test_thinking_control_retry_is_recorded_once_per_model_and_run(monkeypatch) 
     assert len(stored) == 1
 
 
-def test_script_status_persists_page_state_without_action_text_churn(monkeypatch) -> None:
+def test_script_status_persists_only_real_instance_changes(monkeypatch) -> None:
     import database
     from runtime_state import RuntimeState
 
@@ -345,8 +380,46 @@ def test_script_status_persists_page_state_without_action_text_churn(monkeypatch
     monkeypatch.setattr(database, "create_event", lambda event: stored.append(event) or event)
     state = RuntimeState()
 
-    state.update_script("search", "running", "读取第一个岗位")
-    state.update_script("search", "running", "读取第二个岗位")
-    state.update_script("detail", "running", "读取第二个岗位详情")
+    state.update_script("search", "running", "读取第一个岗位", instance_id="search-tab")
+    state.update_script("search", "running", "读取第一个岗位", instance_id="search-tab")
+    state.update_script("search", "running", "读取第二个岗位", instance_id="search-tab")
+    state.update_script("detail", "running", "读取第二个岗位详情", instance_id="detail-tab")
 
-    assert [item["detail"]["page"] for item in stored] == ["search", "detail"]
+    assert [item["detail"]["page"] for item in stored] == ["search", "search", "detail"]
+    assert all("detail" in item["detail"] for item in stored)
+
+
+def test_platform_snapshot_prefers_controller_and_reports_recent_activity(monkeypatch) -> None:
+    import database
+    from runtime_state import RuntimeState
+
+    monkeypatch.setattr(database, "create_event", lambda event: event)
+    state = RuntimeState()
+    state.update_script(
+        "search",
+        "running",
+        "BOSS 岗位调度中",
+        {"currentJobId": "boss-list"},
+        platform="boss",
+        instance_id="boss-search",
+        page_kind="search",
+    )
+    state.update_script(
+        "chat",
+        "running",
+        "BOSS 聊天发送中",
+        {"currentJobId": "boss-chat"},
+        platform="boss",
+        instance_id="boss-chat",
+        page_kind="chat",
+    )
+    state.platform_instances["boss"]["boss-search"]["last_seen"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=30)
+    ).isoformat()
+
+    snapshot = state.script_snapshot("boss")
+    assert snapshot["page"] == "search"
+    assert snapshot["stale"] is True
+    assert snapshot["instance_count"] == 2
+    assert snapshot["recent_activity"]["page"] == "chat"
+    assert snapshot["recent_activity"]["current_job_id"] == "boss-chat"

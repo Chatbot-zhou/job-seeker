@@ -76,6 +76,7 @@ def test_platform_heartbeat_and_control_are_isolated(tmp_path, monkeypatch) -> N
     database._INITIALIZED_PATHS.clear()
     main.runtime_state.platform_controls.update({"boss": "running", "zhaopin": "running"})
     main.runtime_state.platform_pause_reasons.update({"boss": "", "zhaopin": ""})
+    main.runtime_state.platform_instances = {"boss": {}, "zhaopin": {}}
     main.runtime_state.set_control("resume")
 
     with TestClient(main.app) as client:
@@ -85,7 +86,7 @@ def test_platform_heartbeat_and_control_are_isolated(tmp_path, monkeypatch) -> N
                 json={
                     "platform": platform,
                     "instance_id": f"{platform}-instance",
-                    "page_kind": "list",
+                    "page_kind": "search" if platform == "boss" else "list",
                     "page": "search" if platform == "boss" else "list",
                     "status": "running",
                     "current_action": "读取岗位列表",
@@ -94,6 +95,20 @@ def test_platform_heartbeat_and_control_are_isolated(tmp_path, monkeypatch) -> N
             )
             assert response.status_code == 200
             assert response.json()["platform"] == platform
+
+        detail_response = client.post(
+            "/script/heartbeat",
+            json={
+                "platform": "boss",
+                "instance_id": "boss-chat-instance",
+                "page_kind": "chat",
+                "page": "chat",
+                "status": "running",
+                "current_action": "发送打招呼消息",
+                "detail": {"currentJobId": "boss-chat-job"},
+            },
+        )
+        assert detail_response.status_code == 200
 
         paused = client.post("/control", json={"command": "pause", "platform": "zhaopin", "reason": "验证码"})
         assert paused.status_code == 200
@@ -104,6 +119,9 @@ def test_platform_heartbeat_and_control_are_isolated(tmp_path, monkeypatch) -> N
 
         status = client.get("/status").json()
         assert status["platforms"]["boss"]["instance_id"] == "boss-instance"
+        assert status["platforms"]["boss"]["page"] == "search"
+        assert status["platforms"]["boss"]["instance_count"] == 2
+        assert status["platforms"]["boss"]["recent_activity"]["page"] == "chat"
         assert status["platforms"]["zhaopin"]["instance_id"] == "zhaopin-instance"
         assert status["model_queue"]["limit"] in {1, 2}
 

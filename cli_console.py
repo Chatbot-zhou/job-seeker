@@ -52,6 +52,7 @@ BOSS_SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
 ZHAOPIN_DEFAULT_URL = "https://www.zhaopin.com/recommend"
 SESSION_PREPARED = False
 BROWSER_OPEN_COOLDOWN_SECONDS = 60
+USERSCRIPT_UPDATE_CHECK_SECONDS = 15.0
 DEFAULT_AUTORUN_OLLAMA_MODEL = "qwen3:1.7b"
 OLLAMA_PULL_TIMEOUT_SECONDS = 1800
 STARTUP_PLATFORM_SCOPE = str(os.getenv("JOB_SEEKER_ENTRY_PLATFORM", "all")).strip().lower()
@@ -1275,6 +1276,74 @@ def script_install_urls() -> dict[str, str]:
     return {platform: script_install_url(platform) for platform in platforms}
 
 
+def open_userscript_install_page_once(platform: str, reason: str) -> bool:
+    """同一平台、同一目标版本仅自动打开一次安装页。"""
+    _, expected_version = read_script_versions()
+    if expected_version in {"未知", "未找到"}:
+        return False
+    stamp_name = f"userscript_{platform}_{expected_version}"
+    if not should_open_browser_page(stamp_name, cooldown_seconds=3650 * 24 * 60 * 60):
+        return False
+    url = script_install_url(platform)
+    try:
+        webbrowser.open(url, new=2)
+        print(f"[脚本] 已打开 {platform} 脚本安装/更新页（{reason}）。")
+        runtime_state.emit(
+            "userscript_install_page_opened",
+            f"已打开 {platform} 脚本安装/更新页",
+            source="startup",
+            detail={
+                "platform": platform,
+                "reason": reason,
+                "expected_version": expected_version,
+            },
+        )
+        return True
+    except Exception as exc:
+        print(f"[脚本] 打开 {platform} 脚本安装/更新页失败: {exc}")
+        return False
+
+
+def maybe_open_userscript_updates(wait_seconds: float = USERSCRIPT_UPDATE_CHECK_SECONDS) -> None:
+    """首次配置或已连接脚本版本落后时，按目标版本提示一次更新。"""
+    platforms = list(script_install_urls())
+    if CONFIG_WAS_MISSING:
+        for platform in platforms:
+            open_userscript_install_page_once(platform, "首次配置")
+        return
+
+    _, expected_version = read_script_versions()
+    if expected_version in {"未知", "未找到"}:
+        return
+
+    pending = set(platforms)
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while pending:
+        snapshots = runtime_state.platform_snapshots()
+        for platform in tuple(pending):
+            snapshot = snapshots.get(platform) or {}
+            if not snapshot.get("connected") or snapshot.get("stale"):
+                continue
+            pending.remove(platform)
+            browser_version = str((snapshot.get("detail") or {}).get("version") or "").strip()
+            if browser_version and browser_version != expected_version:
+                open_userscript_install_page_once(
+                    platform,
+                    f"检测到旧版本 {browser_version}，目标版本 {expected_version}",
+                )
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
+def start_userscript_update_check() -> None:
+    threading.Thread(
+        target=maybe_open_userscript_updates,
+        name="userscript-update-check",
+        daemon=True,
+    ).start()
+
+
 def api_health_url() -> str:
     return f"http://{Config.server_host}:{Config.server_port}/health"
 
@@ -1340,8 +1409,8 @@ def show_startup_next_steps() -> None:
 
 def show_autorun_next_steps() -> None:
     print("\n[启动] 自动运行模式")
-    print("  1. 已尝试打开当前入口对应的油猴脚本安装/更新页")
-    print("  2. 已尝试打开已启用平台的岗位列表页")
+    print("  1. 已尝试打开已启用平台的岗位列表页")
+    print("  2. 仅在首次配置或检测到旧版脚本时打开安装/更新页")
     print("  3. 等待任一已启用平台的油猴脚本心跳，在线后自动开始运行")
 
 
@@ -1438,8 +1507,8 @@ def wait_for_auto_start_schedule() -> bool:
     return True
 
 
-def maybe_open_startup_pages(*, always_open_userscript: bool = False) -> None:
-    """打开已启用平台的调度页；脚本安装页按模式和冷却策略打开。"""
+def maybe_open_startup_pages() -> None:
+    """正常启动只打开已启用平台的岗位调度页。"""
     if not wait_for_api_ready():
         print("[启动] 本地 API 未在限定时间内就绪，已跳过自动打开。")
         return
@@ -1459,23 +1528,6 @@ def maybe_open_startup_pages(*, always_open_userscript: bool = False) -> None:
             print(f"[启动] 打开智联岗位列表页失败: {exc}")
     elif startup_platform_enabled("zhaopin"):
         print("[启动] 60 秒内已打开过智联岗位列表页，本次跳过自动打开。")
-    meta_version, _ = read_script_versions()
-    for platform, url in script_install_urls().items():
-        stamp_name = (
-            f"userscript_{platform}"
-            if always_open_userscript or CONFIG_WAS_MISSING
-            else f"userscript_{platform}_{meta_version}"
-        )
-        cooldown = BROWSER_OPEN_COOLDOWN_SECONDS if always_open_userscript else 3650 * 24 * 60 * 60
-        if not should_open_browser_page(stamp_name, cooldown_seconds=cooldown):
-            continue
-        try:
-            webbrowser.open(url, new=2)
-            print(f"[启动] 已打开 {platform} 脚本安装/更新页。")
-        except Exception as exc:
-            print(f"[启动] 打开 {platform} 脚本安装页失败: {exc}")
-
-
 def wait_for_script_ready(timeout_seconds: float = 120.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -2287,6 +2339,7 @@ def run_cli(app, shutdown_callback: Callable[[], None] | None = None) -> None:
     start_model_warmup_background()
     print_status_panel()
     maybe_open_startup_pages()
+    start_userscript_update_check()
     show_startup_next_steps()
     try:
         command_loop()
@@ -2321,8 +2374,9 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
         print("\n[退出] 定时等待已取消，正在关闭服务...")
         shutdown_autorun()
         return 130
-    print("[3/6] 打开油猴脚本和已启用平台岗位页...")
-    maybe_open_startup_pages(always_open_userscript=True)
+    print("[3/6] 打开已启用平台岗位页...")
+    maybe_open_startup_pages()
+    start_userscript_update_check()
     show_autorun_next_steps()
     print("[4/6] 检查模型、简历、画像、标签和话术...")
     if not auto_prepare_saved_configuration():
@@ -2339,14 +2393,8 @@ def run_autorun(app, shutdown_callback: Callable[[], None] | None = None) -> int
     if not wait_for_script_ready(120):
         block_autorun("油猴脚本未连接，自动运行已暂停", next_action="安装/更新油猴脚本，登录至少一个已启用平台并刷新岗位页")
         print("[脚本] 油猴脚本未连接。请确认已安装/启用脚本、平台已登录，并刷新岗位列表页。")
-        for platform, url in script_install_urls().items():
-            if not should_open_browser_page(f"userscript_{platform}"):
-                continue
-            try:
-                webbrowser.open(url, new=2)
-                print(f"[脚本] 已再次打开 {platform} 油猴脚本安装/更新页。")
-            except Exception as exc:
-                print(f"[脚本] 打开 {platform} 油猴脚本安装/更新页失败: {exc}")
+        for platform in script_install_urls():
+            open_userscript_install_page_once(platform, "等待脚本连接超时")
         try:
             keep_process_alive()
         finally:

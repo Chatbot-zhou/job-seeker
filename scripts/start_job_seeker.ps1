@@ -119,16 +119,6 @@ function Open-StartupPages {
         [int]$Port,
         [string]$SelectedPlatform
     )
-    $platforms = if ($SelectedPlatform -eq "all") { @("boss", "zhaopin") } else { @($SelectedPlatform) }
-    foreach ($name in $platforms) {
-        $scriptUrl = "http://127.0.0.1:${Port}/userscripts/${name}.user.js"
-        if (Test-OpenCooldown "userscript_$name") {
-            Write-Info "Opening $name userscript install/update page: $scriptUrl"
-            Start-Process $scriptUrl | Out-Null
-        } else {
-            Write-Warn "$name userscript page was opened recently; skipping duplicate open."
-        }
-    }
     if ($SelectedPlatform -in @("all", "boss") -and (Test-OpenCooldown "boss_search")) {
         Write-Info "Opening BOSS search page: $BossUrl"
         Start-Process $BossUrl | Out-Null

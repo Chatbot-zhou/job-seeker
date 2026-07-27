@@ -422,13 +422,21 @@ def get_job(url: str) -> dict[str, Any] | None:
     return row_to_dict(row) if row else None
 
 
-def get_job_by_identity(identity_key: str, *, exclude_platform: str = "") -> dict[str, Any] | None:
+def get_job_by_identity(
+    identity_key: str,
+    *,
+    platform: str = "",
+    exclude_platform: str = "",
+) -> dict[str, Any] | None:
     init_db()
     identity_key = str(identity_key or "").strip()
     if not identity_key:
         return None
     params: list[Any] = [identity_key]
     where = "identity_key = ?"
+    if platform:
+        where += " AND platform = ?"
+        params.append(platform)
     if exclude_platform:
         where += " AND platform != ?"
         params.append(exclude_platform)
@@ -644,20 +652,31 @@ def list_history(limit: int = 100, offset: int = 0) -> dict[str, Any]:
     }
 
 
-def list_recent_processed_jobs(limit: int = 500, hours: int = 24) -> list[dict[str, Any]]:
+def list_recent_processed_jobs(
+    limit: int = 500,
+    hours: int = 24,
+    *,
+    platform: str = "",
+) -> list[dict[str, Any]]:
     init_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, hours))).isoformat()
+    params: list[Any] = [cutoff]
+    platform_filter = ""
+    if platform:
+        platform_filter = " AND platform = ?"
+        params.append(platform)
+    params.append(limit)
     with closing(connect()) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT url, title, company, platform, external_job_id, identity_key,
                    recommendation, final_action, greeted, applied, application_state, updated_at, error
             FROM jobs
-            WHERE url != '' AND updated_at >= ?
+            WHERE url != '' AND updated_at >= ?{platform_filter}
             ORDER BY updated_at DESC
             LIMIT ?
             """,
-            (cutoff, limit),
+            tuple(params),
         ).fetchall()
     return [row_to_dict(row) for row in rows]
 
@@ -896,7 +915,24 @@ def summarize_run(run_id: str) -> dict[str, Any]:
             """,
             (run_id,),
         ).fetchall()
+        action_rows = conn.execute(
+            """
+            SELECT platform, action_type, status, COUNT(*) AS count
+            FROM actions
+            WHERE run_id = ?
+            GROUP BY platform, action_type, status
+            """,
+            (run_id,),
+        ).fetchall()
     counts = {str(row["event_type"]): int(row["count"]) for row in rows}
+    action_counts = {
+        (
+            str(row["platform"] or ""),
+            str(row["action_type"] or ""),
+            str(row["status"] or ""),
+        ): int(row["count"])
+        for row in action_rows
+    }
     error_count = sum(int(row["count"]) for row in rows if row["level"] == "error")
     return {
         "run_id": run_id,
@@ -904,10 +940,19 @@ def summarize_run(run_id: str) -> dict[str, Any]:
         "error_count": error_count,
         "searches": counts.get("search_started", 0),
         "jobs_analyzed": counts.get("job_analyzed", 0) + counts.get("job_analyze_completed", 0),
-        "greet_success": counts.get("greet_success", 0) + counts.get("message_sent", 0),
-        "greet_unknown": counts.get("greet_delivery_unknown", 0),
-        "apply_success": counts.get("apply_confirmed", 0),
-        "apply_unknown": counts.get("apply_delivery_unknown", 0),
+        "greet_success": action_counts.get(("boss", "greet", "completed"), 0),
+        "greet_unknown": (
+            action_counts.get(("boss", "greet", "unknown"), 0)
+            + action_counts.get(("boss", "greet_delivery_unknown", "unknown"), 0)
+        ),
+        "apply_success": (
+            action_counts.get(("zhaopin", "apply", "confirmed"), 0)
+            + action_counts.get(("zhaopin", "apply", "completed"), 0)
+        ),
+        "apply_unknown": (
+            action_counts.get(("zhaopin", "apply", "unknown"), 0)
+            + action_counts.get(("zhaopin", "apply_delivery_unknown", "unknown"), 0)
+        ),
         "paused": counts.get("manual_intervention_pause", 0) + counts.get("platform_limit_pause", 0),
         "event_types": counts,
     }

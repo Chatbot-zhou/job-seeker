@@ -15,7 +15,27 @@ from tools import now_iso, sanitize_log_value
 
 
 SCRIPT_STALE_SECONDS = 15
+SCRIPT_INSTANCE_RETENTION_SECONDS = 300
 PLATFORM_NAMES = ("boss", "zhaopin")
+CONTROLLER_PAGE_KINDS = {
+    "boss": ("search", "search_standby"),
+    "zhaopin": ("list",),
+}
+SCRIPT_STATUS_DETAIL_KEYS = (
+    "version",
+    "backendRunId",
+    "currentJobId",
+    "currentJobTitle",
+    "listMode",
+    "pageNumber",
+    "pageTurnCount",
+    "lastPageOutcome",
+    "scrollMode",
+    "scrollRound",
+    "lastScrollOutcome",
+    "runApplyCount",
+    "dailyApplyCount",
+)
 
 
 def _seconds_since(iso_time: str) -> int | None:
@@ -38,6 +58,9 @@ class RuntimeState:
         self.platform_pause_reasons = {platform: "" for platform in PLATFORM_NAMES}
         self.platform_generations = {platform: 0 for platform in PLATFORM_NAMES}
         self.platforms = {platform: self._blank_script(platform) for platform in PLATFORM_NAMES}
+        self.platform_instances: dict[str, dict[str, dict[str, Any]]] = {
+            platform: {} for platform in PLATFORM_NAMES
+        }
         # Backward-compatible alias.  Existing callers historically saw BOSS only.
         self.script = dict(self.platforms["boss"])
         self.model_warmup = {
@@ -58,7 +81,7 @@ class RuntimeState:
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self._subscribers: list[Queue] = []
         self._lock = threading.RLock()
-        self._last_persisted_script_status: dict[str, tuple[str, str]] = {}
+        self._last_persisted_script_status: dict[tuple[str, str, str], tuple[str, str, str]] = {}
         self._once_event_keys: set[tuple[str, str, str]] = set()
 
     def _new_run_id(self) -> str:
@@ -87,6 +110,102 @@ class RuntimeState:
     @staticmethod
     def _platform_enabled(platform: str) -> bool:
         return bool(getattr(Config, f"{platform}_enabled", True))
+
+    @staticmethod
+    def _instance_key(instance_id: str, page_kind: str, page: str) -> str:
+        return str(instance_id or f"legacy:{page_kind or page or 'unknown'}")
+
+    @staticmethod
+    def _script_age(script: dict[str, Any]) -> int | None:
+        return _seconds_since(str(script.get("last_seen") or ""))
+
+    @staticmethod
+    def _script_with_age(script: dict[str, Any]) -> dict[str, Any]:
+        result = dict(script)
+        result["detail"] = dict(result.get("detail") or {})
+        age_seconds = RuntimeState._script_age(result)
+        result["heartbeat_age_seconds"] = age_seconds
+        result["stale"] = False
+        if age_seconds is None:
+            return result
+        if result.get("connected") and age_seconds > SCRIPT_STALE_SECONDS:
+            result["connected"] = False
+            result["stale"] = True
+            result["status"] = "stale"
+            result["current_action"] = f"脚本心跳超过 {age_seconds} 秒未更新"
+        return result
+
+    @staticmethod
+    def _activity_summary(script: dict[str, Any]) -> dict[str, Any]:
+        detail = dict(script.get("detail") or {})
+        return {
+            "page": script.get("page", "unknown"),
+            "page_kind": script.get("page_kind", ""),
+            "instance_id": script.get("instance_id", ""),
+            "status": script.get("status", "offline"),
+            "current_action": script.get("current_action", ""),
+            "last_seen": script.get("last_seen", ""),
+            "heartbeat_age_seconds": script.get("heartbeat_age_seconds"),
+            "current_job_id": detail.get("currentJobId") or detail.get("jobId") or "",
+            "current_job_title": detail.get("currentJobTitle") or "",
+        }
+
+    @staticmethod
+    def _compact_script_event_detail(script: dict[str, Any]) -> dict[str, Any]:
+        raw_detail = dict(script.get("detail") or {})
+        compact_detail = {
+            key: raw_detail[key]
+            for key in SCRIPT_STATUS_DETAIL_KEYS
+            if key in raw_detail and raw_detail[key] not in ("", None, [], {})
+        }
+        return {
+            "platform": script.get("platform", "boss"),
+            "page": script.get("page", "unknown"),
+            "page_kind": script.get("page_kind", ""),
+            "instance_id": script.get("instance_id", ""),
+            "status": script.get("status", "offline"),
+            "current_action": script.get("current_action", ""),
+            "last_seen": script.get("last_seen", ""),
+            "detail": compact_detail,
+        }
+
+    def _prune_instances_locked(self, platform: str) -> None:
+        instances = self.platform_instances[platform]
+        expired = [
+            key
+            for key, script in instances.items()
+            if (self._script_age(script) or 0) > SCRIPT_INSTANCE_RETENTION_SECONDS
+        ]
+        for key in expired:
+            instances.pop(key, None)
+
+    def _select_primary_locked(self, platform: str) -> dict[str, Any]:
+        self._prune_instances_locked(platform)
+        scripts = list(self.platform_instances[platform].values())
+        if not scripts:
+            return self._blank_script(platform)
+        controller_kinds = CONTROLLER_PAGE_KINDS[platform]
+        controllers = [
+            script
+            for script in scripts
+            if str(script.get("page_kind") or script.get("page") or "") in controller_kinds
+        ]
+        if controllers:
+            def controller_rank(script: dict[str, Any]) -> tuple[int, str]:
+                page_kind = str(script.get("page_kind") or script.get("page") or "")
+                return -controller_kinds.index(page_kind), str(script.get("last_seen") or "")
+
+            return max(controllers, key=controller_rank)
+        fresh = [
+            script
+            for script in scripts
+            if (
+                self._script_age(script) is not None
+                and (self._script_age(script) or 0) <= SCRIPT_STALE_SECONDS
+            )
+        ]
+        candidates = fresh or scripts
+        return max(candidates, key=lambda item: str(item.get("last_seen") or ""))
 
     def log(self, message: str, level: str = "info", source: str = "backend") -> dict[str, Any]:
         return self.emit("log", message, source=source, level=level)
@@ -136,16 +255,19 @@ class RuntimeState:
         persist_event = True
         if event_type == "script_status":
             event_detail = safe_detail if isinstance(safe_detail, dict) else {}
-            script_detail = event_detail.get("detail") or {}
             platform = str(event_detail.get("platform", "boss"))
+            instance_id = str(event_detail.get("instance_id", ""))
+            page_kind = str(event_detail.get("page_kind") or event_detail.get("page") or "")
+            persist_key = (platform, instance_id, page_kind)
             signature = (
-                str(event_detail.get("page", "")),
                 str(event_detail.get("status", "")),
+                str(event_detail.get("current_action", "")),
+                str(event_detail.get("page", "")),
             )
             with self._lock:
-                persist_event = signature != self._last_persisted_script_status.get(platform)
+                persist_event = signature != self._last_persisted_script_status.get(persist_key)
                 if persist_event:
-                    self._last_persisted_script_status[platform] = signature
+                    self._last_persisted_script_status[persist_key] = signature
         try:
             import database
 
@@ -178,15 +300,17 @@ class RuntimeState:
     ) -> None:
         platform = self._platform_name(platform)
         detail = dict(detail or {})
+        page_kind = page_kind or page
+        instance_key = self._instance_key(instance_id, page_kind, page)
         with self._lock:
-            previous = dict(self.platforms[platform])
-            detail.setdefault("backendRunId", self.run_id)
-            detail.setdefault("platform", platform)
+            previous = dict(self.platform_instances[platform].get(instance_key) or {})
+            detail["backendRunId"] = self.run_id
+            detail["platform"] = platform
             script = {
                 "platform": platform,
                 "connected": True,
                 "page": page,
-                "page_kind": page_kind or page,
+                "page_kind": page_kind,
                 "instance_id": instance_id,
                 "status": status,
                 "current_action": current_action,
@@ -195,15 +319,17 @@ class RuntimeState:
                 "heartbeat_age_seconds": 0,
                 "detail": detail,
             }
-            self.platforms[platform] = script
+            self.platform_instances[platform][instance_key] = script
+            primary = self._select_primary_locked(platform)
+            self.platforms[platform] = dict(primary)
             if platform == "boss" or not self._platform_enabled("boss"):
-                self.script = dict(script)
+                self.script = dict(self.platforms[platform])
             changed = (
                 previous.get("page") != page
                 or previous.get("status") != status
                 or previous.get("current_action") != current_action
             )
-            script_detail = dict(script)
+            script_detail = self._compact_script_event_detail(script)
         if changed:
             self.emit(
                 "script_status",
@@ -217,23 +343,41 @@ class RuntimeState:
             "boss" if self._platform_enabled("boss") else "zhaopin"
         )
         with self._lock:
-            script = dict(self.platforms[selected])
-        script["detail"] = dict(script.get("detail") or {})
-        last_seen = script.get("last_seen")
-        script["stale"] = False
-        if not last_seen:
-            script["heartbeat_age_seconds"] = None
-            return script
-        age_seconds = _seconds_since(last_seen)
-        if age_seconds is None:
-            script["heartbeat_age_seconds"] = None
-            return script
-        script["heartbeat_age_seconds"] = age_seconds
-        if script.get("connected") and age_seconds > SCRIPT_STALE_SECONDS:
-            script["connected"] = False
-            script["stale"] = True
-            script["status"] = "stale"
-            script["current_action"] = f"脚本心跳超过 {age_seconds} 秒未更新"
+            primary = self._select_primary_locked(selected)
+            self.platforms[selected] = dict(primary)
+            instances = [
+                self._script_with_age(item)
+                for item in self.platform_instances[selected].values()
+            ]
+        script = self._script_with_age(primary)
+        primary_key = self._instance_key(
+            str(script.get("instance_id") or ""),
+            str(script.get("page_kind") or ""),
+            str(script.get("page") or ""),
+        )
+        secondary = [
+            item
+            for item in instances
+            if self._instance_key(
+                str(item.get("instance_id") or ""),
+                str(item.get("page_kind") or ""),
+                str(item.get("page") or ""),
+            ) != primary_key
+        ]
+        activity_pages = [
+            item
+            for item in secondary
+            if str(item.get("page_kind") or item.get("page") or "")
+            not in CONTROLLER_PAGE_KINDS[selected]
+        ]
+        recent_candidates = activity_pages or secondary
+        recent_activity = (
+            max(recent_candidates, key=lambda item: str(item.get("last_seen") or ""))
+            if recent_candidates
+            else None
+        )
+        script["instance_count"] = len(instances)
+        script["recent_activity"] = self._activity_summary(recent_activity) if recent_activity else {}
         return script
 
     def platform_control(self, platform: str) -> str:

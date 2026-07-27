@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.07.25.1
+// @version      2026.07.27.1
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -24,7 +24,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.07.25.1',
+        scriptVersion: '2026.07.27.1',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -716,6 +716,155 @@
                 ready: jobsChanged || (navigationChanged && jobsReady),
             };
         },
+        zhaopinPaginationRestoreDecision(saved = {}, current = {}) {
+            const savedRunId = String(saved.runId || '');
+            const currentRunId = String(current.runId || '');
+            const savedSource = String(saved.sourceIdentity || '');
+            const currentSource = String(current.sourceIdentity || '');
+            const savedPage = String(saved.pageNumber || saved.pageAfter || '');
+            const currentPage = String(current.pageNumber || '');
+            if (!savedRunId || savedRunId !== currentRunId) {
+                return { reset: true, reason: 'run_changed', pageTurnCount: 0 };
+            }
+            if (!savedSource || savedSource !== currentSource) {
+                return { reset: true, reason: 'source_changed', pageTurnCount: 0 };
+            }
+            if (savedPage && currentPage && savedPage !== currentPage) {
+                return { reset: true, reason: 'page_mismatch_after_reload', pageTurnCount: 0 };
+            }
+            const savedFingerprint = String(saved.fingerprint || '');
+            const currentFingerprint = String(current.fingerprint || '');
+            if (savedFingerprint && currentFingerprint && savedFingerprint !== currentFingerprint) {
+                return { reset: true, reason: 'fingerprint_mismatch_after_reload', pageTurnCount: 0 };
+            }
+            return {
+                reset: false,
+                reason: saved.pending ? 'pending_navigation_recovered' : 'state_restored',
+                pageTurnCount: Math.max(0, Number(saved.pageTurnCount || 0)),
+            };
+        },
+        zhaopinStructuredJobFields(value) {
+            const plain = input => {
+                if (input == null) return '';
+                if (Array.isArray(input)) return input.map(plain).filter(Boolean).join(' ');
+                if (typeof input === 'object') return plain(input.name || input.value || input.text || '');
+                return String(input)
+                    .replace(/<br\s*\/?>/gi, '\n')
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/&nbsp;|&#160;/gi, ' ')
+                    .replace(/&amp;/gi, '&')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+            };
+            const at = (object, ...paths) => {
+                for (const path of paths) {
+                    let current = object;
+                    for (const key of path.split('.')) {
+                        if (current == null || typeof current !== 'object') {
+                            current = undefined;
+                            break;
+                        }
+                        current = current[key];
+                    }
+                    const text = plain(current);
+                    if (text) return text;
+                }
+                return '';
+            };
+            const salary = object => {
+                const direct = at(
+                    object,
+                    'salary',
+                    'salaryText',
+                    'salaryDesc',
+                    'salaryRange',
+                    'jobSalary',
+                    'compensation',
+                );
+                if (direct && direct !== '[object Object]') return direct;
+                const base = object?.baseSalary;
+                const rawValue = base?.value || base;
+                if (!rawValue || typeof rawValue !== 'object') return '';
+                const min = plain(rawValue.minValue || rawValue.min || '');
+                const max = plain(rawValue.maxValue || rawValue.max || '');
+                const unit = plain(rawValue.unitText || rawValue.unit || base?.unitText || '');
+                const currency = plain(base?.currency || object?.salaryCurrency || '');
+                const range = min && max ? `${min}-${max}` : (min || max);
+                return [range, unit, currency].filter(Boolean).join(' ').trim();
+            };
+            const city = object => {
+                const direct = at(
+                    object,
+                    'city',
+                    'cityName',
+                    'workCity',
+                    'workLocation',
+                    'address',
+                    'jobLocation.address.addressLocality',
+                    'jobLocation.address.addressRegion',
+                );
+                if (direct) return direct;
+                const locations = Array.isArray(object?.jobLocation) ? object.jobLocation : [];
+                return locations.map(item => at(item, 'address.addressLocality', 'address.addressRegion', 'name'))
+                    .filter(Boolean)
+                    .join(' / ');
+            };
+            let best = { title: '', company: '', salary: '', city: '', detail: '', score: -1 };
+            const visited = new Set();
+            const walk = (object, depth = 0) => {
+                if (!object || typeof object !== 'object' || depth > 12 || visited.has(object)) return;
+                visited.add(object);
+                if (Array.isArray(object)) {
+                    object.forEach(item => walk(item, depth + 1));
+                    return;
+                }
+                const type = plain(object['@type'] || object.type || '');
+                const title = at(object, 'title', 'jobTitle', 'jobName', 'positionName', 'positionTitle', 'name');
+                const company = at(
+                    object,
+                    'hiringOrganization.name',
+                    'company.name',
+                    'companyName',
+                    'companyShortName',
+                    'employerName',
+                    'organization.name',
+                );
+                const salaryText = salary(object);
+                const cityText = city(object);
+                const detail = at(object, 'description', 'jobDescription', 'positionDescription', 'jobDesc', 'detail');
+                const populated = [company, salaryText, cityText, detail].filter(Boolean).length;
+                const isJobPosting = /jobposting/i.test(type);
+                if (title && populated > 0) {
+                    const score = (isJobPosting ? 20 : 0)
+                        + (company ? 5 : 0)
+                        + (salaryText ? 4 : 0)
+                        + (cityText ? 3 : 0)
+                        + (detail.length >= 40 ? 6 : (detail ? 1 : 0));
+                    if (score > best.score) {
+                        best = {
+                            title: plain(title),
+                            company: plain(company),
+                            salary: plain(salaryText),
+                            city: plain(cityText),
+                            detail: plain(detail).slice(0, 12000),
+                            score,
+                        };
+                    }
+                }
+                Object.values(object).forEach(item => walk(item, depth + 1));
+            };
+            walk(value);
+            const { score, ...result } = best;
+            return result;
+        },
+        zhaopinRecentIdentityKeys(job = {}) {
+            const keys = [];
+            const url = this.zhaopinJobIdentityUrl(job.url || '');
+            const externalId = String(job.external_job_id || this.zhaopinJobIdFromValue(job.url || ''));
+            if (url) keys.push(url);
+            if (externalId) keys.push(`zhaopin:inline:${externalId}`);
+            return Array.from(new Set(keys));
+        },
         randomApplyDelayMs(minSeconds = 3, maxSeconds = 10, randomValue = Math.random()) {
             const min = Math.max(3, Math.min(60, Number(minSeconds) || 3));
             const max = Math.max(min, Math.min(60, Number(maxSeconds) || min));
@@ -1078,13 +1227,18 @@
             if (!node) return '';
             const card = node.closest?.(
                 '.job-card-box,.job-card-wrapper,[class*="job-card"],[class*="jobCard"],'
-                + '[class*="position-item"],[class*="positionItem"],[class*="job-item"],[class*="jobItem"]'
+                + '[class*="position-item"],[class*="positionItem"],[class*="job-item"],[class*="jobItem"],'
+                + '[class*="joblist-box__item"],[class*="joblist-item"],[class*="positionlist-item"],'
+                + '[data-positionnumber],[data-position-number],[data-jobid]'
             ) || node;
             const selectors = [
                 '.company-name', '.company-info .name', '.company-card .name',
                 '[class*="companyName"]', '[class*="company-name"]',
                 '[class*="companyTitle"]', '[class*="company-title"]',
-                '[data-testid*="company"]', '[ka*="company"]',
+                '[class*="company-info"] [class*="name"]', '[class*="company"] [class*="name"]',
+                '[class*="employer"]', '[class*="organization"]',
+                '[data-testid*="company"]', '[data-testid*="employer"]',
+                '[data-company-name]', '[itemprop="hiringOrganization"]', '[ka*="company"]',
             ];
             for (const selector of selectors) {
                 let candidates = [];
@@ -1749,8 +1903,9 @@
             }).catch(reject));
         }
 
-        getRecentJobs() {
-            return this.__http(`/jobs/recent?limit=800&hours=${OPTIONS.recentProcessedHours}`)
+        getRecentJobs(platform = '') {
+            const platformQuery = platform ? `&platform=${encodeURIComponent(platform)}` : '';
+            return this.__http(`/jobs/recent?limit=800&hours=${OPTIONS.recentProcessedHours}${platformQuery}`)
                 .then(res => Array.isArray(res.jobs) ? res.jobs : [])
                 .catch(() => []);
         }
@@ -6319,6 +6474,7 @@
             this.urlIndex = 0;
             this.queue = [];
             this.seen = new Set();
+            this.recentJobsLoaded = false;
             this.pending = new Map();
             this.activeTab = null;
             this.backendRunId = '';
@@ -6335,6 +6491,8 @@
             this.pageJobCountAfter = 0;
             this.detailFailureCode = '';
             this.detailFailureCount = 0;
+            this.dataQualityMissing = { company: 0, salary: 0, city: 0 };
+            this.dataQualityChecked = 0;
             this.currentJob = null;
             this.leaseTimer = null;
             this.heartbeatTimer = null;
@@ -6416,6 +6574,44 @@
             return '';
         }
 
+        readStructuredJobInfo(rootDocument = document) {
+            const selectors = [
+                'script[type="application/ld+json"]',
+                'script#__NEXT_DATA__',
+                'script[id*="INITIAL_STATE"]',
+                'script[id*="initialState"]',
+            ];
+            let best = { title: '', company: '', salary: '', city: '', detail: '' };
+            let bestScore = -1;
+            for (const selector of selectors) {
+                let nodes = [];
+                try { nodes = Array.from(rootDocument.querySelectorAll(selector)); } catch (e) {}
+                for (const node of nodes.slice(0, 30)) {
+                    let raw = String(node.textContent || '').trim();
+                    if (!raw) continue;
+                    if (!raw.startsWith('{') && !raw.startsWith('[')) {
+                        const objectStart = raw.indexOf('{');
+                        const objectEnd = raw.lastIndexOf('}');
+                        if (objectStart < 0 || objectEnd <= objectStart) continue;
+                        raw = raw.slice(objectStart, objectEnd + 1);
+                    }
+                    try {
+                        const fields = tools.zhaopinStructuredJobFields(JSON.parse(raw));
+                        const score = (fields.title ? 5 : 0)
+                            + (fields.company ? 4 : 0)
+                            + (fields.salary ? 3 : 0)
+                            + (fields.city ? 2 : 0)
+                            + (fields.detail?.length >= 40 ? 5 : 0);
+                        if (score > bestScore) {
+                            best = fields;
+                            bestScore = score;
+                        }
+                    } catch (e) {}
+                }
+            }
+            return best;
+        }
+
         detailText(root) {
             const direct = this.firstText(root, [
                 '[class*="job-description"]', '[class*="jobDescription"]', '[class*="position-description"]',
@@ -6447,21 +6643,26 @@
         readJobInfo(rootDocument = document, context = {}) {
             const root = this.detailRoot(rootDocument);
             const actionRoot = this.detailActionRoot(rootDocument);
-            const title = this.firstText(rootDocument, [
+            const structured = this.readStructuredJobInfo(rootDocument);
+            const title = structured.title || this.firstText(rootDocument, [
                 'h1', '[class*="job-name"]', '[class*="jobName"]', '[class*="position-name"]',
-                '[class*="positionName"]', '[data-testid*="title"]',
+                '[class*="positionName"]', '[data-testid*="title"]', '[data-testid*="jobTitle"]',
+                '[data-position-name]', '[itemprop="title"]',
             ]);
-            const salary = this.firstText(root, [
+            const salary = structured.salary || this.firstText(root, [
                 '[class*="salary"]', '[class*="wage"]', '[class*="job-salary"]', '[class*="position-salary"]',
+                '[data-testid*="salary"]', '[itemprop="baseSalary"]',
             ]);
-            const company = tools.sanitizeCompanyName(this.firstText(rootDocument, [
+            const company = tools.sanitizeCompanyName(structured.company || this.firstText(rootDocument, [
                 '[class*="company-name"]', '[class*="companyName"]', '[class*="company-title"]',
-                '[class*="companyTitle"]', '[data-testid*="company"]',
+                '[class*="companyTitle"]', '[class*="employer"]', '[class*="organization"]',
+                '[data-testid*="company"]', '[data-testid*="employer"]', '[itemprop="hiringOrganization"]',
             ]), title, salary);
-            const city = this.firstText(root, [
+            const city = structured.city || this.firstText(root, [
                 '[class*="location"]', '[class*="address"]', '[class*="city"]', '[class*="area"]',
+                '[data-testid*="location"]', '[data-testid*="city"]', '[itemprop="jobLocation"]',
             ]);
-            const detail = this.detailText(root);
+            const detail = structured.detail || this.detailText(root);
             const alreadyButton = this.findActionButton('already_applied', actionRoot);
             const applyButton = this.findActionButton('apply', actionRoot);
             if (!title) {
@@ -6840,6 +7041,8 @@
                 currentUrl: tools.logSafeUrl(location.href),
                 queuedJobs: this.queue.length,
                 seenJobs: this.seen.size,
+                dataQualityChecked: this.dataQualityChecked,
+                dataQualityMissing: { ...this.dataQualityMissing },
                 currentJobId: this.currentJob?.externalJobId || '',
                 currentJobTitle: this.currentJob?.title || '',
                 listMode: 'pagination',
@@ -6929,18 +7132,46 @@
             return index;
         }
 
-        restorePaginationState() {
+        async restorePaginationState() {
             const saved = this.safeJson(this.paginationStateKey, {});
-            if (saved.runId === this.backendRunId && Number(saved.urlIndex) === this.urlIndex) {
-                this.pageTurnCount = Math.max(0, Number(saved.pageTurnCount || 0));
-                this.lastPageOutcome = saved.pending ? 'page_navigation_restored' : String(saved.lastPageOutcome || 'idle');
+            const snapshot = this.paginationSnapshot();
+            const current = {
+                runId: this.backendRunId,
+                sourceIdentity: tools.zhaopinListSourceIdentity(location.href),
+                pageNumber: snapshot.page,
+                fingerprint: snapshot.fingerprint,
+            };
+            const decision = tools.zhaopinPaginationRestoreDecision(saved, current);
+            if (!decision.reset && Number(saved.urlIndex) === this.urlIndex) {
+                this.pageTurnCount = decision.pageTurnCount;
+                this.lastPageOutcome = decision.reason;
                 this.pageBefore = String(saved.pageBefore || '');
-                this.pageNumber = this.currentPageMarker();
+                this.pageNumber = snapshot.page || String(saved.pageNumber || '');
                 this.pageAfter = this.pageNumber || String(saved.pageAfter || '');
-                if (saved.pending) this.savePaginationState({ pending: false });
+                this.savePaginationState({
+                    pending: false,
+                    pageNumber: this.pageNumber,
+                    fingerprint: snapshot.fingerprint,
+                });
                 return;
             }
-            this.resetPaginationState(this.urlIndex, 'source_initialized');
+            const reason = Number(saved.urlIndex) !== this.urlIndex
+                ? 'url_index_changed'
+                : decision.reason;
+            this.resetPaginationState(this.urlIndex, reason);
+            if (saved.runId) {
+                const message = `智联分页状态已按当前页面重置: ${saved.pageNumber || saved.pageAfter || '?'} -> ${snapshot.page || '?'}`;
+                this.logger?.add(message);
+                await this.api.event('zhaopin_pagination_state_reset', message, 'script', 'warning', {
+                    reason,
+                    savedPage: String(saved.pageNumber || saved.pageAfter || ''),
+                    currentPage: String(snapshot.page || ''),
+                    savedFingerprint: String(saved.fingerprint || '').slice(0, 500),
+                    currentFingerprint: String(snapshot.fingerprint || '').slice(0, 500),
+                    savedPageTurnCount: Math.max(0, Number(saved.pageTurnCount || 0)),
+                    urlIndex: this.urlIndex,
+                });
+            }
         }
 
         savePaginationState(patch = {}) {
@@ -6953,6 +7184,9 @@
                 lastPageOutcome: this.lastPageOutcome,
                 pageBefore: this.pageBefore,
                 pageAfter: this.pageAfter,
+                pageNumber: this.pageNumber || this.currentPageMarker(),
+                fingerprint: String(patch.fingerprint || current.fingerprint || ''),
+                sourceIdentity: tools.zhaopinListSourceIdentity(this.urls[this.urlIndex] || location.href),
                 updatedAt: Date.now(),
                 ...patch,
             });
@@ -6967,6 +7201,8 @@
             this.lastPageOutcome = reason;
             this.pageJobCountBefore = 0;
             this.pageJobCountAfter = 0;
+            const snapshot = this.paginationSnapshot();
+            this.pageNumber = snapshot.page || '';
             this.writeJson(this.paginationStateKey, {
                 runId: this.backendRunId,
                 urlIndex: index,
@@ -6974,6 +7210,9 @@
                 lastPageOutcome: reason,
                 pageBefore: '',
                 pageAfter: '',
+                pageNumber: this.pageNumber,
+                fingerprint: snapshot.fingerprint,
+                sourceIdentity: tools.zhaopinListSourceIdentity(this.urls[index] || location.href),
                 pending: false,
                 updatedAt: Date.now(),
             });
@@ -7000,6 +7239,48 @@
             ];
         }
 
+        candidateCard(node) {
+            if (!node) return null;
+            const direct = node.closest?.(
+                '[class*="job-card"],[class*="jobCard"],[class*="position-item"],'
+                + '[class*="positionItem"],[class*="job-item"],[class*="jobItem"],'
+                + '[class*="joblist-box__item"],[class*="joblist-item"],[class*="positionlist-item"],'
+                + '[data-positionnumber],[data-position-number],[data-jobid],li'
+            );
+            if (direct && tools.normalizedText(direct).length <= 2000) return direct;
+            let current = node.parentElement;
+            let best = node;
+            let bestScore = -1;
+            for (let depth = 0; current && depth < 7; depth++, current = current.parentElement) {
+                if (current === document.body || current === document.documentElement) break;
+                const text = tools.normalizedText(current);
+                if (text.length > 2500) break;
+                let score = 0;
+                const className = String(current.className || '').toLowerCase();
+                if (/job|position|card|item/.test(className)) score += 2;
+                if (current.querySelector?.('[class*="salary"],[class*="wage"],[data-testid*="salary"]')) score += 3;
+                if (current.querySelector?.(
+                    '[class*="company"],[class*="employer"],[data-testid*="company"],[itemprop="hiringOrganization"]'
+                )) score += 3;
+                const linkCount = current.querySelectorAll?.(this.jobLinkSelectors().join(','))?.length || 0;
+                if (linkCount === 1) score += 3;
+                else if (linkCount > 5) score -= 5;
+                if (score > bestScore) {
+                    best = current;
+                    bestScore = score;
+                }
+            }
+            return best;
+        }
+
+        cardCity(card) {
+            return this.firstText(card, [
+                '[class*="location"]', '[class*="address"]', '[class*="city"]', '[class*="area"]',
+                '[data-testid*="location"]', '[data-testid*="city"]', '[data-city-name]',
+                '[itemprop="jobLocation"]',
+            ]);
+        }
+
         collectCandidates() {
             const candidates = [];
             const identities = new Set();
@@ -7011,15 +7292,15 @@
                 const identity = tools.zhaopinJobIdentityUrl(href);
                 if (!identity || identities.has(identity)) continue;
                 identities.add(identity);
-                const card = node.closest?.(
-                    '[class*="job-card"],[class*="jobCard"],[class*="position-item"],'
-                    + '[class*="positionItem"],[class*="job-item"],[class*="jobItem"]'
-                ) || node;
+                const card = this.candidateCard(node) || node;
                 const title = this.firstText(card, [
                     '[class*="job-name"]', '[class*="jobName"]', '[class*="position-name"]',
-                    '[class*="positionName"]', '[class*="title"]',
+                    '[class*="positionName"]', '[class*="title"]', '[data-testid*="title"]',
+                    '[data-position-name]', '[itemprop="title"]',
                 ]) || tools.normalizedText(node);
-                const salary = this.firstText(card, ['[class*="salary"]', '[class*="wage"]']);
+                const salary = this.firstText(card, [
+                    '[class*="salary"]', '[class*="wage"]', '[data-testid*="salary"]', '[itemprop="baseSalary"]',
+                ]);
                 const company = tools.companyNameFromJobCard(card, title, salary);
                 candidates.push({
                     navigationUrl: href,
@@ -7030,6 +7311,7 @@
                     company,
                     cardTitle: title,
                     cardSalary: salary,
+                    cardCity: this.cardCity(card),
                 });
             }
             if (!candidates.length) {
@@ -7060,6 +7342,7 @@
                         company: tools.companyNameFromJobCard(node, title, salary),
                         cardTitle: title,
                         cardSalary: salary,
+                        cardCity: this.cardCity(node),
                     });
                 });
             }
@@ -7077,6 +7360,26 @@
                 added += 1;
             }
             return added;
+        }
+
+        async loadRecentJobs() {
+            if (this.recentJobsLoaded) return;
+            const recent = await this.api.getRecentJobs('zhaopin');
+            let loaded = 0;
+            for (const job of recent) {
+                for (const key of tools.zhaopinRecentIdentityKeys(job)) {
+                    if (!this.seen.has(key)) {
+                        this.seen.add(key);
+                        loaded += 1;
+                    }
+                }
+            }
+            this.recentJobsLoaded = true;
+            this.logger?.add(`智联已加载近期岗位历史 ${recent.length} 条，避免刷新后重复评分`);
+            await this.api.event('zhaopin_recent_jobs_loaded', '智联近期岗位历史已加载', 'script', 'info', {
+                recentJobCount: recent.length,
+                identityCount: loaded,
+            });
         }
 
         paginationRootSelector() {
@@ -7275,6 +7578,8 @@
                     this.savePaginationState({
                         pending: true,
                         pageTurnCount: this.pageTurnCount + 1,
+                        pageNumber: before.page,
+                        fingerprint: before.fingerprint,
                     });
                     if (!this.clickPaginationControl(lastControl.element)) {
                         this.lastPageOutcome = `next_click_failed_${attempt}`;
@@ -7296,7 +7601,11 @@
                     this.lastPageOutcome = transition.outcome.jobsChanged ? 'page_jobs_changed' : 'page_changed';
                     this.listEmptyRetries = 0;
                     this.enqueueNewCandidates();
-                    this.savePaginationState({ pending: false });
+                    this.savePaginationState({
+                        pending: false,
+                        pageNumber: transition.after.page,
+                        fingerprint: transition.after.fingerprint,
+                    });
                     await this.api.event('zhaopin_next_page_verified', `智联下一页已生效: ${this.pageBefore || '?'} -> ${this.pageAfter || '?'}`, 'script', 'info', {
                         pageTurnCount: this.pageTurnCount,
                         pageBefore: this.pageBefore,
@@ -7469,6 +7778,27 @@
             }
         }
 
+        async recordDataQuality(jobInfo) {
+            this.dataQualityChecked += 1;
+            let shouldReport = false;
+            for (const field of ['company', 'salary', 'city']) {
+                if (String(jobInfo?.[field] || '').trim()) continue;
+                this.dataQualityMissing[field] += 1;
+                if (this.dataQualityMissing[field] === 1 || this.dataQualityMissing[field] % 20 === 0) {
+                    shouldReport = true;
+                }
+            }
+            if (!shouldReport) return;
+            const counters = { ...this.dataQualityMissing };
+            const message = `智联字段质量汇总：已检查 ${this.dataQualityChecked} 条，缺公司 ${counters.company}，缺薪资 ${counters.salary}，缺城市 ${counters.city}`;
+            this.logger?.add(message);
+            await this.api.event('zhaopin_data_quality_summary', message, 'script', 'warning', {
+                checked: this.dataQualityChecked,
+                missing: counters,
+                jobId: String(jobInfo?.external_job_id || ''),
+            });
+        }
+
         async processCandidate(candidate) {
             this.currentJob = candidate;
             this.seen.add(candidate.identity);
@@ -7510,6 +7840,8 @@
             jobInfo.external_job_id = jobInfo.external_job_id || candidate.externalJobId;
             if (!jobInfo.company && candidate.company) jobInfo.company = candidate.company;
             if (!jobInfo.salary && candidate.cardSalary) jobInfo.salary = candidate.cardSalary;
+            if (!jobInfo.city && candidate.cardCity) jobInfo.city = candidate.cardCity;
+            await this.recordDataQuality(jobInfo);
             this.currentJob = { ...candidate, title: jobInfo.title, externalJobId: jobInfo.external_job_id };
             if (jobInfo.alreadyApplied) {
                 const idempotencyKey = `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`;
@@ -7769,16 +8101,17 @@
             const currentIndex = this.currentConfiguredIndex();
             const savedUrlState = this.safeJson(this.urlStateKey, {});
             this.cooldownUntil = Number(savedUrlState.cooldownUntil || 0);
-                if (this.cooldownUntil && this.cooldownUntil <= Date.now()) {
-                    this.cooldownUntil = 0;
-                    this.writeJson(this.urlStateKey, { index: 0, reason: 'cooldown_finished', cooldownUntil: 0, updatedAt: Date.now() });
-                    this.resetPaginationState(0, 'cooldown_finished');
-                    location.href = this.urls[0];
-                    return;
-                }
-                this.urlIndex = currentIndex >= 0 ? currentIndex : Number(savedUrlState.index || 0);
-                if (currentIndex < 0 && this.navigateToUrl(Math.min(this.urlIndex, this.urls.length - 1), '进入用户配置的智联岗位页')) return;
-                this.restorePaginationState();
+            if (this.cooldownUntil && this.cooldownUntil <= Date.now()) {
+                this.cooldownUntil = 0;
+                this.writeJson(this.urlStateKey, { index: 0, reason: 'cooldown_finished', cooldownUntil: 0, updatedAt: Date.now() });
+                this.resetPaginationState(0, 'cooldown_finished');
+                location.href = this.urls[0];
+                return;
+            }
+            this.urlIndex = currentIndex >= 0 ? currentIndex : Number(savedUrlState.index || 0);
+            if (currentIndex < 0 && this.navigateToUrl(Math.min(this.urlIndex, this.urls.length - 1), '进入用户配置的智联岗位页')) return;
+            await this.loadRecentJobs();
+            await this.restorePaginationState();
             if (ready && this.acquireLease()) {
                 this.running = true;
                 this.logger.setPaused(false);
@@ -7879,6 +8212,9 @@
             zhaopinPaginationControlState: (meta) => tools.zhaopinPaginationControlState(meta),
             zhaopinListSourceIdentity: (value) => tools.zhaopinListSourceIdentity(value),
             zhaopinPageTransitionOutcome: (before, after) => tools.zhaopinPageTransitionOutcome(before, after),
+            zhaopinPaginationRestoreDecision: (saved, current) => tools.zhaopinPaginationRestoreDecision(saved, current),
+            zhaopinStructuredJobFields: (value) => tools.zhaopinStructuredJobFields(value),
+            zhaopinRecentIdentityKeys: (job) => tools.zhaopinRecentIdentityKeys(job),
             randomApplyDelayMs: (min, max, randomValue) => tools.randomApplyDelayMs(min, max, randomValue),
         });
         return;

@@ -642,7 +642,15 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
     platform_generation = runtime_state.platform_generation(platform)
     job["identity_key"] = database.normalize_job_identity(job.get("company", ""), job.get("title", ""))
     existing_job = database.get_job(job.get("url", ""))
-    blocked_reason = blocked_by_history(job, existing_job)
+    same_platform_job = database.get_job_by_identity(
+        job.get("identity_key", ""),
+        platform=platform,
+    )
+    same_platform_duplicate = bool(
+        same_platform_job
+        and str(same_platform_job.get("url") or "") != str(job.get("url") or "")
+    )
+    blocked_reason = blocked_by_history(job, existing_job, same_platform_job)
     final_action = "already_contacted" if job.get("talked") else ""
     if blocked_reason:
         analysis = {
@@ -753,8 +761,51 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
         },
     )
     analysis.setdefault("model_error_kind", "")
+    if (
+        not blocked_reason
+        and not analysis.get("blocked_reason")
+        and not final_action
+        and analysis.get("platform_action") == "skip"
+    ):
+        final_action = "skipped"
     job["run_id"] = runtime_state.run_id
-    saved_job = database.upsert_job(job, analysis, final_action=final_action)
+    reuse_same_platform_history = bool(
+        blocked_reason
+        and (
+            (same_platform_duplicate and blocked_reason.startswith("同平台同公司同职位"))
+            or (
+                existing_job
+                and str(existing_job.get("url") or "") == str(job.get("url") or "")
+                and (
+                    existing_job.get("applied")
+                    or existing_job.get("greeted")
+                    or str(existing_job.get("application_state") or "") in {"clicked", "unknown", "confirmed"}
+                    or recently_processed(existing_job)
+                )
+            )
+        )
+    )
+    if reuse_same_platform_history:
+        saved_job = (
+            same_platform_job
+            if same_platform_duplicate
+            else existing_job
+        ) or {}
+        runtime_state.emit(
+            "same_platform_duplicate_skipped",
+            f"同平台重复岗位已跳过: {platform} / {job.get('title', '')}",
+            source="job",
+            detail={
+                "platform": platform,
+                "external_job_id": str(job.get("external_job_id") or ""),
+                "title": str(job.get("title") or ""),
+                "company": str(job.get("company") or ""),
+                "identity_key": str(job.get("identity_key") or ""),
+                "reason": blocked_reason,
+            },
+        )
+    else:
+        saved_job = database.upsert_job(job, analysis, final_action=final_action)
     if job.get("talked"):
         saved_job = database.update_job_status(job.get("url", ""), final_action="already_contacted", greeted=True) or saved_job
     runtime_state.emit(
@@ -763,13 +814,17 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
         source="job",
         detail={
             "platform": platform,
-            "model_request_id": str(job.get("model_request_id") or ""),
-            "external_job_id": str(job.get("external_job_id") or ""),
-            "scoring_version": analysis.get("scoring_version", SCORING_VERSION),
-            "score_breakdown": analysis.get("score_breakdown", {}),
-            "platform_action": analysis.get("platform_action", "skip"),
-            "analysis": analysis,
-            "job": job,
+            "job_id": str(
+                job.get("external_job_id")
+                or database.fallback_job_identity(platform, "", job.get("url", ""))
+            ),
+            "title": str(job.get("title") or ""),
+            "company": str(job.get("company") or ""),
+            "education_score": int(analysis.get("education_score") or 0),
+            "skill_score": int(analysis.get("skill_score") or 0),
+            "experience_score": int(analysis.get("experience_score") or 0),
+            "total_score": int(analysis.get("total_score") or 0),
+            "decision": analysis.get("platform_action", "skip"),
         },
     )
     return {"analysis": analysis, "job": saved_job}
@@ -847,8 +902,18 @@ async def history(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, 
 
 
 @app.get("/jobs/recent", summary="读取近期已处理职位")
-async def recent_jobs(limit: int = Query(500, ge=1, le=1000), hours: int = Query(24, ge=1, le=168)):
-    return {"jobs": database.list_recent_processed_jobs(limit, hours)}
+async def recent_jobs(
+    limit: int = Query(500, ge=1, le=1000),
+    hours: int = Query(24, ge=1, le=168),
+    platform: str = Query("", pattern="^(|boss|zhaopin)$"),
+):
+    return {
+        "jobs": database.list_recent_processed_jobs(
+            limit,
+            hours,
+            platform=platform,
+        )
+    }
 
 
 @app.get("/tags", summary="获取职位标签")
@@ -863,13 +928,43 @@ async def get_introduce():
     return {"introduce": greeting["active_content"] if greeting.get("confirmed") else ""}
 
 
-def blocked_by_history(job: dict[str, Any], existing_job: dict[str, Any] | None) -> str:
+def blocked_by_history(
+    job: dict[str, Any],
+    existing_job: dict[str, Any] | None,
+    same_platform_job: dict[str, Any] | None = None,
+) -> str:
     platform = str(job.get("platform") or "boss")
     if existing_job and existing_job.get("applied"):
         return "该职位已投递，跳过重复投递"
     if existing_job and str(existing_job.get("application_state") or "") in {"clicked", "unknown"}:
         return "该职位已有未确认的投递事务，禁止重复点击"
+    if existing_job and existing_job.get("greeted"):
+        return "同平台该职位已完成操作，跳过重复处理"
+    if existing_job and recently_processed(existing_job):
+        action = existing_job.get("final_action") or existing_job.get("recommendation") or "已处理"
+        return f"同平台该职位近期已处理，跳过重复评分: {action}"
     identity_key = str(job.get("identity_key") or "")
+    if same_platform_job is None and identity_key:
+        same_platform_job = database.get_job_by_identity(identity_key, platform=platform)
+    same_platform_is_other_url = bool(
+        same_platform_job
+        and str(same_platform_job.get("url") or "") != str(job.get("url") or "")
+    )
+    same_platform_terminal = bool(
+        same_platform_job
+        and (
+            same_platform_job.get("greeted")
+            or same_platform_job.get("applied")
+            or str(same_platform_job.get("application_state") or "") in {"clicked", "unknown", "confirmed"}
+        )
+    )
+    if (
+        same_platform_is_other_url
+        and same_platform_job
+        and (same_platform_terminal or recently_processed(same_platform_job))
+    ):
+        action = same_platform_job.get("final_action") or same_platform_job.get("recommendation") or "已处理"
+        return f"同平台同公司同职位近期已处理，跳过重复操作: {action}"
     cross_platform_job = database.get_job_by_identity(identity_key, exclude_platform=platform)
     cross_platform_terminal = bool(
         cross_platform_job
@@ -886,11 +981,6 @@ def blocked_by_history(job: dict[str, Any], existing_job: dict[str, Any] | None)
         return ""
     if job.get("talked"):
         return job.get("talked_reason") or "页面显示该职位已沟通，跳过重复联系"
-    if existing_job and existing_job.get("greeted"):
-        return "该职位已打过招呼，跳过重复联系"
-    if existing_job and recently_processed(existing_job):
-        action = existing_job.get("final_action") or existing_job.get("recommendation") or "已处理"
-        return f"该职位近期已处理，跳过重复打开: {action}"
     company = job.get("company", "")
     if platform == "boss" and company and database.count_greeted_company(company, platform="boss") >= int(Config.max_contacts_per_company):
         return f"公司已达到联系上限: {company}"

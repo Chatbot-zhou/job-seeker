@@ -335,6 +335,130 @@ def test_cross_platform_same_company_title_is_deduplicated(tmp_path, monkeypatch
     assert "其他平台" in main.blocked_by_history(incoming, None)
 
 
+def test_same_platform_recent_duplicate_skips_model_and_reuses_history(tmp_path, monkeypatch) -> None:
+    import database
+    import main
+    from config import Config
+    from schema import JobAnalyzeRequest
+
+    monkeypatch.setattr(Config, "app_db_name", str(tmp_path / "same-platform.db"))
+    database._INITIALIZED_PATHS.clear()
+    existing_url = "https://www.zhaopin.com/jobdetail/existing.htm"
+    database.upsert_job(
+        {
+            "url": existing_url,
+            "title": "大模型工程师",
+            "company": "示例人工智能有限公司",
+            "platform": "zhaopin",
+            "external_job_id": "existing",
+        },
+        {"recommendation": "skip", "total_score": 55},
+        final_action="skipped",
+    )
+
+    async def should_not_run(*args, **kwargs):
+        raise AssertionError("same-platform duplicate must not enter the model queue")
+
+    monkeypatch.setattr(main.MODEL_QUEUE, "run", should_not_run)
+    result = asyncio.run(
+        main.jobs_analyze(
+            JobAnalyzeRequest(
+                platform="zhaopin",
+                external_job_id="duplicate",
+                title="大模型工程师",
+                company="示例人工智能有限公司",
+                detail="这是一条不同网址但公司和岗位名相同的岗位描述。",
+                url="https://www.zhaopin.com/jobdetail/duplicate.htm",
+            )
+        )
+    )
+
+    assert result["analysis"]["platform_action"] == "skip"
+    assert result["job"]["url"] == existing_url
+    with sqlite3.connect(tmp_path / "same-platform.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    assert any(event["event_type"] == "same_platform_duplicate_skipped" for event in database.list_events(20))
+
+
+def test_low_score_is_saved_as_skipped_and_job_event_is_compact(tmp_path, monkeypatch) -> None:
+    import database
+    import main
+    from config import Config
+    from schema import JobAnalyzeRequest
+
+    monkeypatch.setattr(Config, "app_db_name", str(tmp_path / "compact-analysis.db"))
+    database._INITIALIZED_PATHS.clear()
+    monkeypatch.setattr(main.cache, "load", lambda: None)
+    monkeypatch.setattr(main.cache, "_profile", {"user_detail": "已确认的用户画像"})
+    monkeypatch.setattr(main.runtime_state, "control", "running")
+    monkeypatch.setitem(main.runtime_state.platform_controls, "zhaopin", "running")
+
+    async def fake_run(*args, **kwargs):
+        return {
+            "total_score": 42,
+            "education_score": 50,
+            "skill_score": 40,
+            "experience_score": 35,
+            "risks": [],
+            "recommendation": "skip",
+            "match_reason": "匹配度不足",
+            "greeting": "",
+        }
+
+    monkeypatch.setattr(main.MODEL_QUEUE, "run", fake_run)
+    unique_jd = "UNIQUE_FULL_JD_SHOULD_NOT_APPEAR_IN_EVENT " + ("岗位描述" * 100)
+    url = "https://www.zhaopin.com/jobdetail/compact.htm"
+    result = asyncio.run(
+        main.jobs_analyze(
+            JobAnalyzeRequest(
+                platform="zhaopin",
+                external_job_id="compact",
+                title="平台开发工程师",
+                company="示例云计算有限公司",
+                salary="20-30K",
+                city="杭州",
+                detail=unique_jd,
+                url=url,
+            )
+        )
+    )
+
+    assert result["job"]["final_action"] == "skipped"
+    saved = database.get_job(url)
+    assert saved and unique_jd in saved["detail"]
+    analyzed_event = next(event for event in database.list_events(30) if event["event_type"] == "job_analyzed")
+    assert unique_jd not in str(analyzed_event["detail"])
+    assert "job" not in analyzed_event["detail"]
+    assert analyzed_event["detail"]["education_score"] == 50
+    assert analyzed_event["detail"]["skill_score"] == 40
+    assert analyzed_event["detail"]["experience_score"] == 35
+    assert analyzed_event["detail"]["decision"] == "skip"
+
+
+def test_recent_jobs_can_be_filtered_by_platform(tmp_path, monkeypatch) -> None:
+    import database
+    import main
+    from config import Config
+
+    monkeypatch.setattr(Config, "app_db_name", str(tmp_path / "recent-platform.db"))
+    database._INITIALIZED_PATHS.clear()
+    database.upsert_job(
+        {"url": "https://www.zhipin.com/job_detail/boss-recent.html", "platform": "boss", "title": "后端", "company": "甲"},
+        {"recommendation": "skip"},
+        final_action="skipped",
+    )
+    database.upsert_job(
+        {"url": "https://www.zhaopin.com/jobdetail/zhaopin-recent.htm", "platform": "zhaopin", "title": "前端", "company": "乙"},
+        {"recommendation": "skip"},
+        final_action="skipped",
+    )
+
+    assert [job["platform"] for job in database.list_recent_processed_jobs(platform="zhaopin")] == ["zhaopin"]
+    assert {job["platform"] for job in database.list_recent_processed_jobs()} == {"boss", "zhaopin"}
+    response = asyncio.run(main.recent_jobs(limit=100, hours=24, platform="zhaopin"))
+    assert [job["platform"] for job in response["jobs"]] == ["zhaopin"]
+
+
 def test_unknown_application_blocks_reclick_even_when_general_history_skip_is_disabled(tmp_path, monkeypatch) -> None:
     import database
     import main

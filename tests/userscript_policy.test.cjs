@@ -177,6 +177,94 @@ test('Zhaopin adapter normalizes identity, paginates safely, isolates apply sema
   assert.match(source, /location\.hostname === 'www\.zhaopin\.com'/);
 });
 
+test('Zhaopin structured job fields support JSON-LD and embedded page state', () => {
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'JobPosting',
+    title: '大模型应用工程师',
+    hiringOrganization: { '@type': 'Organization', name: '杭州示例科技有限公司' },
+    baseSalary: {
+      currency: 'CNY',
+      value: { minValue: 20, maxValue: 35, unitText: 'K/月' },
+    },
+    jobLocation: { address: { addressLocality: '杭州' } },
+    description: '<p>负责大模型应用开发、评测与工程落地。</p>',
+  };
+  const fields = hooks.zhaopinStructuredJobFields({ '@graph': [{ '@type': 'BreadcrumbList' }, jsonLd] });
+  assert.equal(fields.title, '大模型应用工程师');
+  assert.equal(fields.company, '杭州示例科技有限公司');
+  assert.match(fields.salary, /20-35/);
+  assert.match(fields.salary, /K\/月/);
+  assert.equal(fields.city, '杭州');
+  assert.match(fields.detail, /大模型应用开发/);
+
+  const embedded = hooks.zhaopinStructuredJobFields({
+    props: {
+      pageProps: {
+        position: {
+          positionName: '后端开发工程师',
+          companyName: '上海示例网络有限公司',
+          salaryDesc: '18-28K',
+          cityName: '上海',
+          positionDescription: '负责服务端系统设计、开发和稳定性建设。',
+        },
+      },
+    },
+  });
+  assert.equal(embedded.company, '上海示例网络有限公司');
+  assert.equal(embedded.salary, '18-28K');
+  assert.equal(embedded.city, '上海');
+});
+
+test('Zhaopin pagination recovery trusts the real page and never fast-forwards after reload', () => {
+  const saved = {
+    runId: 'run-a',
+    sourceIdentity: 'https://www.zhaopin.com/recommend',
+    pageNumber: '8',
+    fingerprint: 'jobs-page-8',
+    pageTurnCount: 7,
+  };
+  const restored = hooks.zhaopinPaginationRestoreDecision(saved, {
+    runId: 'run-a',
+    sourceIdentity: 'https://www.zhaopin.com/recommend',
+    pageNumber: '8',
+    fingerprint: 'jobs-page-8',
+  });
+  assert.equal(restored.reset, false);
+  assert.equal(restored.reason, 'state_restored');
+  assert.equal(restored.pageTurnCount, 7);
+  const reloaded = hooks.zhaopinPaginationRestoreDecision(saved, {
+    runId: 'run-a',
+    sourceIdentity: 'https://www.zhaopin.com/recommend',
+    pageNumber: '1',
+    fingerprint: 'jobs-page-1',
+  });
+  assert.equal(reloaded.reset, true);
+  assert.equal(reloaded.reason, 'page_mismatch_after_reload');
+  assert.equal(reloaded.pageTurnCount, 0);
+  const changedJobs = hooks.zhaopinPaginationRestoreDecision(saved, {
+    runId: 'run-a',
+    sourceIdentity: 'https://www.zhaopin.com/recommend',
+    pageNumber: '8',
+    fingerprint: 'changed-jobs-page-8',
+  });
+  assert.equal(changedJobs.reason, 'fingerprint_mismatch_after_reload');
+  assert.match(source, /zhaopin_pagination_state_reset/);
+});
+
+test('Zhaopin recent identities seed URL and stable job id dedupe keys', () => {
+  const keys = Array.from(hooks.zhaopinRecentIdentityKeys({
+    url: 'https://www.zhaopin.com/jobdetail/CC123.htm?securityId=secret',
+    external_job_id: 'CC123',
+  }));
+  assert.deepEqual(
+    [...keys].sort(),
+    ['https://www.zhaopin.com/jobdetail/CC123.htm', 'zhaopin:inline:CC123'].sort(),
+  );
+  assert.match(source, /getRecentJobs\('zhaopin'\)/);
+  assert.match(source, /zhaopin_recent_jobs_loaded/);
+});
+
 test('platform panels can start pause and stop without requiring CLI start', () => {
   assert.match(source, /api\.control\('start', '用户在 BOSS 页面控制面板点击开始'\)/);
   assert.match(source, /this\.api\.control\('start', '用户在智联页面控制面板点击开始'\)/);
