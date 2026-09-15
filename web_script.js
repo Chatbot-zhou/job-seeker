@@ -527,7 +527,41 @@
             return !previous || Date.now() - previous > cooldownMs;
         },
         markOpenUrl(href, key) {
-            localStorage.setItem(this.openCooldownKey(key, href), String(Date.now()));
+            // 安全写入打开冷却时间戳：配额不足时先清理过期 key 再重试，仍失败则静默忽略，避免阻塞主流程
+            const cooldownKey = this.openCooldownKey(key, href);
+            const write = () => localStorage.setItem(cooldownKey, String(Date.now()));
+            try {
+                write();
+            } catch (e) {
+                if (String(e && e.name || '').includes('QuotaExceeded')) {
+                    this.clearExpiredCooldownKeys();
+                    try {
+                        write();
+                    } catch (e2) {
+                        // 仍失败则放弃记录冷却，不阻塞后续流程
+                    }
+                }
+            }
+        },
+        clearExpiredCooldownKeys(maxScan = 5000) {
+            // 遍历并删除所有已过期的打开冷却 key，防止历史垃圾数据撑爆 localStorage 配额
+            const prefix = '__job_seeker_open_cooldown:';
+            const now = Date.now();
+            let scanned = 0;
+            try {
+                for (let i = localStorage.length - 1; i >= 0 && scanned < maxScan; i -= 1) {
+                    const key = localStorage.key(i);
+                    if (!key || !key.startsWith(prefix)) continue;
+                    scanned += 1;
+                    const timestamp = Number(localStorage.getItem(key) || 0);
+                    if (!timestamp || now - timestamp > OPTIONS.openCooldownMs) {
+                        localStorage.removeItem(key);
+                    }
+                }
+            } catch (e) {
+                return false;
+            }
+            return true;
         },
         closeTabHandle(handle) {
             try {
@@ -5614,6 +5648,8 @@
                     return;
                 }
                 noteBackendOnline();
+                // 启动时清理过期的打开冷却记录，避免 localStorage 配额被历史垃圾数据占满
+                tools.clearExpiredCooldownKeys();
                 await api.event('script_ready', `脚本就绪: ${OPTIONS.scriptVersion}`, 'script', 'info', {
                     version: OPTIONS.scriptVersion,
                     serverHost: OPTIONS.serverHost,
