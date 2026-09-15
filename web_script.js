@@ -543,25 +543,28 @@
                 }
             }
         },
-        clearExpiredCooldownKeys(maxScan = 5000) {
-            // 遍历并删除所有已过期的打开冷却 key，防止历史垃圾数据撑爆 localStorage 配额
+        clearExpiredCooldownKeys(maxScan = 0) {
+            // 遍历并删除所有已过期的打开冷却 key，防止历史垃圾数据撑爆 localStorage 配额；
+            // maxScan 为 0 表示全量扫描（启动与配额恢复场景需要彻底清理，否则尾部窗口外的旧 key 永远清不掉）
             const prefix = '__job_seeker_open_cooldown:';
             const now = Date.now();
             let scanned = 0;
+            let removed = 0;
             try {
-                for (let i = localStorage.length - 1; i >= 0 && scanned < maxScan; i -= 1) {
+                for (let i = localStorage.length - 1; i >= 0 && (!maxScan || scanned < maxScan); i -= 1) {
                     const key = localStorage.key(i);
                     if (!key || !key.startsWith(prefix)) continue;
                     scanned += 1;
                     const timestamp = Number(localStorage.getItem(key) || 0);
                     if (!timestamp || now - timestamp > OPTIONS.openCooldownMs) {
                         localStorage.removeItem(key);
+                        removed += 1;
                     }
                 }
             } catch (e) {
-                return false;
+                return -1;
             }
-            return true;
+            return removed;
         },
         closeTabHandle(handle) {
             try {
@@ -5649,12 +5652,16 @@
                 }
                 noteBackendOnline();
                 // 启动时清理过期的打开冷却记录，避免 localStorage 配额被历史垃圾数据占满
-                tools.clearExpiredCooldownKeys();
+                const cleanedCooldownKeys = tools.clearExpiredCooldownKeys();
+                if (cleanedCooldownKeys > 0) {
+                    logger.add(`已清理 ${cleanedCooldownKeys} 个过期打开冷却记录`);
+                }
                 await api.event('script_ready', `脚本就绪: ${OPTIONS.scriptVersion}`, 'script', 'info', {
                     version: OPTIONS.scriptVersion,
                     serverHost: OPTIONS.serverHost,
                     threshold: OPTIONS.thread,
                     sessionGreetCount: tools.getSessionGreetCount(),
+                    cleanedCooldownKeys,
                 });
                 logger.add('可点击左下角“开始”，也可在 CLI 输入 start');
                 if (res.should_start || res.control === 'running') {
