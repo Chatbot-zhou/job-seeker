@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.3
+// @version      2026.09.17.4
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.3',
+        scriptVersion: '2026.09.17.4',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -1361,18 +1361,34 @@
             return String(value || '').replace(/\s+/g, ' ').trim();
         },
         isApplySuccessText(value) {
-            // 投递成功后平台还会弹一个提示框（智联是“简历已发送”，前程无忧是“投递成功”），
-            // 文字里同样带“投递/简历”，不先按成功识别就会被后面的“问卷/确认按钮”判断
+            // 投递成功后平台还会弹一个提示框，这里是平台明确告知“已经发出去了”。
+            // 智联实测文案是「已向对方发送简历和打招呼语 …」（后半段是用户自己的招呼语，会变），
+            // 前程无忧是「投递成功」。不先按成功识别就会被后面的“问卷/确认按钮”判断
             // 误判成需要人工介入，把已经投成功的岗位暂停掉。
             const text = this.normalizePlainText(value).replace(/\s+/g, '');
             // “验证码已发送”“短信已发送”这类也含“已发送”，但不是投递成功，先排除。
             if (/(验证码|短信|邮件|链接|二维码)已发送/.test(text)) return false;
-            return /投递成功|申请成功|投递已完成|简历投递成功|已成功投递|投递已发送|简历已发送|已发送简历|已发送|已投递成功|恭喜/.test(text);
+            return /投递成功|申请成功|投递已完成|简历投递成功|已成功投递|投递已发送|简历已发送|已发送简历|已发送|已投递成功|已向对方发送|发送简历和打招呼语|恭喜/.test(text);
+        },
+        isApplySuccessDialog(dialog, dialogText = '') {
+            if (!dialog) return false;
+            if (this.isApplySuccessText(dialogText || this.normalizedText(dialog))) return true;
+            // 兜底信号只看“留在此页”这类动作完成后的专属按钮。
+            // 不能用通用的 确定/关闭 判断——投递前的“确认投递”弹窗也有这些按钮，
+            // 那样会把确认框当成成功框，跳过确认并记下一笔没发生的投递。
+            const stayLabels = this.applyDialogStayLabels();
+            return Array.from(dialog.querySelectorAll('button,a,[role="button"],[class*="btn"]'))
+                .filter(el => this.isVisible(el))
+                .some(el => stayLabels.includes(this.normalizePlainText(el.innerText || el.textContent)));
+        },
+        applyDialogStayLabels() {
+            // 动作完成后提示框上的“留在原地”按钮，是成功弹窗的专属特征。
+            return ['留在此页', '留在本页', '留在当前页', '暂不沟通'];
         },
         applyDialogDismissLabels() {
             // 只放“关掉弹窗、不改变页面”的按钮。智联成功弹窗的“继续沟通”会跳到聊天页，
             // 不能点，所以不在这里；列表页必须留在原地继续处理下一个岗位。
-            return ['确定', '好的', '知道了', '我知道了', '关闭', '完成', '确认', '留在此页', '留在本页', '暂不沟通'];
+            return ['确定', '好的', '知道了', '我知道了', '关闭', '完成', '确认', ...this.applyDialogStayLabels()];
         },
         findDialogDismissControl(dialog) {
             // 成功提示弹窗要关掉，否则它会盖住投递按钮，后面的“按钮变为已投递”校验读不到。
@@ -1386,7 +1402,7 @@
         },
         dismissApplySuccessDialog(dialogs = [], seen = null) {
             // 弹窗可能在确认窗口结束之后才出现，投递结果轮询期间也要顺手关掉，否则读不到按钮状态。
-            const dialog = dialogs.find(node => this.isApplySuccessText(this.normalizedText(node)));
+            const dialog = dialogs.find(node => this.isApplySuccessDialog(node));
             if (!dialog) return null;
             const signature = this.applyDialogSignature(dialog);
             if (seen) {
@@ -6948,7 +6964,7 @@
                     continue;
                 }
                 const dialogText = tools.normalizedText(dialog);
-                if (tools.isApplySuccessText(dialogText)) {
+                if (tools.isApplySuccessDialog(dialog, dialogText)) {
                     // 投递已经成功，这里是成功提示弹窗：点掉它并按成功返回，
                     // 后面的“按钮变为已投递”校验会正式确认这次投递。
                     const dismiss = tools.findDialogDismissControl(dialog);
@@ -7066,6 +7082,7 @@
             }
             const deadline = Date.now() + 15000;
             const seenSuccessDialogs = new Set();
+            let successDialogSeen = false;
             while (Date.now() < deadline) {
                 if (this.findActionButton('already_applied')) {
                     await this.api.createAction('apply', {
@@ -7081,10 +7098,13 @@
                 }
                 const settled = tools.dismissApplySuccessDialog(this.simpleDialogs(), seenSuccessDialogs);
                 if (settled) {
+                    // 「已向对方发送简历和打招呼语」是平台给出的投递成功证据，不必再等按钮变化。
+                    successDialogSeen = true;
                     await this.api.event('apply_success_dialog_dismissed', '智联投递成功后已关闭提示弹窗', 'script', 'info', settled);
                     await tools.asyncSleep(300);
                     continue;
                 }
+                if (successDialogSeen) break;
                 const riskAfterClick = this.riskReason() || this.platformLimitReason();
                 if (riskAfterClick) {
                     return {
@@ -7097,6 +7117,18 @@
                     };
                 }
                 await tools.asyncSleep(300);
+            }
+            if (successDialogSeen) {
+                await this.api.createAction('apply', {
+                    idempotencyKey,
+                    transactionState: 'confirmed',
+                    verification: 'success_dialog',
+                }, job, 'confirmed');
+                await this.api.event('apply_confirmed', `智联投递已确认（成功提示弹窗）: ${job.title || ''}`, 'script', 'info', {
+                    jobId: job.external_job_id || '',
+                    url: job.url || '',
+                });
+                return { success: true, state: 'confirmed', requestId: context.requestId };
             }
             await this.api.createAction('apply_delivery_unknown', {
                 idempotencyKey,
@@ -8913,12 +8945,42 @@
         findCandidateCard(jobInfo) {
             // 卡片可能因滚动/重渲染失效，投递前按职位名重新定位职位行
             const probe = String(jobInfo?.title || '').slice(0, 10);
-            if (!probe) return null;
-            for (const card of Array.from(document.querySelectorAll('.joblist-item'))) {
-                if (!tools.isVisible(card)) continue;
-                if (tools.normalizedText(card).includes(probe)) return card;
+            const jobId = String(jobInfo?.external_job_id || tools.job51JobIdFromValue(jobInfo?.url || ''));
+            if (!probe && !jobId) return null;
+            const cards = Array.from(document.querySelectorAll('.joblist-item'));
+            if (probe) {
+                for (const card of cards) {
+                    if (!tools.isVisible(card)) continue;
+                    if (tools.normalizedText(card).includes(probe)) return card;
+                }
+            }
+            // 只靠职位名找不到时（标题被截断/改写），用岗位 ID 的详情链接反查所属卡片。
+            if (jobId) {
+                const link = Array.from(document.querySelectorAll(`a[href*="${jobId}"]`))
+                    .find(el => tools.isVisible(el));
+                if (link) {
+                    const card = link.closest('.joblist-item,li,[class*="joblist"],[class*="job-item"],[class*="jobItem"]');
+                    if (card) return card;
+                }
             }
             return null;
+        }
+
+        resolveApplyScope(job, candidate = null) {
+            // 投递后列表可能整体重渲染，旧的卡片节点会脱离文档，必须在每次校验时重新定位。
+            if (candidate?.element?.isConnected) return candidate.element;
+            return this.findCandidateCard(job);
+        }
+
+        applyCardActionText(job, candidate = null) {
+            // 诊断用：把当前卡片上可见的动作按钮文字带出来，便于确认校验为什么没过。
+            const scope = this.resolveApplyScope(job, candidate);
+            const nodes = Array.from((scope || document).querySelectorAll('button,a,[role="button"],[class*="btn"]'))
+                .filter(el => tools.isVisible(el) && !el.closest('[data-job-seeker-overlay="1"]'));
+            return {
+                scope: scope ? 'card' : 'document',
+                buttons: nodes.map(el => tools.normalizedText(el)).filter(Boolean).slice(0, 6),
+            };
         }
 
         async confirmApplyDialog(resumeName, scope = document) {
@@ -8937,7 +8999,7 @@
                     continue;
                 }
                 const dialogText = tools.normalizedText(dialog);
-                if (tools.isApplySuccessText(dialogText)) {
+                if (tools.isApplySuccessDialog(dialog, dialogText)) {
                     // 前程无忧每次投递完都会弹“投递成功”，文字里带“投递”且可能带输入项，
                     // 必须先按成功处理，否则会被下面的问卷判断误判并暂停整个通道。
                     const dismiss = tools.findDialogDismissControl(dialog);
@@ -9054,8 +9116,10 @@
             }
             const deadline = Date.now() + 15000;
             const seenSuccessDialogs = new Set();
+            let successDialogSeen = false;
             while (Date.now() < deadline) {
-                const currentButton = this.applyButton(scope);
+                // 卡片会在投递后重渲染，每轮都重新定位，不能一直用点击前那个节点。
+                const currentButton = this.applyButton(this.resolveApplyScope(job, context.candidate));
                 if (currentButton && tools.job51ActionState(tools.normalizedText(currentButton)) === 'already_applied') {
                     await this.api.createAction('apply', {
                         idempotencyKey,
@@ -9070,10 +9134,13 @@
                 }
                 const settled = tools.dismissApplySuccessDialog(this.simpleDialogs(), seenSuccessDialogs);
                 if (settled) {
+                    // 平台明确提示“投递成功”，这就是投递已发生的直接证据，不必再等按钮变化。
+                    successDialogSeen = true;
                     await this.api.event('apply_success_dialog_dismissed', '前程无忧投递成功后已关闭提示弹窗', 'script', 'info', settled);
                     await tools.asyncSleep(300);
                     continue;
                 }
+                if (successDialogSeen) break;
                 const riskAfterClick = this.riskReason() || this.platformLimitReason();
                 if (riskAfterClick) {
                     return {
@@ -9087,6 +9154,19 @@
                 }
                 await tools.asyncSleep(300);
             }
+            if (successDialogSeen) {
+                await this.api.createAction('apply', {
+                    idempotencyKey,
+                    transactionState: 'confirmed',
+                    verification: 'success_dialog',
+                }, job, 'confirmed');
+                await this.api.event('apply_confirmed', `前程无忧投递已确认（成功提示弹窗）: ${job.title || ''}`, 'script', 'info', {
+                    jobId: job.external_job_id || '',
+                    url: job.url || '',
+                });
+                return { success: true, state: 'confirmed', requestId: context.requestId };
+            }
+            const cardAction = this.applyCardActionText(job, context.candidate);
             await this.api.createAction('apply_delivery_unknown', {
                 idempotencyKey,
                 transactionState: 'unknown',
@@ -9095,8 +9175,9 @@
             await this.api.event('apply_delivery_unknown', `前程无忧投递结果无法确认: ${job.title || ''}`, 'script', 'error', {
                 jobId: job.external_job_id || '',
                 url: job.url || '',
+                cardAction: JSON.stringify(cardAction),
             });
-            await this.api.control('pause', '投递按钮点击后未变为已投递').catch(() => null);
+            await this.api.control('pause', `投递按钮点击后未变为已投递（按钮=${cardAction.buttons.join('/') || '无'}）`).catch(() => null);
             return {
                 success: false,
                 clicked: true,
@@ -9866,6 +9947,7 @@
             shouldCorrectListUrl: (currentIndex, savedUrlState, now) => tools.shouldCorrectListUrl(currentIndex, savedUrlState, now),
             isApplySuccessText: (value) => tools.isApplySuccessText(value),
             applyDialogDismissLabels: () => tools.applyDialogDismissLabels().slice(),
+            applyDialogStayLabels: () => tools.applyDialogStayLabels().slice(),
             job51JobIdFromValue: (value) => tools.job51JobIdFromValue(value),
             job51JobIdentityUrl: (value) => tools.job51JobIdentityUrl(value),
             isJob51ListUrl: (value) => tools.isJob51ListUrl(value),

@@ -539,12 +539,19 @@ test('Zhaopin list page does not reload forever when the configured URL redirect
 });
 
 test('apply success dialogs are recognized instead of paused as manual intervention', () => {
-  // 智联投递成功后弹“简历已发送 / 留在此页 / 继续沟通”；前程无忧弹“投递成功”。
-  assert.equal(hooks.isApplySuccessText('简历已发送'), true);
-  assert.equal(hooks.isApplySuccessText('您的简历已发送，请留意企业回复'), true);
+  // 智联投递成功后弹出的是「已向对方发送简历和打招呼语 + 自己的招呼语 + 留在此页 / 继续沟通」
+  // （日志里的实测文案），前程无忧弹「投递成功」。
+  assert.equal(hooks.isApplySuccessText('已向对方发送简历和打招呼语'), true);
+  assert.equal(
+    hooks.isApplySuccessText(
+      '已向对方发送简历和打招呼语 您好，我对该职位很感兴趣，请您看下我的简历，如果合适可以随时联系我，谢谢。 留在此页 继续沟通',
+    ),
+    true,
+  );
   assert.equal(hooks.isApplySuccessText('投递成功'), true);
   assert.equal(hooks.isApplySuccessText('简历投递成功，等待企业查看'), true);
   assert.equal(hooks.isApplySuccessText('已投递成功'), true);
+  assert.equal(hooks.isApplySuccessText('您的简历已发送，请留意企业回复'), true);
   // 验证码/短信这类也含“已发送”，不能当成投递成功，否则会把验证弹窗当成功放过去。
   assert.equal(hooks.isApplySuccessText('验证码已发送到手机'), false);
   assert.equal(hooks.isApplySuccessText('短信已发送'), false);
@@ -556,11 +563,34 @@ test('apply success dialogs are recognized instead of paused as manual intervent
   const labels = Array.from(hooks.applyDialogDismissLabels());
   assert.ok(labels.includes('留在此页'), String(labels));
   assert.ok(!labels.includes('继续沟通'), String(labels));
+  // 识别成功弹窗的兜底按钮必须是“留在此页”这类专属按钮；
+  // 用 确定/关闭 兜底会把投递前的确认框当成成功框，凭空记一笔投递。
+  const stayLabels = Array.from(hooks.applyDialogStayLabels());
+  assert.deepEqual(stayLabels, ['留在此页', '留在本页', '留在当前页', '暂不沟通']);
+  assert.ok(!stayLabels.includes('确定') && !stayLabels.includes('确认') && !stayLabels.includes('关闭'));
 
   // 两处确认弹窗都要先判成功，再判问卷；错误信息带上弹窗签名便于定位。
-  const successFirst = /if \(tools\.isApplySuccessText\(dialogText\)\) \{[\s\S]{0,900}const supplementalFields/;
+  const successFirst = /if \(tools\.isApplySuccessDialog\(dialog, dialogText\)\) \{[\s\S]{0,900}const supplementalFields/;
   assert.match(source, successFirst);
   assert.match(source, /apply_success_dialog_dismissed/);
   assert.match(source, /tools\.applyDialogSignature\(dialog\)/);
-  assert.match(source, /tools\.dismissApplySuccessDialog\(this\.simpleDialogs\(\), seenSuccessDialogs\)/);
+  // 有“留在此页”按钮的弹窗一律按动作完成处理，不靠文案也能兜住
+  assert.match(source, /isApplySuccessDialog\(dialog, dialogText = ''\)/);
+  assert.match(source, /dismissApplySuccessDialog\(this\.simpleDialogs\(\), seenSuccessDialogs\)/);
+});
+
+test('apply verification tolerates re-rendered cards and trusts the success dialog', () => {
+  // 投递后列表会重渲染，卡片节点失效，必须每轮重新定位，否则永远读不到“已投递”。
+  assert.match(source, /resolveApplyScope\(job, context\.candidate\)/);
+  assert.match(source, /resolveApplyScope\(job, candidate = null\) \{[\s\S]{0,220}this\.findCandidateCard\(job\)/);
+  // 职位名找不到时用岗位 ID 的详情链接反查卡片
+  assert.match(source, /a\[href\*="\$\{jobId\}"\]/);
+  // 平台明确提示投递成功后直接记为已确认，不再干等按钮变化
+  assert.match(source, /let successDialogSeen = false;/);
+  assert.match(source, /if \(successDialogSeen\) break;/);
+  assert.match(source, /verification: 'success_dialog'/);
+  assert.match(source, /apply_confirmed[\s\S]{0,80}成功提示弹窗/);
+  // 仍无法确认时把卡片上的按钮文字带进日志
+  assert.match(source, /applyCardActionText\(job, context\.candidate\)/);
+  assert.match(source, /cardAction: JSON\.stringify\(cardAction\)/);
 });
