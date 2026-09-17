@@ -665,7 +665,8 @@ test('Zhaopin scrolls the job list, not the detail preview panel', () => {
   assert.match(source, /if \(attempts < maxAttempts\) await tools\.asyncSleep\(800\);/);
   // 投递结果无法确认时要带上可见按钮文字，便于定位
   assert.match(source, /actionTextSnapshot\(\)/);
-  assert.match(source, /actionButtons: actionSnapshot\.join\('\/'\) \|\| '\(无\)'/);
+  assert.match(source, /actionSnapshot: snapshotText/);
+  assert.match(source, /全页候选=\$\{actionSnapshot\.matched\.join\('\/'\) \|\| '无'\}/);
 });
 
 test('jobs that cannot be applied on-platform are skipped instead of pausing the channel', () => {
@@ -695,4 +696,13 @@ test('jobs that cannot be applied on-platform are skipped instead of pausing the
     assert.match(block, /transactionState: 'failed'/);
     assert.doesNotMatch(block, /pausePlatform/);
   });
+});
+
+test('confirmation window also scans short-lived toasts, not only dialogs', () => {
+  // 成功提示可能是几秒就消失的 toast。确认窗口只查 [class*="dialog"] 会漏掉它，
+  // 等轮询开始时提示已经没了，于是被记成“投递结果无法确认”。
+  assert.match(source, /const successNotice = tools\.pendingApplySuccessNotices\(\)\[0\] \|\| null;/);
+  const occurrences = source.split('const successNotice = tools.pendingApplySuccessNotices()[0] || null;').length - 1;
+  assert.equal(occurrences, 2, String(occurrences));
+  assert.match(source, /signature: tools\.applyDialogSignature\(successNotice\)/);
 });

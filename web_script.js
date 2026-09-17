@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.8
+// @version      2026.09.17.9
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.8',
+        scriptVersion: '2026.09.17.9',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -6994,6 +6994,21 @@
             const deadline = Date.now() + 6000;
             while (Date.now() < deadline) {
                 if (this.findActionButton('already_applied')) return { confirmed: true, mode: 'button_changed' };
+                // 成功提示有时是 toast，只存活几秒；这里先用和结果轮询相同的宽选择器扫一遍，
+                // 否则等 6 秒确认窗口过去、轮询才开始找时，提示已经自己消失了。
+                const successNotice = tools.pendingApplySuccessNotices()[0] || null;
+                if (successNotice) {
+                    const dismiss = tools.findDialogDismissControl(successNotice);
+                    if (dismiss) {
+                        tools.clickLikeUser(dismiss);
+                        await tools.asyncSleep(300);
+                    }
+                    await this.api.event('apply_success_dialog', '智联投递成功提示已确认', 'script', 'info', {
+                        dismissed: Boolean(dismiss),
+                        signature: tools.applyDialogSignature(successNotice),
+                    });
+                    return { confirmed: true, mode: 'success_dialog' };
+                }
                 // 只在内层弹窗里找，避免命中覆盖整页的 wrapper（会把搜索筛选项当成输入项）。
                 const dialog = tools.compactDialogs(this.simpleDialogs()).find(node => {
                     const text = tools.normalizedText(node);
@@ -7211,6 +7226,12 @@
                 return { success: true, state: 'confirmed', requestId: context.requestId };
             }
             const actionSnapshot = this.actionTextSnapshot();
+            const snapshotText = [
+                `范围=${actionSnapshot.scope}`,
+                `区内按钮=${actionSnapshot.local.join('/') || '无'}`,
+                `全页候选=${actionSnapshot.matched.join('/') || '无'}`,
+                `弹窗=${actionSnapshot.notices.join(' ¶ ') || '无'}`,
+            ].join(' | ');
             await this.api.createAction('apply_delivery_unknown', {
                 idempotencyKey,
                 transactionState: 'unknown',
@@ -7219,9 +7240,9 @@
             await this.api.event('apply_delivery_unknown', `智联投递结果无法确认: ${job.title || ''}`, 'script', 'error', {
                 jobId: job.external_job_id || '',
                 url: job.url || '',
-                actionButtons: actionSnapshot.join('/') || '(无)',
+                actionSnapshot: snapshotText,
             });
-            await this.api.control('pause', `投递按钮点击后未变为已投递（按钮=${actionSnapshot.join('/') || '无'}）`).catch(() => null);
+            await this.api.control('pause', `投递按钮点击后未变为已投递（${snapshotText}）`).catch(() => null);
             return {
                 success: false,
                 clicked: true,
@@ -8588,14 +8609,27 @@
         }
 
         actionTextSnapshot() {
-            // 诊断用：投递结果无法确认时，把当前可见的动作按钮文字带出来，
-            // 便于判断是按钮文案变了、按钮被渲染掉了，还是投递弹窗没被识别。
-            const scope = this.detailActionRoot(document);
-            return Array.from((scope || document).querySelectorAll('button,a,[role="button"],[class*="btn"]'))
-                .filter(el => tools.isVisible(el) && !el.closest('[data-job-seeker-overlay="1"]'))
+            // 诊断用：投递结果无法确认时把现场信息带出来。
+            // 之前只取详情动作区里的按钮，结果是 (无)，看不出到底是按钮被渲染掉了、
+            // 文案变了，还是页面上有个没被识别的弹窗；这里补上全页动作词候选与紧凑弹窗文字。
+            const actionWords = /投递|申请|沟通|简历|立即|已投|确定|关闭|取消/;
+            const nodes = Array.from(document.querySelectorAll('button,a,[role="button"],[class*="btn"]'))
+                .filter(el => tools.isVisible(el) && !el.closest('[data-job-seeker-overlay="1"]'));
+            const matched = Array.from(new Set(nodes
                 .map(el => tools.normalizedText(el))
-                .filter(Boolean)
-                .slice(0, 6);
+                .filter(text => text && actionWords.test(text))));
+            const notices = this.compactDialogs(this.simpleDialogs())
+                .slice(0, 3)
+                .map(node => tools.normalizedText(node).slice(0, 80));
+            const scope = this.detailActionRoot(document);
+            return {
+                scope: scope === document.body ? 'body' : 'detailRoot',
+                local: nodes
+                    .filter(el => scope && scope.contains(el))
+                    .map(el => tools.normalizedText(el)).filter(Boolean).slice(0, 6),
+                matched: matched.slice(0, 8),
+                notices,
+            };
         }
 
         async switchOrCooldown(reason) {
@@ -9235,6 +9269,21 @@
                 const appliedButton = this.applyButton(scope);
                 if (appliedButton && tools.job51ActionState(tools.normalizedText(appliedButton)) === 'already_applied') {
                     return { confirmed: true, mode: 'button_changed' };
+                }
+                // 成功提示有时是 toast，只存活几秒；先用和结果轮询相同的宽选择器扫一遍，
+                // 否则等 6 秒确认窗口过去、轮询才开始找时，提示已经自己消失了。
+                const successNotice = tools.pendingApplySuccessNotices()[0] || null;
+                if (successNotice) {
+                    const dismiss = tools.findDialogDismissControl(successNotice);
+                    if (dismiss) {
+                        tools.clickLikeUser(dismiss);
+                        await tools.asyncSleep(300);
+                    }
+                    await this.api.event('apply_success_dialog', '前程无忧投递成功提示已确认', 'script', 'info', {
+                        dismissed: Boolean(dismiss),
+                        signature: tools.applyDialogSignature(successNotice),
+                    });
+                    return { confirmed: true, mode: 'success_dialog' };
                 }
                 // 只在内层弹窗里找，避免命中覆盖整页的 wrapper（会把搜索筛选项当成输入项）。
                 const dialog = tools.compactDialogs(this.simpleDialogs()).find(node => {
