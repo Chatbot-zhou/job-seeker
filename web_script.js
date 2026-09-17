@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.4
+// @version      2026.09.17.5
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.4',
+        scriptVersion: '2026.09.17.5',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -6736,6 +6736,9 @@
             this.paginationTarget = '';
             this.lastPageOutcome = 'idle';
             this.listEmptyRetries = 0;
+            this.listScrollRound = 0;
+            this.listScrollTarget = '';
+            this.lastScrollOutcome = 'idle';
             this.pageJobCountBefore = 0;
             this.pageJobCountAfter = 0;
             this.detailFailureCode = '';
@@ -7340,11 +7343,16 @@
                 pageAfter: this.pageAfter,
                 pageJobCountBefore: this.pageJobCountBefore,
                 pageJobCountAfter: this.pageJobCountAfter,
-                // 保留旧滚动字段，便于既有状态页展示；智联值明确标记为分页。
+                // 智联是「翻页 + 懒加载滑动」：没有下一页按钮时先滑动捞新岗位，
+                // 所以这里如实上报滑动轮数和结果，供状态页/doctor 判断卡在哪一步。
+                listScrollRound: this.listScrollRound,
+                listScrollTarget: this.listScrollTarget,
+                lastListScrollOutcome: this.lastScrollOutcome,
+                // 保留旧滚动字段，便于既有状态页展示。
                 scrollMode: 'pagination',
-                scrollTarget: this.paginationTarget,
-                scrollRound: this.pageTurnCount,
-                lastScrollOutcome: this.lastPageOutcome,
+                scrollTarget: this.listScrollTarget || this.paginationTarget,
+                scrollRound: this.listScrollRound,
+                lastScrollOutcome: this.lastScrollOutcome,
                 scrollBefore: this.pageBefore,
                 scrollAfter: this.pageAfter,
                 scrollJobCountBefore: this.pageJobCountBefore,
@@ -7484,6 +7492,10 @@
             this.pageAfter = '';
             this.paginationTarget = '';
             this.lastPageOutcome = reason;
+            // 换来源/新页面后滑动额度也要重置，否则后续页面永远不会再尝试滑动。
+            this.listScrollRound = 0;
+            this.listScrollTarget = '';
+            this.lastScrollOutcome = 'idle';
             this.pageJobCountBefore = 0;
             this.pageJobCountAfter = 0;
             const snapshot = this.paginationSnapshot();
@@ -7967,6 +7979,9 @@
                     this.pageTurnCount += 1;
                     this.lastPageOutcome = transition.outcome.jobsChanged ? 'page_jobs_changed' : 'page_changed';
                     this.listEmptyRetries = 0;
+                    // 翻到新页后重新获得滑动额度，否则第一页滑满之后新页不会再尝试滑动。
+                    this.listScrollRound = 0;
+                    this.lastScrollOutcome = 'idle';
                     this.enqueueNewCandidates();
                     this.savePaginationState({
                         pending: false,
@@ -8358,6 +8373,100 @@
             if (!result.preservePage && !result.clicked) this.closeActiveDetail(jobInfo.requestId);
         }
 
+        listLinkAnchors() {
+            const selector = this.jobLinkSelectors().join(',');
+            return Array.from(document.querySelectorAll(selector));
+        }
+
+        listIdentitySnapshot() {
+            const identities = new Set();
+            for (const anchor of this.listLinkAnchors()) {
+                const identity = tools.zhaopinJobIdentityUrl(anchor.href || anchor.getAttribute('href') || '');
+                if (!identity) continue;
+                const jobId = tools.zhaopinJobIdFromValue(identity);
+                identities.add(jobId ? `zhaopin:${jobId}` : identity);
+            }
+            return identities;
+        }
+
+        findListScrollContainer() {
+            // 新版列表是懒加载：先找职位卡片所在的滚动容器，找不到就退化成整页滚动。
+            for (const anchor of this.listLinkAnchors().slice(0, 8)) {
+                let node = anchor.parentElement;
+                while (node && node !== document.body && node !== document.documentElement) {
+                    if (node.scrollHeight > node.clientHeight + 40) return node;
+                    node = node.parentElement;
+                }
+            }
+            return null;
+        }
+
+        dispatchListScroll(container, distance) {
+            const documentTarget = !container;
+            const rect = documentTarget
+                ? { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight }
+                : container.getBoundingClientRect();
+            const clientX = Math.round(rect.left + rect.width / 2);
+            const clientY = Math.round(rect.top + Math.min(Math.max(8, rect.height - 8), rect.height * 0.72));
+            const point = document.elementFromPoint(clientX, clientY);
+            const target = point && (documentTarget || container.contains(point)) ? point : (container || document.body);
+            try {
+                target.dispatchEvent(new WheelEvent('wheel', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    deltaY: distance,
+                    deltaMode: 0,
+                    clientX,
+                    clientY,
+                }));
+            } catch (e) {
+                // 旧环境不支持 WheelEvent 时，下面的滚动赋值仍可作为兜底。
+            }
+            if (documentTarget) window.scrollBy(0, distance);
+            else container.scrollTop = Math.min(container.scrollHeight, container.scrollTop + distance);
+        }
+
+        async scrollListForMoreCandidates() {
+            // 没有下一页按钮不代表岗位处理完了：先下滑把懒加载的卡片拉出来，
+            // 滑不动了才交给 switchOrCooldown 去切岗位标签，最后才冷却。
+            const maxRounds = Math.max(0, Math.min(20, Number(OPTIONS.searchResultScrollRounds) || 0));
+            if (this.listScrollRound >= maxRounds) {
+                this.lastScrollOutcome = 'scroll_round_limit';
+                return false;
+            }
+            const before = this.listIdentitySnapshot();
+            const container = this.findListScrollContainer();
+            this.listScrollTarget = container ? tools.elementBrief(container) : 'window';
+            const distance = Math.round((container ? container.clientHeight : window.innerHeight) * 0.9);
+            this.listScrollRound += 1;
+            this.dispatchListScroll(container, distance);
+            const deadline = Date.now() + 4000;
+            let fresh = new Set();
+            while (Date.now() < deadline) {
+                if (this.riskReason() || this.platformLimitReason()) break;
+                const current = this.listIdentitySnapshot();
+                fresh = new Set(Array.from(current).filter(key => !before.has(key)));
+                if (fresh.size > 0) break;
+                await tools.asyncSleep(400);
+            }
+            this.lastScrollOutcome = fresh.size > 0 ? 'jobs_loaded' : 'no_new_jobs';
+            await this.api.event('zhaopin_list_scroll', `智联岗位页滑动第 ${this.listScrollRound} 次: ${fresh.size > 0 ? `加载到 ${fresh.size} 个新岗位` : '没有新岗位'}`, 'script', 'info', {
+                round: this.listScrollRound,
+                maxRounds,
+                target: this.listScrollTarget,
+                newJobs: fresh.size,
+                outcome: this.lastScrollOutcome,
+                seenJobs: before.size,
+                urlIndex: this.urlIndex,
+            });
+            if (fresh.size > 0) {
+                this.enqueueNewCandidates();
+                return true;
+            }
+            return false;
+        }
+
         async switchOrCooldown(reason) {
             if (this.urlIndex + 1 < this.urls.length) {
                 this.navigateToUrl(this.urlIndex + 1, reason);
@@ -8438,7 +8547,13 @@
                     setTimeout(() => this.loop(), 0);
                     return;
                 }
-                await this.api.event('zhaopin_pagination_exhausted', `智联岗位页已耗尽: ${this.lastPageOutcome}`, 'script', 'info', this.heartbeatDetail());
+                // 翻页走不通时先滑动加载更多岗位；滑不动了才切岗位标签，最后才冷却。
+                const scrolled = await this.scrollListForMoreCandidates();
+                if (this.queue.length > 0 || scrolled) {
+                    setTimeout(() => this.loop(), 0);
+                    return;
+                }
+                await this.api.event('zhaopin_pagination_exhausted', `智联岗位页已耗尽: ${this.lastPageOutcome} / ${this.lastScrollOutcome}`, 'script', 'info', this.heartbeatDetail());
                 await this.switchOrCooldown(this.lastPageOutcome);
             } catch (error) {
                 if (tools.isBackendUnavailableError(error)) {

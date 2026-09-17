@@ -345,7 +345,7 @@ def print_config_preview(updates: dict[str, Any]) -> None:
     print(
         f"- 搜索: 冷却 {preview.get('search_round_cooldown_min_minutes', 1)}-{preview.get('search_round_cooldown_minutes')} 分钟 / "
         f"标签间隔 {preview.get('tag_search_delay_seconds')}-{preview.get('tag_search_delay_max_seconds')} 秒 / "
-        f"列表扩展 {preview.get('search_result_scroll_rounds')} 次（BOSS 滚动 / 智联、前程无忧翻页）"
+        f"列表扩展 {preview.get('search_result_scroll_rounds')} 次（BOSS 滚动 / 智联、前程无忧翻页，翻不动时智联会继续滑动）"
     )
     print(
         f"- 搜索预算: 每小时 {preview.get('max_search_submissions_per_hour')} 次 / "
@@ -438,7 +438,7 @@ def configure_search_safety_settings() -> None:
             int(current.get("max_search_submissions_per_day", 30)),
         ),
         "search_result_scroll_rounds": ask_int(
-            "单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联、前程无忧翻页）",
+            "单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联、前程无忧翻页，翻不动时智联会继续滑动）",
             int(current.get("search_result_scroll_rounds", 20)),
         ),
         "preferred_feed_max_jobs_per_tab": ask_int(
@@ -703,7 +703,7 @@ def edit_session_settings() -> None:
     print(f"  搜索冷却: 随机 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分钟")
     print(f"  标签间隔: 随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒")
     print(f"  搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / 每日 {Config.max_search_submissions_per_day} 次")
-    print(f"  列表扩展: {Config.search_result_scroll_rounds} 次（BOSS 滚动 / 智联、前程无忧翻页）")
+    print(f"  列表扩展: {Config.search_result_scroll_rounds} 次（BOSS 滚动 / 智联、前程无忧翻页，翻不动时智联会继续滑动）")
     print(
         f"  自定义推荐: {'启用' if Config.preferred_feed_mode != 'off' else '关闭'} / "
         f"每个 Tab {format_feed_job_limit(Config.preferred_feed_max_jobs_per_tab)}"
@@ -763,7 +763,7 @@ def edit_session_settings() -> None:
         print(f"[配置] 标签搜索间隔已更新为: 随机 {min_seconds}-{max_seconds} 秒")
     elif choice == "4":
         while True:
-            rounds = ask_int("单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联、前程无忧翻页）", int(Config.search_result_scroll_rounds))
+            rounds = ask_int("单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联、前程无忧翻页，翻不动时智联会继续滑动）", int(Config.search_result_scroll_rounds))
             if not 0 <= rounds <= 20:
                 print("[配置] 列表扩展次数只能设置为 0-20。")
                 continue
@@ -1024,7 +1024,7 @@ def setup_quick_start() -> None:
             300,
         ),
         "search_result_scroll_rounds": ensure_range_int(
-            "单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联、前程无忧翻页）",
+            "单个岗位来源最多扩展次数 0-20（BOSS 滚动 / 智联、前程无忧翻页，翻不动时智联会继续滑动）",
             int(current.get("search_result_scroll_rounds", 20)),
             0,
             20,
@@ -1298,7 +1298,7 @@ def print_summary() -> None:
     print(
         f"- 搜索策略: 无新岗位随机冷却 {Config.search_round_cooldown_min_minutes}-{Config.search_round_cooldown_minutes} 分钟 / "
         f"标签间隔随机 {Config.tag_search_delay_seconds}-{Config.tag_search_delay_max_seconds} 秒 / "
-        f"列表扩展 {Config.search_result_scroll_rounds} 次（BOSS 滚动 / 智联、前程无忧翻页）"
+        f"列表扩展 {Config.search_result_scroll_rounds} 次（BOSS 滚动 / 智联、前程无忧翻页，翻不动时智联会继续滑动）"
     )
     print(
         f"- 关键词搜索预算: 每小时 {Config.max_search_submissions_per_hour} 次 / "
@@ -2059,6 +2059,14 @@ def show_doctor() -> None:
                 f"岗位 {detail.get('pageJobCountBefore', 0)}->{detail.get('pageJobCountAfter', 0)} / "
                 f"按钮 {detail.get('pageTarget') or '-'}"
             )
+            if detail.get("listScrollRound") is not None or detail.get("lastListScrollOutcome"):
+                # 智联没有下一页按钮时会先滑动捞新岗位，可能连续多次都不出岗位。
+                # 把滑动轮数和结果单独列出来，避免误判成“直接冷却”。
+                print(
+                    f"  智联滑动: 第 {detail.get('listScrollRound', 0)}/{Config.search_result_scroll_rounds} 次 / "
+                    f"{detail.get('lastListScrollOutcome') or '-'} / "
+                    f"目标 {detail.get('listScrollTarget') or '-'}"
+                )
         else:
             print(
                 f"  岗位滚动: {detail.get('scrollMode') or '未选择'} / "

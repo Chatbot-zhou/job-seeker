@@ -174,7 +174,10 @@ test('Zhaopin adapter normalizes identity, paginates safely, isolates apply sema
   assert.match(source, /this\.detailFailureCount\s*>=\s*3/);
   assert.match(source, /paginationMode:\s*'next_button'/);
   const zhaopinAdapter = source.slice(source.indexOf('class Zhaopin'), source.indexOf('if (globalThis.__JOB_SEEKER_TEST_MODE__)'));
-  assert.doesNotMatch(zhaopinAdapter, /scrollForMore|new WheelEvent|window\.scrollBy/);
+  // 早期版本规定智联“只翻页不滑动”，结果新版懒加载列表没有“下一页”按钮时
+  // 会被误判为岗位耗尽、直接进入冷却。现在翻页失败后必须继续尝试滑动。
+  assert.match(zhaopinAdapter, /async scrollListForMoreCandidates\(\)/);
+  assert.match(zhaopinAdapter, /new WheelEvent\('wheel'/);
   assert.match(source, /cooldownUntil:\s*this\.cooldownUntil/);
   assert.match(source, /for \(let attempt = 2; attempt <= 3 && finalResult\.preClickFailure && !finalResult\.clicked; attempt\+\+\)/);
   assert.match(source, /location\.hostname === 'www\.zhaopin\.com'/);
@@ -593,4 +596,28 @@ test('apply verification tolerates re-rendered cards and trusts the success dial
   // 仍无法确认时把卡片上的按钮文字带进日志
   assert.match(source, /applyCardActionText\(job, context\.candidate\)/);
   assert.match(source, /cardAction: JSON\.stringify\(cardAction\)/);
+});
+
+test('Zhaopin scrolls for more jobs before switching source and cooling down', () => {
+  // 顺序必须是 翻页 → 滑动 → 切岗位标签/冷却；滑动不能放在切换之后。
+  assert.match(
+    source,
+    /const mayContinue = await this\.turnToNextPage\(\);[\s\S]{0,260}const scrolled = await this\.scrollListForMoreCandidates\(\);[\s\S]{0,220}zhaopin_pagination_exhausted/,
+  );
+  // 滑动要能识别懒加载出来的新岗位，才有“继续处理”的依据
+  assert.match(source, /async scrollListForMoreCandidates\(\)/);
+  assert.match(source, /listIdentitySnapshot\(\)/);
+  assert.match(source, /this\.lastScrollOutcome = fresh\.size > 0 \? 'jobs_loaded' : 'no_new_jobs';/);
+  assert.match(source, /if \(fresh\.size > 0\) \{\s*\n\s*this\.enqueueNewCandidates\(\);/);
+  // 滚动容器找不到时退化成整页滚动，不能直接判定失败
+  assert.match(source, /findListScrollContainer\(\)/);
+  assert.match(source, /if \(documentTarget\) window\.scrollBy\(0, distance\);/);
+  assert.match(source, /new WheelEvent\('wheel'/);
+  // 轮数上限复用列表扩展次数，且新页/新来源要重置额度
+  assert.match(source, /if \(this\.listScrollRound >= maxRounds\)/);
+  assert.match(source, /this\.listScrollRound = 0;\s*\n\s*this\.lastScrollOutcome = 'idle';/);
+  // 状态页要能看到滑动进度，否则“滑不动 → 冷却”看起来像直接冷却
+  assert.match(source, /listScrollRound: this\.listScrollRound/);
+  assert.match(source, /lastListScrollOutcome: this\.lastScrollOutcome/);
+  assert.match(source, /zhaopin_list_scroll/);
 });
