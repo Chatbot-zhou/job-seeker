@@ -133,7 +133,7 @@ JOB_SCORE_BREAKDOWN = """
 
 # 技术赛道判定（第一步，必须优先执行）
 以下技术赛道互不兼容，跨赛道直接打入极低分：
-- 大模型应用：LangChain/RAG/Agent/Prompt工程/Tool Calling/MCP/向量检索等
+- 大模型应用：LangChain/RAG/Agent/Prompt工程/Tool Calling/MCP/向量检索等，或者最近新兴赛道FDE
 - Java后端：SpringBoot/MyBatis/微服务/高并发等
 - 前端开发：Vue/React/Angular/TypeScript等
 - 数据分析：SQL/Python数据分析/Pandas/BI工具等

@@ -6039,7 +6039,14 @@
                     await confirmChatQuotaReminderIfPresent('find_chat_input');
                     const roots = chatSearchRoots();
                     const candidates = queryChatRoots(SELECTORS.ZHIPIN.CHAT.CHATINPUT, roots);
-                    const visible = candidates.find(el => tools.isVisible(el) && !tools.isDisabled(el));
+                    let visible = candidates.find(el => tools.isVisible(el) && !tools.isDisabled(el));
+                    if (!visible) {
+                        // BOSS 改版后聊天输入框可能是不含 chat/消息/沟通 关键词的普通 textarea，
+                        // 此时页面若恰好只有唯一一个可见 textarea，则将其作为输入框兜底
+                        const visibleTextareas = queryChatRoots(['textarea'], roots)
+                            .filter(el => tools.isVisible(el) && !tools.isDisabled(el));
+                        if (visibleTextareas.length === 1) visible = visibleTextareas[0];
+                    }
                     if (visible) {
                         if (conversationActivationClicked && !conversationActivationConfirmed) {
                             conversationActivationConfirmed = true;
