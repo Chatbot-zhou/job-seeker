@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.7
+// @version      2026.09.17.8
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.7',
+        scriptVersion: '2026.09.17.8',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -1370,6 +1370,13 @@
             if (/(验证码|短信|邮件|链接|二维码)已发送/.test(text)) return false;
             // 只认带投递语义的整句，不单靠“已发送”三个字——聊天气泡之类也可能出现这三个字。
             return /投递成功|申请成功|投递已完成|简历投递成功|已成功投递|投递已发送|简历已发送|已发送简历|已投递成功|已向对方发送|发送简历和打招呼语|恭喜/.test(text);
+        },
+        isApplyNotApplicableText(value) {
+            // 平台明确告知该岗位不能在这里投递，例如前程无忧的
+            // 「当前投递的是校招网申职位，需前往应届生求职平台进行申请」。
+            // 这是岗位自身的限制，不是通道故障：应当记为跳过并继续，不能暂停整个平台。
+            const text = this.normalizePlainText(value).replace(/\s+/g, '');
+            return /校招网申|应届生求职平台|不支持在线投递|不支持网页投递|无法在线投递|无法网页投递|需前往[^。；]{0,24}申请|请前往[^。；]{0,24}申请|需在[^。；]{0,16}官网|请至官网|去官网投递/.test(text);
         },
         isApplySuccessDialog(dialog, dialogText = '') {
             if (!dialog) return false;
@@ -7011,6 +7018,21 @@
                     });
                     return { confirmed: true, mode: 'success_dialog' };
                 }
+                if (tools.isApplyNotApplicableText(dialogText)) {
+                    // 岗位自身投不了（需去别家平台申请等）时记为跳过，不能暂停通道。
+                    const dismiss = tools.findDialogDismissControl(dialog);
+                    if (dismiss) {
+                        tools.clickLikeUser(dismiss);
+                        await tools.asyncSleep(300);
+                    }
+                    const reason = tools.normalizePlainText(dialogText).slice(0, 80);
+                    await this.api.event('zhaopin_apply_not_applicable', `智联该岗位无法在本平台投递: ${reason}`, 'script', 'info', {
+                        dismissed: Boolean(dismiss),
+                        reason,
+                        signature: tools.applyDialogSignature(dialog),
+                    });
+                    return { confirmed: false, notApplicable: true, reason };
+                }
                 const supplementalFields = Array.from(dialog.querySelectorAll(
                     'textarea,select,input[type="file"],input[type="text"],input:not([type])'
                 )).filter(node => tools.isVisible(node));
@@ -7127,6 +7149,16 @@
                     url: job.url || '',
                 });
                 return { success: true, state: 'confirmed', requestId: context.requestId };
+            }
+            if (dialogResult.notApplicable) {
+                // 岗位只能去别的平台申请，属于岗位限制：交给主循环记为跳过并继续，不暂停通道。
+                return {
+                    success: false,
+                    clicked: true,
+                    notApplicable: true,
+                    reason: dialogResult.reason || '该岗位需前往其他平台申请',
+                    requestId: context.requestId,
+                };
             }
             const deadline = Date.now() + 15000;
             const seenSuccessDialogs = new Set();
@@ -8370,6 +8402,20 @@
                 this.closeActiveDetail(jobInfo.requestId);
                 return;
             }
+            if (result.notApplicable) {
+                // 岗位自身投不了（需去别家平台申请等）：记为失败并跳过，不暂停通道。
+                await this.api.createAction('apply', {
+                    idempotencyKey: `zhaopin:${jobInfo.external_job_id || jobInfo.url}:apply`,
+                    transactionState: 'failed',
+                    reason: result.reason || '该岗位需前往其他平台申请',
+                }, jobInfo, 'failed').catch(() => null);
+                await this.api.event('zhaopin_apply_skipped', `智联跳过无法在本平台投递的岗位: ${jobInfo.title || ''}`, 'script', 'info', {
+                    reason: result.reason || '',
+                    url: jobInfo.url || '',
+                });
+                this.closeActiveDetail(jobInfo.requestId);
+                return;
+            }
             if (result.preClickFailure && !result.clicked) {
                 let finalResult = result;
                 for (let attempt = 2; attempt <= 3 && finalResult.preClickFailure && !finalResult.clicked; attempt++) {
@@ -9214,6 +9260,22 @@
                     });
                     return { confirmed: true, mode: 'success_dialog' };
                 }
+                if (tools.isApplyNotApplicableText(dialogText)) {
+                    // 「校招网申职位，需前往应届生求职平台申请」这类提示说明这个岗位投不了，
+                    // 属于岗位限制而不是通道故障：关掉提示、记为跳过，让主循环继续下一个岗位。
+                    const dismiss = tools.findDialogDismissControl(dialog);
+                    if (dismiss) {
+                        tools.clickLikeUser(dismiss);
+                        await tools.asyncSleep(300);
+                    }
+                    const reason = tools.normalizePlainText(dialogText).slice(0, 80);
+                    await this.api.event('job51_apply_not_applicable', `前程无忧该岗位无法在本平台投递: ${reason}`, 'script', 'info', {
+                        dismissed: Boolean(dismiss),
+                        reason,
+                        signature: tools.applyDialogSignature(dialog),
+                    });
+                    return { confirmed: false, notApplicable: true, reason };
+                }
                 const supplementalFields = Array.from(dialog.querySelectorAll(
                     'textarea,select,input[type="file"],input[type="text"],input:not([type])'
                 )).filter(node => tools.isVisible(node));
@@ -9329,6 +9391,17 @@
                     url: job.url || '',
                 });
                 return { success: true, state: 'confirmed', requestId: context.requestId };
+            }
+            if (dialogResult.notApplicable) {
+                // 该岗位只能去别的平台申请，属于岗位限制：交给主循环记为跳过并继续，
+                // 不能走 pauseRequired —— 那会因为一个投不了的岗位停掉整个前程无忧通道。
+                return {
+                    success: false,
+                    clicked: true,
+                    notApplicable: true,
+                    reason: dialogResult.reason || '该岗位需前往其他平台申请',
+                    requestId: context.requestId,
+                };
             }
             const deadline = Date.now() + 15000;
             const seenSuccessDialogs = new Set();
@@ -9830,6 +9903,20 @@
                 }
                 return;
             }
+            if (result.notApplicable) {
+                // 岗位自身投不了（校招网申、需去别家平台等）：记为失败并跳过这个岗位，
+                // 不暂停通道——否则一个投不了的岗位就会停掉整个前程无忧。
+                await this.api.createAction('apply', {
+                    idempotencyKey: `job51:${jobInfo.external_job_id || jobInfo.url}:apply`,
+                    transactionState: 'failed',
+                    reason: result.reason || '该岗位需前往其他平台申请',
+                }, jobInfo, 'failed').catch(() => null);
+                await this.api.event('job51_apply_skipped', `前程无忧跳过无法在本平台投递的岗位: ${jobInfo.title || ''}`, 'script', 'info', {
+                    reason: result.reason || '',
+                    url: jobInfo.url || '',
+                });
+                return;
+            }
             if (result.preClickFailure && !result.clicked) {
                 let finalResult = result;
                 for (let attempt = 2; attempt <= 3 && finalResult.preClickFailure && !finalResult.clicked; attempt++) {
@@ -10162,6 +10249,7 @@
             zhaopinRecentIdentityKeys: (job) => tools.zhaopinRecentIdentityKeys(job),
             shouldCorrectListUrl: (currentIndex, savedUrlState, now) => tools.shouldCorrectListUrl(currentIndex, savedUrlState, now),
             isApplySuccessText: (value) => tools.isApplySuccessText(value),
+            isApplyNotApplicableText: (value) => tools.isApplyNotApplicableText(value),
             applyDialogDismissLabels: () => tools.applyDialogDismissLabels().slice(),
             applyDialogStayLabels: () => tools.applyDialogStayLabels().slice(),
             job51JobIdFromValue: (value) => tools.job51JobIdFromValue(value),

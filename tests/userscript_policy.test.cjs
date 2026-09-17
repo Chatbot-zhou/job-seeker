@@ -573,8 +573,9 @@ test('apply success dialogs are recognized instead of paused as manual intervent
   assert.ok(!stayLabels.includes('确定') && !stayLabels.includes('确认') && !stayLabels.includes('关闭'));
 
   // 两处确认弹窗都要先判成功，再判问卷；错误信息带上弹窗签名便于定位。
-  const successFirst = /if \(tools\.isApplySuccessDialog\(dialog, dialogText\)\) \{[\s\S]{0,900}const supplementalFields/;
-  assert.match(source, successFirst);
+  // 判断顺序：成功 -> 岗位投不了 -> 问卷/补充信息。
+  const order = /if \(tools\.isApplySuccessDialog\(dialog, dialogText\)\) \{[\s\S]{0,1400}if \(tools\.isApplyNotApplicableText\(dialogText\)\) \{[\s\S]{0,1200}const supplementalFields/;
+  assert.match(source, order);
   assert.match(source, /apply_success_dialog_dismissed/);
   assert.match(source, /tools\.applyDialogSignature\(dialog\)/);
   // 有“留在此页”按钮的弹窗一律按动作完成处理，不靠文案也能兜住
@@ -665,4 +666,33 @@ test('Zhaopin scrolls the job list, not the detail preview panel', () => {
   // 投递结果无法确认时要带上可见按钮文字，便于定位
   assert.match(source, /actionTextSnapshot\(\)/);
   assert.match(source, /actionButtons: actionSnapshot\.join\('\/'\) \|\| '\(无\)'/);
+});
+
+test('jobs that cannot be applied on-platform are skipped instead of pausing the channel', () => {
+  // 日志实测文案：「当前投递的是校招网申职位，需前往应届生求职平台进行申请」
+  // 这是岗位限制，不是通道故障；早期实现会抛“投递弹窗无法安全确认”并暂停整个通道。
+  assert.equal(
+    hooks.isApplyNotApplicableText('当前投递的是校招网申职位，需前往应届生求职平台进行申请'),
+    true,
+  );
+  assert.equal(hooks.isApplyNotApplicableText('该职位不支持在线投递，请前往官网投递'), true);
+  assert.equal(hooks.isApplyNotApplicableText('需在 xx 公司官网完成投递'), true);
+  // 成功提示、普通确认、问卷都不算“投不了”
+  assert.equal(hooks.isApplyNotApplicableText('投递成功 微信扫一扫与HR沟通'), false);
+  assert.equal(hooks.isApplyNotApplicableText('确认投递该职位？'), false);
+  assert.equal(hooks.isApplyNotApplicableText('请补充以下问题'), false);
+
+  // 两个平台都要识别并跳过，且不能走 pausePlatform
+  assert.match(source, /if \(tools\.isApplyNotApplicableText\(dialogText\)\) \{/);
+  assert.match(source, /job51_apply_not_applicable/);
+  assert.match(source, /zhaopin_apply_not_applicable/);
+  assert.match(source, /if \(result\.notApplicable\) \{/);
+  assert.match(source, /job51_apply_skipped/);
+  assert.match(source, /zhaopin_apply_skipped/);
+  const notApplicableBlocks = source.split('if (result.notApplicable) {').slice(1).map(part => part.slice(0, 900));
+  assert.equal(notApplicableBlocks.length, 2);
+  notApplicableBlocks.forEach(block => {
+    assert.match(block, /transactionState: 'failed'/);
+    assert.doesNotMatch(block, /pausePlatform/);
+  });
 });
