@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("all", "boss", "zhaopin")]
+    [ValidateSet("all", "boss", "zhaopin", "job51")]
     [string]$Platform = "all",
     [switch]$NoOpen
 )
@@ -15,6 +15,7 @@ try {
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BossUrl = "https://www.zhipin.com/web/geek/jobs"
 $ZhaopinDefaultUrl = "https://www.zhaopin.com/recommend"
+$Job51DefaultUrl = "https://we.51job.com/pc/search"
 $OpenCooldownSeconds = 60
 
 function Write-Info {
@@ -114,26 +115,72 @@ function Test-OpenCooldown {
     return $true
 }
 
+function Test-ConfigFlag {
+    param(
+        [object]$Value,
+        [bool]$Default
+    )
+    if ($null -eq $Value) {
+        return $Default
+    }
+    if ($Value -is [bool]) {
+        return $Value
+    }
+    $text = "$Value".Trim().ToLower()
+    if ($text -eq "") {
+        return $Default
+    }
+    return $text -in @("true", "1", "yes", "on")
+}
+
+function Get-PlatformUrl {
+    param(
+        [string]$Name,
+        [object]$Config
+    )
+    if ($Name -eq "boss") {
+        return $BossUrl
+    }
+    $configured = Get-ConfigValue $Config "${Name}_job_urls" $null
+    if ($configured) {
+        $first = [string](@($configured)[0])
+        if ($first) {
+            return $first
+        }
+    }
+    if ($Name -eq "zhaopin") {
+        return $ZhaopinDefaultUrl
+    }
+    if ($Name -eq "job51") {
+        return $Job51DefaultUrl
+    }
+    return $null
+}
+
 function Open-StartupPages {
     param(
         [int]$Port,
         [string]$SelectedPlatform
     )
-    if ($SelectedPlatform -in @("all", "boss") -and (Test-OpenCooldown "boss_search")) {
-        Write-Info "Opening BOSS search page: $BossUrl"
-        Start-Process $BossUrl | Out-Null
-    } elseif ($SelectedPlatform -in @("all", "boss")) {
-        Write-Warn "BOSS search page was opened recently; skipping duplicate open."
+    $targets = @($SelectedPlatform)
+    if ($SelectedPlatform -eq "all") {
+        $targets = @($script:enabledPlatforms)
     }
-    if ($SelectedPlatform -in @("all", "zhaopin") -and (Test-OpenCooldown "zhaopin_search")) {
-        $zhaopinUrl = $ZhaopinDefaultUrl
-        if ($null -ne $script:config -and $script:config.zhaopin_job_urls -and $script:config.zhaopin_job_urls.Count -gt 0) {
-            $zhaopinUrl = [string]$script:config.zhaopin_job_urls[0]
+    if ($targets.Count -eq 0) {
+        Write-Warn "No platform is enabled in data\config.json; no jobs page was opened."
+        return
+    }
+    foreach ($target in $targets) {
+        $url = Get-PlatformUrl $target $script:config
+        if (-not $url) {
+            continue
         }
-        Write-Info "Opening Zhaopin jobs page: $zhaopinUrl"
-        Start-Process $zhaopinUrl | Out-Null
-    } elseif ($SelectedPlatform -in @("all", "zhaopin")) {
-        Write-Warn "Zhaopin jobs page was opened recently; skipping duplicate open."
+        if (-not (Test-OpenCooldown "${target}_search")) {
+            Write-Warn "$target jobs page was opened recently; skipping duplicate open."
+            continue
+        }
+        Write-Info "Opening $target jobs page: $url"
+        Start-Process $url | Out-Null
     }
 }
 
@@ -190,6 +237,22 @@ $port = [int](Get-ConfigValue $config "server_port" 33333)
 $provider = [string](Get-ConfigValue $config "model_provider" "ollama")
 $ollamaHost = [string](Get-ConfigValue $config "ollama_host" "http://127.0.0.1:11434")
 $openaiKey = [string](Get-ConfigValue $config "openai_api_key" "")
+
+$script:enabledPlatforms = @()
+foreach ($platformName in @("boss", "zhaopin", "job51")) {
+    if (Test-ConfigFlag (Get-ConfigValue $config "${platformName}_enabled" $null) $true) {
+        $script:enabledPlatforms += $platformName
+    }
+}
+if ($Platform -eq "all") {
+    if ($script:enabledPlatforms.Count -gt 0) {
+        Write-Info "Enabled platforms: $($script:enabledPlatforms -join ', ')"
+    } else {
+        Write-Warn "No platform is enabled in data\config.json. Run the CLI and use config to enable at least one platform."
+    }
+} elseif ($script:enabledPlatforms -notcontains $Platform) {
+    Write-Warn "$Platform is disabled in data\config.json; it will stay disabled until you enable it in the CLI."
+}
 
 if (Test-TcpPort $port) {
     if (Test-JobSeekerHealth $port) {

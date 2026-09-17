@@ -123,6 +123,9 @@ test('Zhaopin adapter normalizes identity, paginates safely, isolates apply sema
   assert.equal(hooks.zhaopinJobIdentityUrl(url), 'https://www.zhaopin.com/jobdetail/CC123.htm');
   assert.equal(hooks.isZhaopinListUrl('https://www.zhaopin.com/recommend'), true);
   assert.equal(hooks.isZhaopinListUrl('https://www.zhaopin.com/sou/?jl=489'), true);
+  // 新版搜索域必须被接受：后端 config 归一化也只认这几个域名，两边不能各说各话。
+  assert.equal(hooks.isZhaopinListUrl('https://sou.zhaopin.com/?kw=算法工程师'), true);
+  assert.equal(hooks.isZhaopinListUrl('https://www.zhaopin.com/jobs'), true);
   assert.equal(hooks.isZhaopinListUrl(url), false);
   assert.equal(hooks.zhaopinActionState('立即投递'), 'apply');
   assert.equal(hooks.zhaopinActionState('已投递'), 'already_applied');
@@ -468,4 +471,69 @@ test('backend shutdown pauses search loop instead of retrying forever', () => {
 test('background tabs remain non-active', () => {
   assert.match(source, /GM_openInTab/);
   assert.match(source, /active:\s*false/);
+});
+
+test('Job51 adapter normalizes identity, list URLs, pagination detail, and apply state', () => {
+  assert.equal(hooks.job51JobIdFromValue('https://we.51job.com/pc/job/123456'), '123456');
+  assert.equal(hooks.job51JobIdFromValue('https://we.51job.com/pc/job/123456.html'), '123456');
+  assert.equal(hooks.job51JobIdFromValue('https://we.51job.com/pc/job/123456?jobId=999'), '999');
+  assert.equal(hooks.job51JobIdFromValue('https://jobs.51job.com/hangzhou/123456.html'), '123456');
+  assert.equal(hooks.job51JobIdentityUrl('https://we.51job.com/pc/job/123456?from=list#top'), 'https://we.51job.com/pc/job/123456');
+
+  assert.equal(hooks.isJob51ListUrl('https://we.51job.com/pc/search?keyword=python'), true);
+  assert.equal(hooks.isJob51ListUrl('https://we.51job.com/pc/job/123456'), false);
+  assert.equal(hooks.isJob51ListUrl('https://www.zhipin.com/web/geek/jobs'), false);
+
+  assert.equal(hooks.job51ActionState('已投递'), 'already_applied');
+  assert.equal(hooks.job51ActionState('立即投递'), 'apply');
+
+  const keys = Array.from(hooks.job51RecentIdentityKeys({
+    url: 'https://we.51job.com/pc/job/123456',
+    external_job_id: '123456',
+    company: '示例科技有限公司',
+    title: 'AI 应用工程师',
+  }));
+  assert.deepEqual(keys, ['https://we.51job.com/pc/job/123456', 'job51:123456']);
+  // 带 .html 后缀的详情网址也要归一到同一个稳定职位 ID，避免重复评分。
+  assert.ok(
+    Array.from(hooks.job51RecentIdentityKeys({ url: 'https://we.51job.com/pc/job/123456.html' })).includes('job51:123456'),
+  );
+
+  // 详情读取与心跳上报，保证列表页能按 requestId 收到 JD，且状态页有分页数据。
+  assert.match(source, /pageTarget: this\.pageControlState/);
+  assert.match(source, /pageJobCountBefore: this\.pageJobCountBefore/);
+  assert.match(source, /const wait = this\.waitFor\(this\.types\.JOB_INFO, requestId\);/);
+  assert.match(source, /读取 JD，读完后回收后台标签页/);
+
+  // 详情页是前端渲染，必须先等职位名称元素再读，否则会把“还没渲染”当成“没有职位名称”。
+  assert.match(source, /await this\.waitForDetailContent\(\);/);
+  assert.match(source, /return await tools\.waitForOne\(this\.detailTitleSelectors\(\), timeout\)/);
+  assert.match(source, /const title = this\.firstText\(rootDocument, this\.detailTitleSelectors\(\)\);/);
+  // 详情标签页收到关闭广播要自行收掉，避免留下白屏标签页。
+  assert.match(source, /this\.broadcast\.on\(this\.types\.CLOSE, \(from, data\) => \{[\s\S]{0,240}window\.close\(\);/);
+});
+
+test('Zhaopin list page does not reload forever when the configured URL redirects', () => {
+  // 配置的搜索页会被 302 到规范化列表页，身份永远对不上；只允许纠正跳转一次。
+  const now = 1_700_000_000_000;
+  // 已经停在配置来源上：不需要纠正
+  assert.equal(hooks.shouldCorrectListUrl(0, { navigatedAt: 0 }, now), false);
+  // 身份对不上且从未纠正过：跳一次
+  assert.equal(hooks.shouldCorrectListUrl(-1, {}, now), true);
+  assert.equal(hooks.shouldCorrectListUrl(-1, { navigatedAt: 0 }, now), true);
+  // 刚为纠正跳转过（页面被重定向回来）：接住当前列表页，不再跳
+  assert.equal(hooks.shouldCorrectListUrl(-1, { navigatedAt: now - 1000 }, now), false);
+  assert.equal(hooks.shouldCorrectListUrl(-1, { navigatedAt: now - 59000 }, now), false);
+  // 冷却过后允许再纠正一次（例如用户手动跑到了别的列表页）
+  assert.equal(hooks.shouldCorrectListUrl(-1, { navigatedAt: now - 61000 }, now), true);
+
+  assert.match(source, /tools\.shouldCorrectListUrl\(currentIndex, savedUrlState\)/);
+  assert.match(source, /listUrlRedirectCooldownMs: 60000/);
+  assert.match(source, /zhaopin_list_url_redirected/);
+  // navigatedAt 只在真正跳转时写入，翻页等空调用不会误标记。
+  assert.match(
+    source,
+    /this\.writeJson\(this\.urlStateKey, \{ index, reason, updatedAt: Date\.now\(\) \}\);\s*\n\s*return false;/,
+  );
+  assert.match(source, /navigatedAt: Date\.now\(\)/);
 });

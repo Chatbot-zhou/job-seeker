@@ -16,14 +16,21 @@ from tools import now_iso, sanitize_log_value
 
 SCRIPT_STALE_SECONDS = 15
 SCRIPT_INSTANCE_RETENTION_SECONDS = 300
-PLATFORM_NAMES = ("boss", "zhaopin")
+PLATFORM_NAMES = ("boss", "zhaopin", "job51")
+# 通过“投递”触达岗位的平台；BOSS 使用打招呼流程，不计入投递统计与对账。
+APPLY_PLATFORMS = ("zhaopin", "job51")
 CONTROLLER_PAGE_KINDS = {
     "boss": ("search", "search_standby"),
     "zhaopin": ("list",),
+    "job51": ("list",),
 }
 SCRIPT_STATUS_DETAIL_KEYS = (
     "version",
     "backendRunId",
+    # 心跳里带着当前页面地址（脚本侧已做 logSafeUrl 脱敏）。之前被过滤掉，
+    # 排查“页面被重定向到别处/反复重载”时看不到标签页到底停在哪。
+    "currentUrl",
+    "currentUrlIndex",
     "currentJobId",
     "currentJobTitle",
     "listMode",
@@ -338,10 +345,14 @@ class RuntimeState:
                 detail=script_detail,
             )
 
+    def _default_platform(self) -> str:
+        for platform in PLATFORM_NAMES:
+            if self._platform_enabled(platform):
+                return platform
+        return PLATFORM_NAMES[0]
+
     def script_snapshot(self, platform: str | None = None) -> dict[str, Any]:
-        selected = self._platform_name(platform) if platform else (
-            "boss" if self._platform_enabled("boss") else "zhaopin"
-        )
+        selected = self._platform_name(platform) if platform else self._default_platform()
         with self._lock:
             primary = self._select_primary_locked(selected)
             self.platforms[selected] = dict(primary)

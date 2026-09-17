@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from config import Config, ensure_data_dirs
+from runtime_state import APPLY_PLATFORMS
 from tools import now_iso, redact_sensitive_urls, sanitize_log_value
 
 
@@ -20,6 +21,10 @@ SCHEMA_VERSION = 6
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _MIGRATION_RESULTS: dict[str, dict[str, Any]] = {}
+
+
+def _apply_platform_sql() -> str:
+    return ", ".join("?" for _ in APPLY_PLATFORMS)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -683,8 +688,8 @@ def list_recent_processed_jobs(
 
 def count_applications(*, run_id: str = "", day: str = "") -> int:
     init_db()
-    params: list[Any] = []
-    where = "platform = 'zhaopin' AND applied = 1"
+    params: list[Any] = list(APPLY_PLATFORMS)
+    where = f"platform IN ({_apply_platform_sql()}) AND applied = 1"
     if run_id:
         where += " AND run_id = ?"
         params.append(run_id)
@@ -697,7 +702,7 @@ def count_applications(*, run_id: str = "", day: str = "") -> int:
 
 
 def reconcile_stale_application_actions(*, stale_minutes: int = 10) -> dict[str, Any]:
-    """Move abandoned Zhaopin post-click transactions to an explicit unknown state."""
+    """Move abandoned post-click apply transactions of application platforms to an explicit unknown state."""
     init_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, int(stale_minutes)))).isoformat()
     current_time = now_iso()
@@ -705,16 +710,16 @@ def reconcile_stale_application_actions(*, stale_minutes: int = 10) -> dict[str,
     job_urls: list[str] = []
     with closing(connect()) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, job_url
             FROM actions
-            WHERE platform = 'zhaopin'
+            WHERE platform IN ({_apply_platform_sql()})
               AND action_type = 'apply'
               AND status = 'clicked'
               AND updated_at < ?
             ORDER BY id
             """,
-            (cutoff,),
+            (*APPLY_PLATFORMS, cutoff),
         ).fetchall()
         for row in rows:
             action_id = int(row["id"])
@@ -748,16 +753,16 @@ def reconcile_stale_application_actions(*, stale_minutes: int = 10) -> dict[str,
             )
             if job_url:
                 conn.execute(
-                    """
+                    f"""
                     UPDATE jobs
                     SET application_state = 'unknown',
                         final_action = 'apply_delivery_unknown',
                         updated_at = ?
                     WHERE url = ?
-                      AND platform = 'zhaopin'
+                      AND platform IN ({_apply_platform_sql()})
                       AND application_state = 'clicked'
                     """,
-                    (current_time, job_url),
+                    (current_time, job_url, *APPLY_PLATFORMS),
                 )
         conn.commit()
     return {
@@ -945,13 +950,15 @@ def summarize_run(run_id: str) -> dict[str, Any]:
             action_counts.get(("boss", "greet", "unknown"), 0)
             + action_counts.get(("boss", "greet_delivery_unknown", "unknown"), 0)
         ),
-        "apply_success": (
-            action_counts.get(("zhaopin", "apply", "confirmed"), 0)
-            + action_counts.get(("zhaopin", "apply", "completed"), 0)
+        "apply_success": sum(
+            action_counts.get((platform, "apply", "confirmed"), 0)
+            + action_counts.get((platform, "apply", "completed"), 0)
+            for platform in APPLY_PLATFORMS
         ),
-        "apply_unknown": (
-            action_counts.get(("zhaopin", "apply", "unknown"), 0)
-            + action_counts.get(("zhaopin", "apply_delivery_unknown", "unknown"), 0)
+        "apply_unknown": sum(
+            action_counts.get((platform, "apply", "unknown"), 0)
+            + action_counts.get((platform, "apply_delivery_unknown", "unknown"), 0)
+            for platform in APPLY_PLATFORMS
         ),
         "paused": counts.get("manual_intervention_pause", 0) + counts.get("platform_limit_pause", 0),
         "event_types": counts,

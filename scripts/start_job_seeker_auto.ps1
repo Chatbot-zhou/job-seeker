@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("all", "boss", "zhaopin")]
+    [ValidateSet("all", "boss", "zhaopin", "job51")]
     [string]$Platform = "all",
     [switch]$NoOpen
 )
@@ -15,6 +15,7 @@ try {
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BossUrl = "https://www.zhipin.com/web/geek/jobs"
 $ZhaopinDefaultUrl = "https://www.zhaopin.com/recommend"
+$Job51DefaultUrl = "https://we.51job.com/pc/search"
 $OpenCooldownSeconds = 60
 $DefaultOllamaModel = "qwen3:1.7b"
 
@@ -251,7 +252,7 @@ function Open-StartupPages {
     if ($NoOpen) {
         return
     }
-    $platforms = if ($SelectedPlatform -eq "all") { @("boss", "zhaopin") } else { @($SelectedPlatform) }
+    $platforms = if ($SelectedPlatform -eq "all") { @("boss", "zhaopin", "job51") } else { @($SelectedPlatform) }
     foreach ($name in $platforms) {
         $scriptUrl = "http://127.0.0.1:${Port}/userscripts/${name}.user.js"
         if (Test-OpenCooldown "userscript_$name") {
@@ -276,6 +277,16 @@ function Open-StartupPages {
         Start-Process $zhaopinUrl | Out-Null
     } elseif ($SelectedPlatform -in @("all", "zhaopin")) {
         Write-Warn "Zhaopin jobs page was opened recently; skipping duplicate open."
+    }
+    if ($SelectedPlatform -in @("all", "job51") -and (Test-OpenCooldown "job51_search")) {
+        $job51Url = $Job51DefaultUrl
+        if ($null -ne $script:config -and $script:config.job51_job_urls -and $script:config.job51_job_urls.Count -gt 0) {
+            $job51Url = [string]$script:config.job51_job_urls[0]
+        }
+        Write-Info "Opening 51job jobs page: $job51Url"
+        Start-Process $job51Url | Out-Null
+    } elseif ($SelectedPlatform -in @("all", "job51")) {
+        Write-Warn "51job jobs page was opened recently; skipping duplicate open."
     }
 }
 

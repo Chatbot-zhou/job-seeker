@@ -65,6 +65,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "zhaopin_apply_delay_max_seconds": 10,
     "zhaopin_max_applications_per_run": 0,
     "zhaopin_max_applications_per_day": 0,
+    "job51_enabled": True,
+    "job51_job_urls": ["https://we.51job.com/pc/search?keyword=算法工程师"],
+    "job51_resume_name": "",
+    "job51_apply_delay_min_seconds": 3,
+    "job51_apply_delay_max_seconds": 10,
+    "job51_max_applications_per_run": 0,
+    "job51_max_applications_per_day": 0,
     "model_max_concurrency": 1,
     "model_concurrency_profile": "",
     "auto_start_enabled": False,
@@ -127,7 +134,12 @@ def _as_hhmm(value: Any, default: str = "09:00") -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
-def _as_zhaopin_urls(value: Any) -> list[str]:
+def _as_zhaopin_urls(value: Any, on_reject=None) -> list[str]:
+    """解析智联岗位列表地址。
+
+    与油猴脚本 tools.isZhaopinListUrl 保持一致：新版搜索域名 sou.zhaopin.com 同样视为
+    列表页，否则用户配置的搜索地址会被静默丢弃并回退到默认 /recommend。
+    """
     if isinstance(value, str):
         values = value.replace("\r", "\n").replace(",", "\n").split("\n")
     elif isinstance(value, (list, tuple)):
@@ -142,14 +154,56 @@ def _as_zhaopin_urls(value: Any) -> list[str]:
         try:
             parsed = urlsplit(raw)
         except ValueError:
+            if on_reject:
+                on_reject(raw, "网址格式无法解析")
             continue
-        if parsed.scheme.lower() != "https" or parsed.hostname not in {"www.zhaopin.com", "zhaopin.com"}:
+        if parsed.scheme.lower() != "https":
+            if on_reject:
+                on_reject(raw, "仅支持 https 地址")
             continue
-        path = parsed.path or "/recommend"
-        normalized = urlunsplit(("https", "www.zhaopin.com", path, parsed.query, ""))
+        host = (parsed.hostname or "").lower()
+        if host == "sou.zhaopin.com":
+            # 新版搜索页，保留原样；页面会自行 302 到规范化列表页。
+            normalized = urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
+        elif host in {"www.zhaopin.com", "zhaopin.com"}:
+            normalized = urlunsplit(("https", "www.zhaopin.com", parsed.path or "/recommend", parsed.query, ""))
+        else:
+            if on_reject:
+                on_reject(raw, "仅支持 www.zhaopin.com / zhaopin.com / sou.zhaopin.com 的列表页")
+            continue
         if normalized not in result:
             result.append(normalized)
     return result or list(DEFAULT_CONFIG["zhaopin_job_urls"])
+
+
+def _as_job51_urls(value: Any, on_reject=None) -> list[str]:
+    """解析前程无忧职位列表地址，仅保留 we.51job.com 搜索页。"""
+    if isinstance(value, str):
+        values = value.replace("\r", "\n").replace(",", "\n").split("\n")
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = []
+    result: list[str] = []
+    for item in values:
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urlsplit(raw)
+        except ValueError:
+            if on_reject:
+                on_reject(raw, "网址格式无法解析")
+            continue
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme.lower() != "https" or host not in {"we.51job.com", "51job.com"}:
+            if on_reject:
+                on_reject(raw, "仅支持 https://we.51job.com/ 的搜索页")
+            continue
+        normalized = urlunsplit(("https", "we.51job.com", parsed.path or "/pc/search", parsed.query, ""))
+        if normalized not in result:
+            result.append(normalized)
+    return result or list(DEFAULT_CONFIG["job51_job_urls"])
 
 
 def model_concurrency_fingerprint(data: dict[str, Any] | None = None) -> str:
@@ -271,10 +325,37 @@ class Config:
     zhaopin_apply_delay_max_seconds = DEFAULT_CONFIG["zhaopin_apply_delay_max_seconds"]
     zhaopin_max_applications_per_run = DEFAULT_CONFIG["zhaopin_max_applications_per_run"]
     zhaopin_max_applications_per_day = DEFAULT_CONFIG["zhaopin_max_applications_per_day"]
+    job51_enabled = DEFAULT_CONFIG["job51_enabled"]
+    job51_job_urls = list(DEFAULT_CONFIG["job51_job_urls"])
+    job51_resume_name = DEFAULT_CONFIG["job51_resume_name"]
+    job51_apply_delay_min_seconds = DEFAULT_CONFIG["job51_apply_delay_min_seconds"]
+    job51_apply_delay_max_seconds = DEFAULT_CONFIG["job51_apply_delay_max_seconds"]
+    job51_max_applications_per_run = DEFAULT_CONFIG["job51_max_applications_per_run"]
+    job51_max_applications_per_day = DEFAULT_CONFIG["job51_max_applications_per_day"]
     model_max_concurrency = DEFAULT_CONFIG["model_max_concurrency"]
     model_concurrency_profile = DEFAULT_CONFIG["model_concurrency_profile"]
     auto_start_enabled = DEFAULT_CONFIG["auto_start_enabled"]
     auto_start_time = DEFAULT_CONFIG["auto_start_time"]
+
+    @classmethod
+    def warn_rejected_job_urls(cls, data: dict[str, Any]) -> list[str]:
+        """配置里的岗位列表地址被规则丢弃时给出提示。
+
+        归一化会把无法识别的地址换成默认地址，若静默处理，用户会看到 config.json 与
+        实际生效值不一致，很难排查（例如智联新版搜索域名曾导致默认 /recommend 被反复重载）。
+        """
+        messages: list[str] = []
+        for key, normalizer, label in (
+            ("zhaopin_job_urls", _as_zhaopin_urls, "智联"),
+            ("job51_job_urls", _as_job51_urls, "前程无忧"),
+        ):
+            def report(raw: str, reason: str, _label: str = label, _key: str = key) -> None:
+                messages.append(f"[警告] {_label}岗位列表网址已忽略 {raw}（{reason}），请修正 {_key} 后重启")
+
+            normalizer(data.get(key), report)
+        for message in messages:
+            print(message, file=sys.stderr)
+        return messages
 
     @classmethod
     def load(cls) -> dict[str, Any]:
@@ -298,6 +379,7 @@ class Config:
                     data.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
             except json.JSONDecodeError as exc:
                 print(f"[警告] 配置文件损坏，已使用默认配置: {CONFIG_PATH} / {exc}", file=sys.stderr)
+        cls.warn_rejected_job_urls(data)
         cls.apply(data)
         if not CONFIG_PATH.exists() or should_rewrite:
             cls.save(data)
@@ -323,6 +405,9 @@ class Config:
         data["zhaopin_enabled"] = _as_bool(data.get("zhaopin_enabled"))
         data["zhaopin_job_urls"] = _as_zhaopin_urls(data.get("zhaopin_job_urls"))
         data["zhaopin_resume_name"] = str(data.get("zhaopin_resume_name") or "").strip()
+        data["job51_enabled"] = _as_bool(data.get("job51_enabled"))
+        data["job51_job_urls"] = _as_job51_urls(data.get("job51_job_urls"))
+        data["job51_resume_name"] = str(data.get("job51_resume_name") or "").strip()
         data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
         data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
         data["search_round_cooldown_min_minutes"] = _as_int(
@@ -408,6 +493,24 @@ class Config:
         )
         data["zhaopin_max_applications_per_day"] = _as_int(
             data.get("zhaopin_max_applications_per_day"), 0, 0, 5000
+        )
+        data["job51_apply_delay_min_seconds"] = _as_int(
+            data.get("job51_apply_delay_min_seconds"),
+            DEFAULT_CONFIG["job51_apply_delay_min_seconds"],
+            3,
+            60,
+        )
+        data["job51_apply_delay_max_seconds"] = _as_int(
+            data.get("job51_apply_delay_max_seconds"),
+            DEFAULT_CONFIG["job51_apply_delay_max_seconds"],
+            data["job51_apply_delay_min_seconds"],
+            60,
+        )
+        data["job51_max_applications_per_run"] = _as_int(
+            data.get("job51_max_applications_per_run"), 0, 0, 1000
+        )
+        data["job51_max_applications_per_day"] = _as_int(
+            data.get("job51_max_applications_per_day"), 0, 0, 5000
         )
         requested_concurrency = _as_int(data.get("model_max_concurrency"), 1, 1, 2)
         concurrency_profile = str(data.get("model_concurrency_profile") or "").strip()

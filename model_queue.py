@@ -66,7 +66,7 @@ class FairModelQueue:
                 ticket.future.set_result(None)
 
     async def acquire(self, platform: str) -> str:
-        platform = platform if platform in {"boss", "zhaopin"} else "boss"
+        platform = platform if platform in {"boss", "zhaopin", "job51"} else "boss"
         guard = self._ensure_guard()
         loop = asyncio.get_running_loop()
         ticket = _Ticket(

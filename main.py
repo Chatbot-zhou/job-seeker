@@ -31,7 +31,7 @@ from config import Config
 from core import SCORING_VERSION, analyze_job
 from model_queue import FairModelQueue, ModelQueueCancelled
 from model_stream import model_execution_snapshot, model_warmup_check
-from runtime_state import runtime_state
+from runtime_state import APPLY_PLATFORMS, runtime_state
 from schema import (
     ActionCreate,
     ActionDecision,
@@ -61,10 +61,21 @@ USERSCRIPT_DEFINITIONS = {
         "description": "Job Seeker 智联招聘通道",
         "matches": (
             "https://www.zhaopin.com/*",
+            "https://sou.zhaopin.com/*",
             "https://passport.zhaopin.com/*",
         ),
         "icon": "https://www.google.com/s2/favicons?sz=64&domain=zhaopin.com",
         "path": "/userscripts/zhaopin.user.js",
+    },
+    "job51": {
+        "name": "Job Seeker - 前程无忧",
+        "description": "Job Seeker 前程无忧通道",
+        "matches": (
+            "https://we.51job.com/*",
+            "https://login.51job.com/*",
+        ),
+        "icon": "https://www.google.com/s2/favicons?sz=64&domain=51job.com",
+        "path": "/userscripts/job51.user.js",
     },
 }
 MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-model")
@@ -397,6 +408,11 @@ async def boss_userscript():
 @app.get("/userscripts/zhaopin.user.js", summary="安装或更新智联篡改猴脚本")
 async def zhaopin_userscript():
     return PlainTextResponse(render_userscript("zhaopin"), media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/userscripts/job51.user.js", summary="安装或更新前程无忧篡改猴脚本")
+async def job51_userscript():
+    return PlainTextResponse(render_userscript("job51"), media_type="application/javascript; charset=utf-8")
 
 
 @app.get("/status", summary="系统状态")
@@ -745,7 +761,7 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
             analysis["match_reason"] = "平台已暂停，评分结果已作废"
         else:
             analysis["platform_action"] = (
-                ("apply" if platform == "zhaopin" else "greet")
+                ("apply" if platform in APPLY_PLATFORMS else "greet")
                 if analysis.get("recommendation") == "greet"
                 else "skip"
             )
@@ -850,7 +866,7 @@ async def create_action(payload: ActionCreate):
         database.update_job_status(payload.job_url, final_action="greeted", greeted=True)
     if payload.action_type == "already_contacted" and payload.status in {"completed", "approved"}:
         database.update_job_status(payload.job_url, final_action="already_contacted", greeted=True)
-    if payload.platform == "zhaopin" and payload.action_type in {"apply", "already_applied"}:
+    if payload.platform in APPLY_PLATFORMS and payload.action_type in {"apply", "already_applied"}:
         transaction_state = str(payload.payload.get("transactionState") or payload.payload.get("state") or "")
         confirmed = payload.action_type == "already_applied" or transaction_state == "confirmed" or payload.status == "completed"
         database.update_job_status(
@@ -859,7 +875,7 @@ async def create_action(payload: ActionCreate):
             applied=True if confirmed else None,
             application_state="confirmed" if confirmed else (transaction_state or payload.status),
         )
-    if payload.platform == "zhaopin" and payload.action_type == "apply_delivery_unknown":
+    if payload.platform in APPLY_PLATFORMS and payload.action_type == "apply_delivery_unknown":
         database.update_job_status(
             payload.job_url,
             final_action="apply_delivery_unknown",
@@ -905,7 +921,7 @@ async def history(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, 
 async def recent_jobs(
     limit: int = Query(500, ge=1, le=1000),
     hours: int = Query(24, ge=1, le=168),
-    platform: str = Query("", pattern="^(|boss|zhaopin)$"),
+    platform: str = Query("", pattern="^(|boss|zhaopin|job51)$"),
 ):
     return {
         "jobs": database.list_recent_processed_jobs(
@@ -1027,6 +1043,7 @@ def print_usage() -> None:
                 "  start_all.bat               启动全部平台",
                 "  start_boss.bat              只启动 BOSS",
                 "  start_zhaopin.bat           只启动智联",
+                "  start_job51.bat             只启动前程无忧",
             ]
         )
     )
@@ -1039,7 +1056,10 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         raise SystemExit(run_api_only())
     if len(sys.argv) > 1 and sys.argv[1] in {"agent", "mcp"}:
-        print("[Job Seeker] 请使用 start_all.bat、start_boss.bat 或 start_zhaopin.bat 启动，然后在网页面板控制运行。")
+        print(
+            "[Job Seeker] 请使用 start_all.bat、start_boss.bat、start_zhaopin.bat "
+            "或 start_job51.bat 启动，然后在网页面板控制运行。"
+        )
         raise SystemExit(2)
     from cli_console import run_autorun, run_cli
 

@@ -117,6 +117,10 @@ def check_userscript_version_sync() -> None:
     assert "https://passport.zhaopin.com/*" in script
     assert "zhaopinActionState" in script
     assert "apply_delivery_unknown" in script
+    assert "https://we.51job.com/*" in script
+    assert "https://we.51job.com/pc/search" in script
+    assert "job51ActionState" in script
+    assert "job51RecentIdentityKeys" in script
 
 
 def check_diagnostic_redaction() -> None:
@@ -150,6 +154,7 @@ def check_launcher_entries() -> None:
         "start_all.bat": "all",
         "start_boss.bat": "boss",
         "start_zhaopin.bat": "zhaopin",
+        "start_job51.bat": "job51",
     }
     launchers = {path.name for path in ROOT.glob("start_*.bat")}
     assert launchers == set(expected), f"unexpected launchers: {sorted(launchers)}"

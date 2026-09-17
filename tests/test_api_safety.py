@@ -69,14 +69,15 @@ def test_platform_heartbeat_and_control_are_isolated(tmp_path, monkeypatch) -> N
     import database
     import main
     from config import Config
+    from runtime_state import PLATFORM_NAMES
 
     monkeypatch.setattr(Config, "app_db_name", str(tmp_path / "platform-api.db"))
     monkeypatch.setattr(Config, "boss_enabled", True)
     monkeypatch.setattr(Config, "zhaopin_enabled", True)
     database._INITIALIZED_PATHS.clear()
-    main.runtime_state.platform_controls.update({"boss": "running", "zhaopin": "running"})
-    main.runtime_state.platform_pause_reasons.update({"boss": "", "zhaopin": ""})
-    main.runtime_state.platform_instances = {"boss": {}, "zhaopin": {}}
+    main.runtime_state.platform_controls.update({platform: "running" for platform in PLATFORM_NAMES})
+    main.runtime_state.platform_pause_reasons.update({platform: "" for platform in PLATFORM_NAMES})
+    main.runtime_state.platform_instances = {platform: {} for platform in PLATFORM_NAMES}
     main.runtime_state.set_control("resume")
 
     with TestClient(main.app) as client:

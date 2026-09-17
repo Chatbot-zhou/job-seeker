@@ -49,7 +49,7 @@ class ConfigUpdate(BaseModel):
 
 
 class ScriptHeartbeat(BaseModel):
-    platform: str = Field(default="boss", pattern="^(boss|zhaopin)$")
+    platform: str = Field(default="boss", pattern="^(boss|zhaopin|job51)$")
     instance_id: str = ""
     page_kind: str = ""
     page: str = "unknown"
@@ -59,7 +59,7 @@ class ScriptHeartbeat(BaseModel):
 
 
 class JobAnalyzeRequest(BaseModel):
-    platform: str = Field(default="boss", pattern="^(boss|zhaopin)$")
+    platform: str = Field(default="boss", pattern="^(boss|zhaopin|job51)$")
     external_job_id: str = ""
     title: str
     salary: str = ""
@@ -74,7 +74,7 @@ class JobAnalyzeRequest(BaseModel):
 class ActionCreate(BaseModel):
     action_type: str
     status: str = "pending"
-    platform: str = Field(default="boss", pattern="^(boss|zhaopin)$")
+    platform: str = Field(default="boss", pattern="^(boss|zhaopin|job51)$")
     idempotency_key: str = ""
     external_job_id: str = ""
     job_url: str = ""
@@ -90,7 +90,7 @@ class ActionDecision(BaseModel):
 class ControlUpdate(BaseModel):
     command: str = Field(pattern="^(start|pause|resume|stop)$")
     new_run: bool = False
-    platform: str | None = Field(default=None, pattern="^(boss|zhaopin)$")
+    platform: str | None = Field(default=None, pattern="^(boss|zhaopin|job51)$")
     reason: str = ""
 
 

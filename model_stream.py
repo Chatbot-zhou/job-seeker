@@ -87,7 +87,7 @@ class ModelExecutionGate:
             yield
             return
         ticket_id = f"gate-{uuid.uuid4().hex[:12]}"
-        normalized_platform = platform if platform in {"boss", "zhaopin"} else "system"
+        normalized_platform = platform if platform in {"boss", "zhaopin", "job51"} else "system"
         started_at = time.monotonic()
         with self._condition:
             self._waiters.append((ticket_id, normalized_platform, kind))
