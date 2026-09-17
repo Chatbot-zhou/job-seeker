@@ -579,7 +579,7 @@ test('apply success dialogs are recognized instead of paused as manual intervent
   assert.match(source, /tools\.applyDialogSignature\(dialog\)/);
   // 有“留在此页”按钮的弹窗一律按动作完成处理，不靠文案也能兜住
   assert.match(source, /isApplySuccessDialog\(dialog, dialogText = ''\)/);
-  assert.match(source, /dismissApplySuccessDialog\(this\.simpleDialogs\(\), seenSuccessDialogs\)/);
+  assert.match(source, /dismissApplySuccessDialog\(tools\.pendingApplySuccessNotices\(\), seenSuccessDialogs\)/);
 });
 
 test('apply verification tolerates re-rendered cards and trusts the success dialog', () => {
@@ -620,4 +620,29 @@ test('Zhaopin scrolls for more jobs before switching source and cooling down', (
   assert.match(source, /listScrollRound: this\.listScrollRound/);
   assert.match(source, /lastListScrollOutcome: this\.lastScrollOutcome/);
   assert.match(source, /zhaopin_list_scroll/);
+});
+
+test('apply dialogs are picked from the innermost node, not a page-wide wrapper', () => {
+  // simpleDialogs() 的 [class*="dialog"] 会命中覆盖整页的 wrapper：文字里包含
+  // 搜索筛选项，于是被当成“问卷输入项”误报，成功提示签名也变成整页文本。
+  assert.match(source, /compactDialogs\(dialogs = \[\], maxChars = 600\)/);
+  assert.match(source, /\.filter\(item => item\.length > 0 && item\.length <= maxChars\)/);
+  // 按文字长度升序 => 最内层的真弹窗排在最前面
+  assert.match(source, /\.sort\(\(a, b\) => a\.length - b\.length\)/);
+  assert.match(source, /tools\.compactDialogs\(this\.simpleDialogs\(\)\)/);
+  // 成功提示也可能不是 role=dialog，轮询要能扫到 toast
+  assert.match(source, /pendingApplySuccessNotices\(\)/);
+  assert.match(source, /\[class\*="toast"\],\[class\*="message"\],\[class\*="notice"\]/);
+});
+
+test('apply confirmation from the dialog step is not thrown away', () => {
+  // 确认弹窗阶段已经拿到成功证据时，必须直接记为已确认，
+  // 否则会继续等按钮变化并最终误记为“结果无法确认 + 暂停”。
+  assert.match(source, /applyDialogConfirmed\(result\)/);
+  assert.match(source, /if \(result\.confirmed === true\) return true;/);
+  assert.match(source, /String\(result\.mode \|\| ''\) === 'success_dialog'/);
+  assert.match(source, /dialogResult = await this\.confirmSimpleApplyDialog\([\s\S]{0,80}\|\| dialogResult;/);
+  assert.match(source, /dialogResult = await this\.confirmApplyDialog\([\s\S]{0,90}\|\| dialogResult;/);
+  assert.match(source, /if \(tools\.applyDialogConfirmed\(dialogResult\)\)/);
+  assert.match(source, /verification: `dialog:\$\{dialogResult\.mode \|\| 'confirmed'\}`/);
 });
