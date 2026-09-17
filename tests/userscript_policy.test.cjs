@@ -537,3 +537,30 @@ test('Zhaopin list page does not reload forever when the configured URL redirect
   );
   assert.match(source, /navigatedAt: Date\.now\(\)/);
 });
+
+test('apply success dialogs are recognized instead of paused as manual intervention', () => {
+  // 智联投递成功后弹“简历已发送 / 留在此页 / 继续沟通”；前程无忧弹“投递成功”。
+  assert.equal(hooks.isApplySuccessText('简历已发送'), true);
+  assert.equal(hooks.isApplySuccessText('您的简历已发送，请留意企业回复'), true);
+  assert.equal(hooks.isApplySuccessText('投递成功'), true);
+  assert.equal(hooks.isApplySuccessText('简历投递成功，等待企业查看'), true);
+  assert.equal(hooks.isApplySuccessText('已投递成功'), true);
+  // 验证码/短信这类也含“已发送”，不能当成投递成功，否则会把验证弹窗当成功放过去。
+  assert.equal(hooks.isApplySuccessText('验证码已发送到手机'), false);
+  assert.equal(hooks.isApplySuccessText('短信已发送'), false);
+  // 普通的确认弹窗和问卷弹窗都不算成功
+  assert.equal(hooks.isApplySuccessText('确认投递该职位？'), false);
+  assert.equal(hooks.isApplySuccessText('请补充以下问题'), false);
+
+  // 关闭按钮必须包含“留在此页”，且绝不能包含会离开列表页的“继续沟通”。
+  const labels = Array.from(hooks.applyDialogDismissLabels());
+  assert.ok(labels.includes('留在此页'), String(labels));
+  assert.ok(!labels.includes('继续沟通'), String(labels));
+
+  // 两处确认弹窗都要先判成功，再判问卷；错误信息带上弹窗签名便于定位。
+  const successFirst = /if \(tools\.isApplySuccessText\(dialogText\)\) \{[\s\S]{0,900}const supplementalFields/;
+  assert.match(source, successFirst);
+  assert.match(source, /apply_success_dialog_dismissed/);
+  assert.match(source, /tools\.applyDialogSignature\(dialog\)/);
+  assert.match(source, /tools\.dismissApplySuccessDialog\(this\.simpleDialogs\(\), seenSuccessDialogs\)/);
+});

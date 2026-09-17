@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.2
+// @version      2026.09.17.3
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.2',
+        scriptVersion: '2026.09.17.3',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -1359,6 +1359,56 @@
         },
         normalizePlainText(value) {
             return String(value || '').replace(/\s+/g, ' ').trim();
+        },
+        isApplySuccessText(value) {
+            // 投递成功后平台还会弹一个提示框（智联是“简历已发送”，前程无忧是“投递成功”），
+            // 文字里同样带“投递/简历”，不先按成功识别就会被后面的“问卷/确认按钮”判断
+            // 误判成需要人工介入，把已经投成功的岗位暂停掉。
+            const text = this.normalizePlainText(value).replace(/\s+/g, '');
+            // “验证码已发送”“短信已发送”这类也含“已发送”，但不是投递成功，先排除。
+            if (/(验证码|短信|邮件|链接|二维码)已发送/.test(text)) return false;
+            return /投递成功|申请成功|投递已完成|简历投递成功|已成功投递|投递已发送|简历已发送|已发送简历|已发送|已投递成功|恭喜/.test(text);
+        },
+        applyDialogDismissLabels() {
+            // 只放“关掉弹窗、不改变页面”的按钮。智联成功弹窗的“继续沟通”会跳到聊天页，
+            // 不能点，所以不在这里；列表页必须留在原地继续处理下一个岗位。
+            return ['确定', '好的', '知道了', '我知道了', '关闭', '完成', '确认', '留在此页', '留在本页', '暂不沟通'];
+        },
+        findDialogDismissControl(dialog) {
+            // 成功提示弹窗要关掉，否则它会盖住投递按钮，后面的“按钮变为已投递”校验读不到。
+            if (!dialog) return null;
+            const labels = this.applyDialogDismissLabels();
+            const buttons = Array.from(dialog.querySelectorAll('button,a,[role="button"],[class*="btn"]'))
+                .filter(el => this.isVisible(el) && !this.isDisabled(el));
+            const byLabel = buttons.find(node => labels.includes(this.normalizePlainText(node.innerText || node.textContent)));
+            if (byLabel) return byLabel;
+            return dialog.querySelector('[class*="close"],[aria-label*="关闭"],[title*="关闭"]');
+        },
+        dismissApplySuccessDialog(dialogs = [], seen = null) {
+            // 弹窗可能在确认窗口结束之后才出现，投递结果轮询期间也要顺手关掉，否则读不到按钮状态。
+            const dialog = dialogs.find(node => this.isApplySuccessText(this.normalizedText(node)));
+            if (!dialog) return null;
+            const signature = this.applyDialogSignature(dialog);
+            if (seen) {
+                if (seen.has(signature)) return null;
+                seen.add(signature);
+            }
+            const control = this.findDialogDismissControl(dialog);
+            if (control) this.clickLikeUser(control);
+            return { dismissed: Boolean(control), signature };
+        },
+        applyDialogSignature(dialog, labels = []) {
+            // 用于诊断：把弹窗文字、按钮和输入项压缩成一行，无法识别时能直接看到真实 DOM 文案。
+            if (!dialog) return '';
+            const text = this.normalizePlainText(this.normalizedText ? this.normalizedText(dialog) : dialog.textContent)
+                .slice(0, 160);
+            const buttons = (labels.length ? labels : Array.from(dialog.querySelectorAll('button,a,[role="button"]'))
+                .filter(el => this.isVisible(el))
+                .map(el => this.normalizePlainText(el.innerText || el.textContent))).filter(Boolean);
+            const fields = Array.from(dialog.querySelectorAll('textarea,select,input'))
+                .filter(el => this.isVisible(el))
+                .map(el => `${el.tagName.toLowerCase()}${el.type ? `:${el.type}` : ''}`);
+            return `文字=${text || '(空)'} | 按钮=${buttons.slice(0, 8).join('/') || '(无)'} | 输入项=${fields.slice(0, 8).join('/') || '(无)'}`;
         },
         sanitizeCompanyName(value, title = '', salary = '') {
             const raw = String(value || '').trim();
@@ -6898,11 +6948,25 @@
                     continue;
                 }
                 const dialogText = tools.normalizedText(dialog);
+                if (tools.isApplySuccessText(dialogText)) {
+                    // 投递已经成功，这里是成功提示弹窗：点掉它并按成功返回，
+                    // 后面的“按钮变为已投递”校验会正式确认这次投递。
+                    const dismiss = tools.findDialogDismissControl(dialog);
+                    if (dismiss) {
+                        tools.clickLikeUser(dismiss);
+                        await tools.asyncSleep(300);
+                    }
+                    await this.api.event('apply_success_dialog', '智联投递成功提示已确认', 'script', 'info', {
+                        dismissed: Boolean(dismiss),
+                        signature: tools.applyDialogSignature(dialog),
+                    });
+                    return { confirmed: true, mode: 'success_dialog' };
+                }
                 const supplementalFields = Array.from(dialog.querySelectorAll(
                     'textarea,select,input[type="file"],input[type="text"],input:not([type])'
                 )).filter(node => tools.isVisible(node));
                 if (/问卷|补充问题|附加问题|上传附件|作品集|求职信|回答以下/.test(dialogText) || supplementalFields.length) {
-                    const error = new Error('智联投递需要填写问卷、附件或补充信息');
+                    const error = new Error(`智联投递需要填写问卷、附件或补充信息（${tools.applyDialogSignature(dialog)}）`);
                     error.manualIntervention = true;
                     throw error;
                 }
@@ -6933,7 +6997,7 @@
                 }
                 const confirm = this.actionButtons(dialog).find(node => /^(确认投递|确定投递|投递|确认|确定)$/.test(tools.normalizedText(node)));
                 if (!confirm) {
-                    const error = new Error('智联投递弹窗无法安全确认');
+                    const error = new Error(`智联投递弹窗无法安全确认（${tools.applyDialogSignature(dialog)}）`);
                     error.manualIntervention = true;
                     throw error;
                 }
@@ -7001,6 +7065,7 @@
                 throw error;
             }
             const deadline = Date.now() + 15000;
+            const seenSuccessDialogs = new Set();
             while (Date.now() < deadline) {
                 if (this.findActionButton('already_applied')) {
                     await this.api.createAction('apply', {
@@ -7013,6 +7078,12 @@
                         url: job.url || '',
                     });
                     return { success: true, state: 'confirmed', requestId: context.requestId };
+                }
+                const settled = tools.dismissApplySuccessDialog(this.simpleDialogs(), seenSuccessDialogs);
+                if (settled) {
+                    await this.api.event('apply_success_dialog_dismissed', '智联投递成功后已关闭提示弹窗', 'script', 'info', settled);
+                    await tools.asyncSleep(300);
+                    continue;
                 }
                 const riskAfterClick = this.riskReason() || this.platformLimitReason();
                 if (riskAfterClick) {
@@ -8866,11 +8937,25 @@
                     continue;
                 }
                 const dialogText = tools.normalizedText(dialog);
+                if (tools.isApplySuccessText(dialogText)) {
+                    // 前程无忧每次投递完都会弹“投递成功”，文字里带“投递”且可能带输入项，
+                    // 必须先按成功处理，否则会被下面的问卷判断误判并暂停整个通道。
+                    const dismiss = tools.findDialogDismissControl(dialog);
+                    if (dismiss) {
+                        tools.clickLikeUser(dismiss);
+                        await tools.asyncSleep(300);
+                    }
+                    await this.api.event('apply_success_dialog', '前程无忧投递成功提示已确认', 'script', 'info', {
+                        dismissed: Boolean(dismiss),
+                        signature: tools.applyDialogSignature(dialog),
+                    });
+                    return { confirmed: true, mode: 'success_dialog' };
+                }
                 const supplementalFields = Array.from(dialog.querySelectorAll(
                     'textarea,select,input[type="file"],input[type="text"],input:not([type])'
                 )).filter(node => tools.isVisible(node));
                 if (/问卷|补充问题|附加问题|上传附件|作品集|求职信|回答以下/.test(dialogText) || supplementalFields.length) {
-                    const error = new Error('前程无忧投递需要填写问卷、附件或补充信息');
+                    const error = new Error(`前程无忧投递需要填写问卷、附件或补充信息（${tools.applyDialogSignature(dialog)}）`);
                     error.manualIntervention = true;
                     throw error;
                 }
@@ -8899,7 +8984,7 @@
                     .filter(el => tools.isVisible(el) && !tools.isDisabled(el))
                     .find(node => /^(确认投递|确定投递|投递|确认|确定)$/.test(tools.normalizedText(node)));
                 if (!confirm) {
-                    const error = new Error('前程无忧投递弹窗无法安全确认');
+                    const error = new Error(`前程无忧投递弹窗无法安全确认（${tools.applyDialogSignature(dialog)}）`);
                     error.manualIntervention = true;
                     throw error;
                 }
@@ -8968,6 +9053,7 @@
                 throw error;
             }
             const deadline = Date.now() + 15000;
+            const seenSuccessDialogs = new Set();
             while (Date.now() < deadline) {
                 const currentButton = this.applyButton(scope);
                 if (currentButton && tools.job51ActionState(tools.normalizedText(currentButton)) === 'already_applied') {
@@ -8981,6 +9067,12 @@
                         url: job.url || '',
                     });
                     return { success: true, state: 'confirmed', requestId: context.requestId };
+                }
+                const settled = tools.dismissApplySuccessDialog(this.simpleDialogs(), seenSuccessDialogs);
+                if (settled) {
+                    await this.api.event('apply_success_dialog_dismissed', '前程无忧投递成功后已关闭提示弹窗', 'script', 'info', settled);
+                    await tools.asyncSleep(300);
+                    continue;
                 }
                 const riskAfterClick = this.riskReason() || this.platformLimitReason();
                 if (riskAfterClick) {
@@ -9772,6 +9864,8 @@
             zhaopinStructuredJobFields: (value) => tools.zhaopinStructuredJobFields(value),
             zhaopinRecentIdentityKeys: (job) => tools.zhaopinRecentIdentityKeys(job),
             shouldCorrectListUrl: (currentIndex, savedUrlState, now) => tools.shouldCorrectListUrl(currentIndex, savedUrlState, now),
+            isApplySuccessText: (value) => tools.isApplySuccessText(value),
+            applyDialogDismissLabels: () => tools.applyDialogDismissLabels().slice(),
             job51JobIdFromValue: (value) => tools.job51JobIdFromValue(value),
             job51JobIdentityUrl: (value) => tools.job51JobIdentityUrl(value),
             isJob51ListUrl: (value) => tools.isJob51ListUrl(value),
