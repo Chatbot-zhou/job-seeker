@@ -646,3 +646,23 @@ test('apply confirmation from the dialog step is not thrown away', () => {
   assert.match(source, /if \(tools\.applyDialogConfirmed\(dialogResult\)\)/);
   assert.match(source, /verification: `dialog:\$\{dialogResult\.mode \|\| 'confirmed'\}`/);
 });
+
+test('Zhaopin scrolls the job list, not the detail preview panel', () => {
+  // 列表页是左右分栏，右侧详情预览同样含职位链接且可滚动。日志实测早期实现选中了
+  // job-detail-modules__scroll（详情面板），滑动它不会加载出任何新岗位。
+  assert.match(source, /findListScrollContainer\(\) \{[\s\S]{0,1600}if \(!\/detail\|preview\/i\.test\(className\)\)/);
+  assert.match(source, /\.slice\(0, 60\)/);
+  // 取“包含职位链接最多”的容器：列表容器必然包含大量卡片
+  assert.match(source, /scores\.set\(node, \(scores\.get\(node\) \|\| 0\) \+ 1\)/);
+  assert.match(source, /if \(score > bestScore \|\| \(score === bestScore && node\.clientHeight > \(best \? best\.clientHeight : 0\)\)\)/);
+  // 不足以认定是列表容器时宁可整页滚动，也不要滑错面板
+  assert.match(source, /if \(bestScore < 3\) return null;/);
+  assert.match(source, /listLinks: this\.listScrollLinkCount/);
+  // 单次没出岗位不代表滑不动：同一轮内多试几次再判定耗尽
+  assert.match(source, /const maxAttempts = 3;/);
+  assert.match(source, /while \(attempts < maxAttempts && this\.listScrollRound < maxRounds\)/);
+  assert.match(source, /if \(attempts < maxAttempts\) await tools\.asyncSleep\(800\);/);
+  // 投递结果无法确认时要带上可见按钮文字，便于定位
+  assert.match(source, /actionTextSnapshot\(\)/);
+  assert.match(source, /actionButtons: actionSnapshot\.join\('\/'\) \|\| '\(无\)'/);
+});

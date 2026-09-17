@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.6
+// @version      2026.09.17.7
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.6',
+        scriptVersion: '2026.09.17.7',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -6766,6 +6766,7 @@
             this.listEmptyRetries = 0;
             this.listScrollRound = 0;
             this.listScrollTarget = '';
+            this.listScrollLinkCount = 0;
             this.lastScrollOutcome = 'idle';
             this.pageJobCountBefore = 0;
             this.pageJobCountAfter = 0;
@@ -7177,6 +7178,7 @@
                 });
                 return { success: true, state: 'confirmed', requestId: context.requestId };
             }
+            const actionSnapshot = this.actionTextSnapshot();
             await this.api.createAction('apply_delivery_unknown', {
                 idempotencyKey,
                 transactionState: 'unknown',
@@ -7185,8 +7187,9 @@
             await this.api.event('apply_delivery_unknown', `智联投递结果无法确认: ${job.title || ''}`, 'script', 'error', {
                 jobId: job.external_job_id || '',
                 url: job.url || '',
+                actionButtons: actionSnapshot.join('/') || '(无)',
             });
-            await this.api.control('pause', '投递按钮点击后未变为已投递').catch(() => null);
+            await this.api.control('pause', `投递按钮点击后未变为已投递（按钮=${actionSnapshot.join('/') || '无'}）`).catch(() => null);
             return {
                 success: false,
                 clicked: true,
@@ -8434,15 +8437,36 @@
         }
 
         findListScrollContainer() {
-            // 新版列表是懒加载：先找职位卡片所在的滚动容器，找不到就退化成整页滚动。
-            for (const anchor of this.listLinkAnchors().slice(0, 8)) {
+            // 智联列表页是左右分栏：右侧的职位详情预览同样含职位链接、同样可滚动。
+            // 早期只取“第一个可滚动祖先”，结果选中了 job-detail-modules__scroll（详情面板），
+            // 滑动它当然不会加载出新岗位。改为在所有候选里选“包含职位链接最多”的那个：
+            // 列表容器必然包含大量卡片，详情面板只有一两个。
+            const scores = new Map();
+            for (const anchor of this.listLinkAnchors().slice(0, 60)) {
                 let node = anchor.parentElement;
                 while (node && node !== document.body && node !== document.documentElement) {
-                    if (node.scrollHeight > node.clientHeight + 40) return node;
+                    if (node.scrollHeight > node.clientHeight + 40) {
+                        const className = String(node.className || '');
+                        if (!/detail|preview/i.test(className)) {
+                            scores.set(node, (scores.get(node) || 0) + 1);
+                        }
+                        break;
+                    }
                     node = node.parentElement;
                 }
             }
-            return null;
+            let best = null;
+            let bestScore = 0;
+            for (const [node, score] of scores) {
+                if (score > bestScore || (score === bestScore && node.clientHeight > (best ? best.clientHeight : 0))) {
+                    best = node;
+                    bestScore = score;
+                }
+            }
+            this.listScrollLinkCount = bestScore;
+            // 少于 3 个职位链接不足以认定是列表容器，宁可不滑也不要滑错面板。
+            if (bestScore < 3) return null;
+            return best;
         }
 
         dispatchListScroll(container, distance) {
@@ -8475,40 +8499,57 @@
             // 没有下一页按钮不代表岗位处理完了：先下滑把懒加载的卡片拉出来，
             // 滑不动了才交给 switchOrCooldown 去切岗位标签，最后才冷却。
             const maxRounds = Math.max(0, Math.min(20, Number(OPTIONS.searchResultScrollRounds) || 0));
-            if (this.listScrollRound >= maxRounds) {
-                this.lastScrollOutcome = 'scroll_round_limit';
-                return false;
-            }
-            const before = this.listIdentitySnapshot();
-            const container = this.findListScrollContainer();
-            this.listScrollTarget = container ? tools.elementBrief(container) : 'window';
-            const distance = Math.round((container ? container.clientHeight : window.innerHeight) * 0.9);
-            this.listScrollRound += 1;
-            this.dispatchListScroll(container, distance);
-            const deadline = Date.now() + 4000;
+            const maxAttempts = 3;
+            let attempts = 0;
             let fresh = new Set();
-            while (Date.now() < deadline) {
-                if (this.riskReason() || this.platformLimitReason()) break;
-                const current = this.listIdentitySnapshot();
-                fresh = new Set(Array.from(current).filter(key => !before.has(key)));
-                if (fresh.size > 0) break;
-                await tools.asyncSleep(400);
+            while (attempts < maxAttempts && this.listScrollRound < maxRounds) {
+                attempts += 1;
+                const before = this.listIdentitySnapshot();
+                const container = this.findListScrollContainer();
+                this.listScrollTarget = container ? tools.elementBrief(container) : 'window';
+                const distance = Math.round((container ? container.clientHeight : window.innerHeight) * 0.9);
+                this.listScrollRound += 1;
+                this.dispatchListScroll(container, distance);
+                const deadline = Date.now() + 4000;
+                while (Date.now() < deadline) {
+                    if (this.riskReason() || this.platformLimitReason()) break;
+                    const current = this.listIdentitySnapshot();
+                    fresh = new Set(Array.from(current).filter(key => !before.has(key)));
+                    if (fresh.size > 0) break;
+                    await tools.asyncSleep(400);
+                }
+                this.lastScrollOutcome = fresh.size > 0 ? 'jobs_loaded' : 'no_new_jobs';
+                await this.api.event('zhaopin_list_scroll', `智联岗位页滑动第 ${this.listScrollRound} 次: ${fresh.size > 0 ? `加载到 ${fresh.size} 个新岗位` : '没有新岗位'}`, 'script', 'info', {
+                    round: this.listScrollRound,
+                    attempt: attempts,
+                    maxRounds,
+                    target: this.listScrollTarget,
+                    listLinks: this.listScrollLinkCount,
+                    newJobs: fresh.size,
+                    outcome: this.lastScrollOutcome,
+                    seenJobs: before.size,
+                    urlIndex: this.urlIndex,
+                });
+                if (fresh.size > 0) {
+                    this.enqueueNewCandidates();
+                    return true;
+                }
+                // 懒加载偶尔会慢一拍，单次没出岗位不代表滑不动；多试几次再判定耗尽。
+                if (attempts < maxAttempts) await tools.asyncSleep(800);
             }
-            this.lastScrollOutcome = fresh.size > 0 ? 'jobs_loaded' : 'no_new_jobs';
-            await this.api.event('zhaopin_list_scroll', `智联岗位页滑动第 ${this.listScrollRound} 次: ${fresh.size > 0 ? `加载到 ${fresh.size} 个新岗位` : '没有新岗位'}`, 'script', 'info', {
-                round: this.listScrollRound,
-                maxRounds,
-                target: this.listScrollTarget,
-                newJobs: fresh.size,
-                outcome: this.lastScrollOutcome,
-                seenJobs: before.size,
-                urlIndex: this.urlIndex,
-            });
-            if (fresh.size > 0) {
-                this.enqueueNewCandidates();
-                return true;
-            }
+            if (this.listScrollRound >= maxRounds) this.lastScrollOutcome = 'scroll_round_limit';
             return false;
+        }
+
+        actionTextSnapshot() {
+            // 诊断用：投递结果无法确认时，把当前可见的动作按钮文字带出来，
+            // 便于判断是按钮文案变了、按钮被渲染掉了，还是投递弹窗没被识别。
+            const scope = this.detailActionRoot(document);
+            return Array.from((scope || document).querySelectorAll('button,a,[role="button"],[class*="btn"]'))
+                .filter(el => tools.isVisible(el) && !el.closest('[data-job-seeker-overlay="1"]'))
+                .map(el => tools.normalizedText(el))
+                .filter(Boolean)
+                .slice(0, 6);
         }
 
         async switchOrCooldown(reason) {
