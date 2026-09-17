@@ -1302,6 +1302,17 @@
             const total = Number(analysis.total_score || 0);
             return `学历专业 ${education} / 技术栈 ${skill} / 项目经验 ${experience} / 加权匹配度 ${total}`;
         },
+        scoreLine(analysis = {}) {
+            // 单行评分摘要：评分（分项）→ 推荐动作 | 判断原因（截断60字），替代原评分结果/判断原因/推荐动作三行日志
+            const education = Number(analysis.education_score || analysis.score_breakdown?.education || 0);
+            const skill = Number(analysis.skill_score || analysis.score_breakdown?.skill || 0);
+            const experience = Number(analysis.experience_score || analysis.score_breakdown?.experience || 0);
+            const total = Number(analysis.total_score || 0);
+            const action = this.platformActionLabel(analysis.platform_action || 'skip');
+            const reason = String(analysis.match_reason || '').slice(0, 60);
+            const line = `评分 ${total}（学历${education} 技术${skill} 经验${experience}）→ ${action}`;
+            return reason ? `${line} | ${reason}` : line;
+        },
         platformActionLabel(action = '') {
             return {
                 greet: '打招呼',
@@ -3856,7 +3867,7 @@
                 }
                 const distance = Math.max(420, Math.floor(window.innerHeight * 0.75));
                 setSearchAction(`低频滚动读取: ${keyword}`);
-                logger.add(`低频滚动读取搜索结果: ${keyword} (${round}/${OPTIONS.searchResultScrollRounds})`);
+                if (round === 1) logger.add(`滚动读取搜索结果中… (${keyword})`);
                 const tried = [];
                 for (const container of containers) {
                     const mode = scrollTargetMode(container);
@@ -5190,7 +5201,6 @@
                     title: jobInfo.title || '',
                     company: jobInfo.company || '',
                 });
-                logger.add(`正在给职位 [${jobInfo.title}] 发送打招呼消息`);
                 await api.event('greet_started', `准备打招呼: ${jobInfo.title}`, 'script', 'info', { title: jobInfo.title, score: jobInfo.score });
                 if (!jobInfo.addUrl && !jobInfo.chatUrl) {
                     await api.createAction('greet_unavailable', {
@@ -5433,9 +5443,7 @@
                         talked_reason: jobInfo.talked_reason || '',
                     });
                     const score = analysis.total_score;
-                    logger.add(`评分结果: ${tools.analysisScoreSummary(analysis)}`);
-                    if (analysis.match_reason) logger.add(`判断原因: ${analysis.match_reason}`);
-                    logger.add(`推荐动作: ${tools.platformActionLabel(analysis.platform_action || 'skip')}`);
+                    logger.add(tools.scoreLine(analysis));
                     await api.event('job_analysis_finished', `职位分析完成: ${jobInfo.title} / ${score}`, 'script', 'info', {
                         title: jobInfo.title,
                         company: jobInfo.company || '',
@@ -7062,7 +7070,6 @@
             const state = this.counterState();
             const remaining = state.nextAllowedAt - Date.now();
             if (remaining > 0) {
-                this.logger?.add(`智联投递随机间隔，等待 ${(remaining / 1000).toFixed(1)} 秒`);
                 await tools.asyncSleep(remaining);
             }
         }
@@ -7926,9 +7933,7 @@
             });
             const score = Number(analysis.total_score || 0);
             jobInfo.score = score;
-            this.logger?.add(`评分结果: ${tools.analysisScoreSummary(analysis)}`);
-            if (analysis.match_reason) this.logger?.add(`判断原因: ${analysis.match_reason}`);
-            this.logger?.add(`推荐动作: ${tools.platformActionLabel(analysis.platform_action || 'skip')}`);
+            this.logger?.add(tools.scoreLine(analysis));
             await this.api.event('job_analysis_finished', `智联职位分析完成: ${jobInfo.title} / ${score}`, 'script', 'info', {
                 title: jobInfo.title,
                 company: jobInfo.company || '',
