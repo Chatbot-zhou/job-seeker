@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.17.9
+// @version      2026.09.26.1
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -27,7 +27,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.09.17.9',
+        scriptVersion: '2026.09.26.1',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         resumeIndex: 0, // 第几份简历，从 0 开始递增
@@ -58,6 +58,7 @@
         zhaopinApplyDelayMaxSeconds: 10,
         zhaopinMaxApplicationsPerRun: 0,
         zhaopinMaxApplicationsPerDay: 0,
+        zhaopinVerificationWaitMinutes: 5, // 人机验证等待用户完成的最长时间，超时才暂停通道
         job51Enabled: true,
         job51JobUrls: ['https://we.51job.com/pc/search?keyword=算法工程师'],
         job51ResumeName: '',
@@ -1368,8 +1369,14 @@
             const text = this.normalizePlainText(value).replace(/\s+/g, '');
             // “验证码已发送”“短信已发送”这类也含“已发送”，但不是投递成功，先排除。
             if (/(验证码|短信|邮件|链接|二维码)已发送/.test(text)) return false;
+            // 人机验证/安全校验通过后的提示常带“恭喜”，与投递无关，先排除，
+            // 否则滑块验证刚完成时的 toast 会被误判成投递成功、记下一笔没发生的投递。
+            // 只在整句没有投递/简历语义时排除，避免误伤“验证后已投递”这类混合提示。
+            if (!/投递|申请|递交|简历/.test(text)
+                && /验证(成功|通过)|安全校验(成功|通过)|(已完成|完成了)验证|验证已完成/.test(text)) return false;
             // 只认带投递语义的整句，不单靠“已发送”三个字——聊天气泡之类也可能出现这三个字。
-            return /投递成功|申请成功|投递已完成|简历投递成功|已成功投递|投递已发送|简历已发送|已发送简历|已投递成功|已向对方发送|发送简历和打招呼语|恭喜/.test(text);
+            // “恭喜”不能单独命中：验证通过、活动奖励都爱用它，必须和投递/申请连在一起。
+            return /投递成功|申请成功|投递已完成|投递完成|简历投递成功|已成功投递|投递已发送|简历已发送|已发送简历|已投递成功|已向对方发送|发送简历和打招呼语|(?:恭喜|祝贺)[^。!！]{0,20}(?:投递|申请|递交|发送)/.test(text);
         },
         isApplyNotApplicableText(value) {
             // 平台明确告知该岗位不能在这里投递，例如前程无忧的
@@ -1404,10 +1411,11 @@
             if (result.confirmed === true) return true;
             return String(result.mode || '') === 'success_dialog';
         },
-        compactDialogs(dialogs = [], maxChars = 600) {
+        compactDialogs(dialogs = [], maxChars = 900) {
             // simpleDialogs() 的选择器会命中覆盖整页的 wrapper（class 里带 dialog/modal），
             // 这种容器的文字包含整个页面：搜索筛选项会被当成“问卷输入项”而误报需要人工处理，
             // 成功提示的签名也会变成整页文本。这里按文字长度筛掉并优先取最内层的那个弹窗。
+            // 上限放宽到 900：智联成功提示会把用户招呼语整段带出来，600 可能截掉真实弹窗。
             return dialogs
                 .map(node => ({ node, length: this.normalizedText(node).length }))
                 .filter(item => item.length > 0 && item.length <= maxChars)
@@ -1422,31 +1430,37 @@
                 .filter(el => this.isVisible(el) && !this.isDisabled(el));
             const byLabel = buttons.find(node => labels.includes(this.normalizePlainText(node.innerText || node.textContent)));
             if (byLabel) return byLabel;
+            // 部分成功提示只有右上角一个图标按钮（× / ✕），没有文字标签，也要能点掉。
+            const symbol = buttons.find(node => /^[×✕xX]$/.test(this.normalizePlainText(node.innerText || node.textContent)));
+            if (symbol) return symbol;
             return dialog.querySelector('[class*="close"],[aria-label*="关闭"],[title*="关闭"]');
         },
         pendingApplySuccessNotices() {
             // 成功提示不一定是 role=dialog，也可能是 toast/message 节点。
-            // 统一在“文字命中 + 足够小（最内层）”的元素里找，找不到就返回空数组。
+            // 统一在“文字命中 + 足够小（最内层）”的元素里找；toast 和 dialog 可能同时存在，全部返回。
             if (typeof document === 'undefined') return [];
             const selector = '[role="dialog"],[aria-modal="true"],[class*="modal"],[class*="dialog"],[class*="popup"],'
                 + '[class*="toast"],[class*="message"],[class*="notice"],[class*="alert"],[class*="tip"]';
             const candidates = Array.from(document.querySelectorAll(selector))
                 .filter(node => this.isVisible(node) && !node.closest('[data-job-seeker-overlay="1"]'));
-            const notice = this.compactDialogs(candidates).find(node => this.isApplySuccessDialog(node));
-            return notice ? [notice] : [];
+            return this.compactDialogs(candidates).filter(node => this.isApplySuccessDialog(node));
         },
         dismissApplySuccessDialog(dialogs = [], seen = null) {
             // 弹窗可能在确认窗口结束之后才出现，投递结果轮询期间也要顺手关掉，否则读不到按钮状态。
-            const dialog = this.compactDialogs(dialogs).find(node => this.isApplySuccessDialog(node));
-            if (!dialog) return null;
-            const signature = this.applyDialogSignature(dialog);
-            if (seen) {
-                if (seen.has(signature)) return null;
-                seen.add(signature);
+            // 成功提示可能叠多层（toast + dialog），每层都要关；seen 防止对同一层重复点。
+            let lastSettled = null;
+            for (const dialog of this.compactDialogs(dialogs)) {
+                if (!this.isApplySuccessDialog(dialog)) continue;
+                const signature = this.applyDialogSignature(dialog);
+                if (seen) {
+                    if (seen.has(signature)) continue;
+                    seen.add(signature);
+                }
+                const control = this.findDialogDismissControl(dialog);
+                if (control) this.clickLikeUser(control);
+                lastSettled = { dismissed: Boolean(control), signature };
             }
-            const control = this.findDialogDismissControl(dialog);
-            if (control) this.clickLikeUser(control);
-            return { dismissed: Boolean(control), signature };
+            return lastSettled;
         },
         applyDialogSignature(dialog, labels = []) {
             // 用于诊断：把弹窗文字、按钮和输入项压缩成一行，无法识别时能直接看到真实 DOM 文案。
@@ -1691,6 +1705,18 @@
                 'please complete verification',
                 'please log in',
                 'captcha verification',
+            ];
+            return patterns.find(pattern => content.includes(pattern)) || '';
+        },
+        detectVerificationInterruptionText(text) {
+            // 人机验证（滑块/验证码）和登录失效不同：用户在页面上完成后即可继续，
+            // 值得等待而不是直接暂停通道。这里只认验证类关键词，登录类要保持暂停逻辑。
+            const content = String(text || '').replace(/\s+/g, ' ').toLowerCase();
+            const patterns = [
+                '安全验证', '安全校验', '人机验证', '人机校验', '机器验证',
+                '拖动滑块', '滑块拼图', '滑动验证', '向右滑动', '按住滑块', '完成滑块',
+                '图形验证', '请输入验证码', '完成验证码', '请完成验证', '验证码',
+                'captcha', 'slider verification',
             ];
             return patterns.find(pattern => content.includes(pattern)) || '';
         },
@@ -6745,6 +6771,7 @@
                 APPLY: 'zhaopin-apply',
                 APPLY_RESULT: 'zhaopin-apply-result',
                 CLOSE: 'zhaopin-close-detail',
+                VERIFY_WAIT: 'zhaopin-verify-wait',
             };
             this.contextKey = '__job_seeker_zhaopin_detail_context';
             this.leaseKey = '__job_seeker_zhaopin_list_lease';
@@ -6786,6 +6813,7 @@
             this.heartbeatTimer = null;
             this.logger = null;
             this.broadcast = null;
+            this.isDetailInstance = false;
         }
 
         safeJson(key, fallback = {}) {
@@ -7111,13 +7139,28 @@
             const risk = this.riskReason();
             const limit = this.platformLimitReason();
             if (risk || limit) {
-                return {
-                    success: false,
-                    pauseRequired: true,
-                    failureKind: limit ? 'platform_limit' : 'manual_intervention',
-                    reason: risk || limit,
-                    requestId: context.requestId,
-                };
+                if (risk && !limit && this.verificationInterruptionReason(risk)) {
+                    // 详情窗口被人机验证挡住：等用户完成后继续本次投递，而不是直接按失败暂停。
+                    const wait = await this.waitVerificationCleared(risk);
+                    if (wait.outcome !== 'cleared') {
+                        return {
+                            success: false,
+                            pauseRequired: true,
+                            failureKind: 'manual_intervention',
+                            verificationWaitTimedOut: true,
+                            reason: `智联人机验证未在等待时间内完成: ${risk}`,
+                            requestId: context.requestId,
+                        };
+                    }
+                } else {
+                    return {
+                        success: false,
+                        pauseRequired: true,
+                        failureKind: limit ? 'platform_limit' : 'manual_intervention',
+                        reason: risk || limit,
+                        requestId: context.requestId,
+                    };
+                }
             }
             const alreadyButton = this.findActionButton('already_applied');
             if (alreadyButton) {
@@ -7175,7 +7218,7 @@
                     requestId: context.requestId,
                 };
             }
-            const deadline = Date.now() + 15000;
+            let deadline = Date.now() + 15000;
             const seenSuccessDialogs = new Set();
             let successDialogSeen = false;
             while (Date.now() < deadline) {
@@ -7202,6 +7245,25 @@
                 if (successDialogSeen) break;
                 const riskAfterClick = this.riskReason() || this.platformLimitReason();
                 if (riskAfterClick) {
+                    if (!this.platformLimitReason() && this.verificationInterruptionReason(riskAfterClick)) {
+                        // 点击投递后才弹出人机验证：等用户完成，之后平台通常会自行继续投递流程，
+                        // 所以这里重新拉长确认窗口继续观察按钮变化，而不是立刻按“结果无法确认”上报。
+                        const wait = await this.waitVerificationCleared(riskAfterClick);
+                        if (wait.outcome === 'cleared') {
+                            deadline = Date.now() + 15000;
+                            continue;
+                        }
+                        return {
+                            success: false,
+                            clicked: true,
+                            unknown: true,
+                            pauseRequired: true,
+                            preservePage: true,
+                            verificationWaitTimedOut: true,
+                            reason: `智联投递后出现人机验证且未在等待时间内完成: ${riskAfterClick}`,
+                            requestId: context.requestId,
+                        };
+                    }
                     return {
                         success: false,
                         clicked: true,
@@ -7266,6 +7328,7 @@
         }
 
         async runDetail() {
+            this.isDetailInstance = true;
             this.setupBroadcast(this.targets.detail);
             const context = this.detailContext();
             if (!context.requestId) {
@@ -7304,6 +7367,7 @@
             try {
                 let jobInfo = null;
                 let lastError = null;
+                let verificationWaitTimedOut = false;
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     try {
                         const risk = this.riskReason();
@@ -7313,6 +7377,16 @@
                         break;
                     } catch (error) {
                         lastError = error;
+                        // 详情窗口被人机验证挡住时，等用户完成验证后继续重试读取，
+                        // 而不是直接把“需要人工处理”抛回列表侧暂停整个通道。
+                        // 等待已超时过一次（用户不在场）就不再重复等满 3 轮。
+                        const verificationRisk = this.riskReason();
+                        if (!verificationWaitTimedOut && verificationRisk && !this.platformLimitReason()
+                            && this.verificationInterruptionReason(verificationRisk)) {
+                            const wait = await this.waitVerificationCleared(verificationRisk);
+                            if (wait.outcome === 'cleared') continue;
+                            verificationWaitTimedOut = true;
+                        }
                         if (attempt < 3) await tools.asyncSleep(1200 * attempt);
                     }
                 }
@@ -7506,6 +7580,101 @@
             });
             await this.api.control('pause', reason).catch(() => null);
             await this.api.heartbeat('list', 'paused', reason, this.heartbeatDetail()).catch(() => null);
+        }
+
+        verificationInterruptionReason(value) {
+            return tools.detectVerificationInterruptionText(value);
+        }
+
+        showVerificationOverlay(reason, waitMs) {
+            // banner() 3 秒就消失，验证等待需要常驻提示，让用户知道要做什么、完成后会发生什么。
+            // 文案刻意避开 detectInterruptionText 的关键词（如“安全验证”“请完成验证”），
+            // 否则提示自己会被 riskReason() 扫到，验证永远等不到“已通过”。
+            const el = document.createElement('div');
+            el.setAttribute('data-job-seeker-overlay', '1');
+            el.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:2147483000;'
+                + 'background:rgba(20,20,20,.85);color:#fff;padding:10px 22px;border-radius:8px;'
+                + 'font-size:14px;line-height:1.6;max-width:70vw;text-align:center;';
+            el.innerText = `检测到智联的人机校验弹层，请在页面上把它完成，脚本会自动继续运行（最长等待 ${Math.max(1, Math.round(waitMs / 60000))} 分钟）`;
+            document.body.appendChild(el);
+            return { remove: () => el.remove() };
+        }
+
+        async waitVerificationCleared(reason) {
+            // 智联的滑块/验证码弹层脚本无法也不应该代替用户完成；但一出现就把通道暂停、
+            // 要求用户手动再点“开始”，连续性太差。这里改为：常驻提示 + 轮询等待，
+            // 验证消失后自动恢复；超过等待上限仍没完成才真正暂停。
+            const waitMs = Math.max(1, Number(OPTIONS.zhaopinVerificationWaitMinutes || 5)) * 60000;
+            const sourcePage = this.isDetailInstance ? 'detail' : 'list';
+            const overlay = this.showVerificationOverlay(reason, waitMs);
+            const startedAt = Date.now();
+            try {
+                if (this.isDetailInstance && this.broadcast) {
+                    // 详情窗口进入等待时，让列表侧把投递结果的等待窗口同步拉长，
+                    // 避免 45 秒先超时、把仍在等用户完成验证的投递记成“未收到确认”。
+                    await this.broadcast.send(this.targets.list, this.types.VERIFY_WAIT, {
+                        requestId: this.detailContext().requestId || '',
+                        waitMs: waitMs + 30000,
+                    }).catch(() => null);
+                }
+                await this.api.event('zhaopin_verification_wait_started', `检测到智联人机验证（${reason}），等待用户完成后自动继续`, 'script', 'warning', {
+                    reason,
+                    sourcePage,
+                    waitMs,
+                    jobId: this.currentJob?.externalJobId || '',
+                });
+                this.logger?.add(`检测到智联人机验证（${reason}），请在页面上完成，脚本会自动继续`);
+                const deadline = Date.now() + waitMs;
+                let lastListSyncAt = 0;
+                while (Date.now() < deadline) {
+                    await tools.asyncSleep(2000);
+                    if (!this.riskReason()) {
+                        const message = `智联人机验证已通过，自动恢复运行（${reason}）`;
+                        this.logger?.add(message);
+                        await this.api.event('zhaopin_verification_cleared', message, 'script', 'info', {
+                            reason,
+                            sourcePage,
+                            waitedMs: Date.now() - startedAt,
+                            jobId: this.currentJob?.externalJobId || '',
+                        });
+                        return { outcome: 'cleared' };
+                    }
+                    if (!this.isDetailInstance && Date.now() - lastListSyncAt >= 15000) {
+                        // 等待期间也要响应后端/用户面板的暂停与停止指令。
+                        lastListSyncAt = Date.now();
+                        await this.syncControl(`智联等待人机校验完成: ${reason}`).catch(() => null);
+                        if (this.pause) return { outcome: 'stopped' };
+                    }
+                }
+                await this.api.event('zhaopin_verification_wait_timeout', `智联人机验证等待超时（${Math.round(waitMs / 60000)} 分钟内未完成）: ${reason}`, 'script', 'error', {
+                    reason,
+                    sourcePage,
+                    waitMs,
+                    jobId: this.currentJob?.externalJobId || '',
+                });
+                return { outcome: 'timeout' };
+            } finally {
+                overlay.remove();
+            }
+        }
+
+        async pauseAfterInterruption(reason, type = 'zhaopin_platform_pause', preservePage = false, options = {}) {
+            // 验证类干扰：等待用户完成并自动恢复；登录失效、平台限额等其他干扰保持原暂停逻辑。
+            if (!options.skipWait && this.verificationInterruptionReason(reason)) {
+                const wait = await this.waitVerificationCleared(reason);
+                if (wait.outcome === 'cleared') {
+                    this.pause = false;
+                    this.running = true;
+                    this.logger?.setPaused(false);
+                    return { resumed: true };
+                }
+                if (wait.outcome === 'stopped') return { resumed: false };
+                // 等待上限内没有完成，说明用户不在场，按原逻辑暂停通道。
+                await this.pausePlatform(`智联人机验证未在等待时间内完成: ${reason}`, type, preservePage);
+                return { resumed: false };
+            }
+            await this.pausePlatform(reason, type, preservePage);
+            return { resumed: false };
         }
 
         currentConfiguredIndex() {
@@ -8119,6 +8288,20 @@
             });
         }
 
+        extendPending(type, requestId, totalMs = 0) {
+            // 详情窗口进入人机验证等待时会请求延长等待窗口，避免列表侧先超时、
+            // 把仍在等用户完成验证的投递记成“未收到确认”。pending 已结束则忽略。
+            const key = `${type}:${requestId}`;
+            const pending = this.pending.get(key);
+            if (!pending || !(Number(totalMs) > 0)) return false;
+            clearTimeout(pending.timer);
+            pending.timer = setTimeout(() => {
+                this.pending.delete(key);
+                pending.reject(new Error(`等待智联详情页响应超时: ${type}`));
+            }, Number(totalMs));
+            return true;
+        }
+
         resolvePending(type, data) {
             const key = `${type}:${data?.requestId || ''}`;
             const pending = this.pending.get(key);
@@ -8330,7 +8513,9 @@
                     await this.handleDetailCompatibilityFailure(lastFailureCode, reason, candidate);
                     return;
                 }
-                await this.pausePlatform(this.riskReason() || this.platformLimitReason() || reason, 'zhaopin_detail_failed');
+                // 人机验证类的干扰会先等待用户完成并自动恢复（resume 后 loop 继续调度），
+                // 登录失效等其他原因仍然直接暂停。
+                await this.pauseAfterInterruption(this.riskReason() || this.platformLimitReason() || reason, 'zhaopin_detail_failed');
                 return;
             }
             this.resetDetailCompatibilityFailures();
@@ -8483,7 +8668,13 @@
                 ? 'apply_delivery_unknown'
                 : (result.failureKind === 'platform_limit' ? 'platform_limit_pause'
                     : (result.failureKind === 'manual_intervention' ? 'manual_intervention_required' : 'zhaopin_apply_failed'));
-            await this.pausePlatform(result.reason || '智联投递失败', pauseEventType, Boolean(result.preservePage || result.clicked));
+            // 详情窗口里等待验证已超时的，列表侧直接暂停（skipWait），不要再等一轮。
+            await this.pauseAfterInterruption(
+                result.reason || '智联投递失败',
+                pauseEventType,
+                Boolean(result.preservePage || result.clicked),
+                { skipWait: Boolean(result.verificationWaitTimedOut) },
+            );
             if (!result.preservePage && !result.clicked) this.closeActiveDetail(jobInfo.requestId);
         }
 
@@ -8681,7 +8872,8 @@
                 const risk = this.riskReason();
                 const limit = this.platformLimitReason();
                 if (risk || limit) {
-                    await this.pausePlatform(risk || limit, risk ? 'manual_intervention_required' : 'platform_limit_pause');
+                    const handled = await this.pauseAfterInterruption(risk || limit, risk ? 'manual_intervention_required' : 'platform_limit_pause');
+                    if (handled.resumed && !this.pause) setTimeout(() => this.loop(), 0);
                     return;
                 }
                 if (this.queue.length === 0) {
@@ -8742,6 +8934,14 @@
             });
             this.broadcast.on(this.types.APPLY_RESULT, (from, data) => {
                 if (from === this.targets.detail) this.resolvePending(this.types.APPLY_RESULT, data || {});
+            });
+            this.broadcast.on(this.types.VERIFY_WAIT, (from, data) => {
+                if (from === this.targets.detail) {
+                    // 读详情和投递两个阶段都可能在详情窗口里等用户完成验证，
+                    // 两种 pending 都尝试延长；没有对应 pending 时 extendPending 自动忽略。
+                    this.extendPending(this.types.JOB_INFO, String(data?.requestId || ''), Number(data?.waitMs || 0));
+                    this.extendPending(this.types.APPLY_RESULT, String(data?.requestId || ''), Number(data?.waitMs || 0));
+                }
             });
             this.logger = new Logger(
                 async () => this.api.control('start', '用户在智联页面控制面板点击开始'),
@@ -10299,6 +10499,7 @@
             shouldCorrectListUrl: (currentIndex, savedUrlState, now) => tools.shouldCorrectListUrl(currentIndex, savedUrlState, now),
             isApplySuccessText: (value) => tools.isApplySuccessText(value),
             isApplyNotApplicableText: (value) => tools.isApplyNotApplicableText(value),
+            detectVerificationInterruptionText: (value) => tools.detectVerificationInterruptionText(value),
             applyDialogDismissLabels: () => tools.applyDialogDismissLabels().slice(),
             applyDialogStayLabels: () => tools.applyDialogStayLabels().slice(),
             job51JobIdFromValue: (value) => tools.job51JobIdFromValue(value),

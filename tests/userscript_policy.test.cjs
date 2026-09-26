@@ -626,7 +626,8 @@ test('Zhaopin scrolls for more jobs before switching source and cooling down', (
 test('apply dialogs are picked from the innermost node, not a page-wide wrapper', () => {
   // simpleDialogs() 的 [class*="dialog"] 会命中覆盖整页的 wrapper：文字里包含
   // 搜索筛选项，于是被当成“问卷输入项”误报，成功提示签名也变成整页文本。
-  assert.match(source, /compactDialogs\(dialogs = \[\], maxChars = 600\)/);
+  assert.match(source, /compactDialogs\(dialogs = \[\], maxChars = 900\)/);
+  // 900 的余量是给智联成功提示里整段招呼语的；整页 wrapper（数千字）仍会被筛掉
   assert.match(source, /\.filter\(item => item\.length > 0 && item\.length <= maxChars\)/);
   // 按文字长度升序 => 最内层的真弹窗排在最前面
   assert.match(source, /\.sort\(\(a, b\) => a\.length - b\.length\)/);
@@ -705,4 +706,45 @@ test('confirmation window also scans short-lived toasts, not only dialogs', () =
   const occurrences = source.split('const successNotice = tools.pendingApplySuccessNotices()[0] || null;').length - 1;
   assert.equal(occurrences, 2, String(occurrences));
   assert.match(source, /signature: tools\.applyDialogSignature\(successNotice\)/);
+});
+
+test('verification toasts and bare congratulations are not delivery success', () => {
+  // 人机验证通过后平台常弹「恭喜，验证成功」这类 toast；早期实现里裸的“恭喜”会命中
+  // 成功判定，滑块验证刚完成就被误判成投递成功、凭空记一笔投递。
+  assert.equal(hooks.isApplySuccessText('恭喜，验证成功'), false);
+  assert.equal(hooks.isApplySuccessText('验证通过'), false);
+  assert.equal(hooks.isApplySuccessText('安全校验通过'), false);
+  assert.equal(hooks.isApplySuccessText('恭喜！您已完成验证'), false);
+  // 带投递语义的整句仍然要认，包括“恭喜”和投递连在一起的正常成功提示。
+  assert.equal(hooks.isApplySuccessText('恭喜！简历已成功投递'), true);
+  assert.equal(hooks.isApplySuccessText('投递完成，请留意企业反馈'), true);
+  assert.equal(hooks.isApplySuccessText('恭喜，您的申请已成功发送'), true);
+});
+
+test('verification interruption classifier separates captcha from login', () => {
+  // 验证类干扰可以等用户完成后自动恢复；登录失效必须保持暂停，不能混为一谈。
+  assert.match(hooks.detectVerificationInterruptionText('拖动滑块完成拼图'), /拖动滑块/);
+  assert.match(hooks.detectVerificationInterruptionText('安全验证'), /安全验证/);
+  assert.match(hooks.detectVerificationInterruptionText('请完成验证后继续操作'), /请完成验证/);
+  assert.match(hooks.detectVerificationInterruptionText('请输入验证码'), /验证码/);
+  assert.equal(hooks.detectVerificationInterruptionText('登录状态已失效，请重新登录'), '');
+  assert.equal(hooks.detectVerificationInterruptionText('智联登录页面'), '');
+  assert.equal(hooks.detectVerificationInterruptionText(''), '');
+});
+
+test('zhaopin verification waits for the user and auto-resumes instead of hard pause', () => {
+  // 验证出现时不再直接 pausePlatform：常驻提示 + 轮询等待 + 自动恢复，超时才回落为暂停。
+  assert.match(source, /zhaopinVerificationWaitMinutes/);
+  assert.match(source, /async waitVerificationCleared\(reason\)/);
+  assert.match(source, /async pauseAfterInterruption\(reason/);
+  assert.match(source, /zhaopin_verification_wait_started/);
+  assert.match(source, /zhaopin_verification_cleared/);
+  assert.match(source, /zhaopin_verification_wait_timeout/);
+  assert.match(source, /VERIFY_WAIT: 'zhaopin-verify-wait'/);
+  assert.match(source, /extendPending\(type, requestId, totalMs = 0\)/);
+  assert.match(source, /verificationWaitTimedOut/);
+  // 常驻提示必须带 data-job-seeker-overlay 标记，避免被当成平台弹窗扫进风险面。
+  assert.match(source, /el\.setAttribute\('data-job-seeker-overlay', '1'\)/);
+  // 验证通过后循环要重新调度，而不是停在原地。
+  assert.match(source, /if \(handled\.resumed && !this\.pause\) setTimeout\(\(\) => this\.loop\(\), 0\);/);
 });
