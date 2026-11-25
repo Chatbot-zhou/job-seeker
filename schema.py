@@ -48,6 +48,25 @@ class ConfigUpdate(BaseModel):
     config: dict[str, Any]
 
 
+class ModelSelectRequest(BaseModel):
+    provider: str = Field(pattern="^(ollama|openai)$")
+    pause_running: bool = True
+
+
+class ModelTestRequest(BaseModel):
+    provider: str = Field(pattern="^(ollama|openai)$")
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProfileUpdate(BaseModel):
+    tags: list[str] = Field(default_factory=list)
+    user_detail: str = ""
+
+
+class SetupCompleteRequest(BaseModel):
+    completed: bool = True
+
+
 class ScriptHeartbeat(BaseModel):
     platform: str = Field(default="boss", pattern="^boss$")
     instance_id: str = ""

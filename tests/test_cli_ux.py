@@ -160,7 +160,7 @@ def test_autorun_openai_model_check_does_not_require_ollama(monkeypatch) -> None
                 **original,
                 "model_provider": "openai",
                 "openai_api_key": "test-key",
-                "think_model": "remote-model",
+                "cloud_model": "remote-model",
             }
         )
         monkeypatch.setattr(cli_console, "ensure_autorun_ollama_model", fail_ollama_check)
@@ -179,3 +179,77 @@ def test_autorun_openai_model_check_does_not_require_ollama(monkeypatch) -> None
         assert cli_console.model_ready_for_autorun() is True
     finally:
         Config.apply(original)
+
+
+def test_open_ui_page_once_opens_web_console(monkeypatch) -> None:
+    import cli_console
+
+    opened: list[str] = []
+    monkeypatch.setattr(cli_console, "should_open_browser_page", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cli_console.webbrowser, "open", lambda url, **kwargs: opened.append(url) or True)
+    monkeypatch.setattr(cli_console.runtime_state, "emit", lambda *args, **kwargs: {})
+
+    assert cli_console.open_ui_page_once() is True
+    assert opened == ["http://127.0.0.1:33333/ui/"]
+
+
+def test_run_ui_skips_blocking_cli_onboarding(monkeypatch) -> None:
+    import types
+
+    import cli_console
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli_console.database, "init_db", lambda: calls.append("db"))
+    monkeypatch.setattr(cli_console.cache, "load", lambda: calls.append("cache"))
+    monkeypatch.setattr(cli_console, "start_event_printer", lambda: calls.append("events"))
+    monkeypatch.setattr(cli_console, "apply_startup_platform_scope", lambda: calls.append("scope"))
+    monkeypatch.setattr(
+        cli_console,
+        "start_api_server",
+        lambda app: types.SimpleNamespace(should_exit=False),
+    )
+    monkeypatch.setattr(cli_console, "wait_for_api_ready", lambda: True)
+    monkeypatch.setattr(cli_console, "start_model_warmup_background", lambda: calls.append("warmup"))
+    monkeypatch.setattr(cli_console, "open_ui_page_once", lambda: calls.append("ui"))
+    monkeypatch.setattr(cli_console, "print_status_panel", lambda: None)
+    monkeypatch.setattr(cli_console, "run_initialization", lambda: calls.append("init"))
+    monkeypatch.setattr(cli_console.runtime_state, "emit", lambda *args, **kwargs: {})
+    monkeypatch.setattr(cli_console, "command_loop", lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: None)
+
+    cli_console.run_ui(object())
+
+    assert "init" not in calls
+    assert "ui" in calls
+    assert calls.index("db") < calls.index("warmup") < calls.index("ui")
+
+
+def test_run_ui_keeps_web_console_alive_when_terminal_input_closes(monkeypatch) -> None:
+    import types
+
+    import cli_console
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli_console.database, "init_db", lambda: None)
+    monkeypatch.setattr(cli_console.cache, "load", lambda: None)
+    monkeypatch.setattr(cli_console, "start_event_printer", lambda: None)
+    monkeypatch.setattr(cli_console, "apply_startup_platform_scope", lambda: None)
+    monkeypatch.setattr(
+        cli_console,
+        "start_api_server",
+        lambda app: types.SimpleNamespace(should_exit=False),
+    )
+    monkeypatch.setattr(cli_console, "wait_for_api_ready", lambda: True)
+    monkeypatch.setattr(cli_console, "start_model_warmup_background", lambda: None)
+    monkeypatch.setattr(cli_console, "open_ui_page_once", lambda: None)
+    monkeypatch.setattr(cli_console, "print_status_panel", lambda: None)
+    monkeypatch.setattr(cli_console.runtime_state, "emit", lambda *args, **kwargs: {})
+    monkeypatch.setattr(cli_console, "command_loop", lambda: (_ for _ in ()).throw(EOFError()))
+    monkeypatch.setattr(cli_console, "keep_process_alive", lambda: calls.append("keep"))
+    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: None)
+
+    cli_console.run_ui(object())
+
+    assert calls == ["keep"]

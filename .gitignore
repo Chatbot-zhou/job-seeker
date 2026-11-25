@@ -9,6 +9,7 @@ resume.md
 resume-lock.md
 data/
 .agents/
+.zcode/
 .codex/
 .claude/
 .venv/

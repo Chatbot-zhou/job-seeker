@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Seeker
 // @namespace    http://tampermonkey.net/
-// @version      2026.11.25.1
+// @version      2026.11.26.4
 // @description  Job Seeker 篡改猴插件
 // @author       Chatbot-Zhou
 // @match        https://www.zhipin.com/*
@@ -22,7 +22,7 @@
 
     // 配置项
     const OPTIONS = {
-        scriptVersion: '2026.11.25.1',
+        scriptVersion: '2026.11.26.4',
         greetMaxAttempts: 3,
         greetRetryDelays: [0, 3000, 8000],
         serverHost: 'http://127.0.0.1:33333', // 本地服务的主机地址
@@ -42,6 +42,7 @@
         searchLeaseMs: 12000,
         openCooldownMs: 45000,
         recentProcessedHours: 24,
+        greetingMode: 'boss_native', // boss_native: 只点击 BOSS 原生立即沟通；custom_only: 发送自定义话术
     };
 
     let backendOfflineNotified = false;
@@ -86,6 +87,7 @@
         if (Number.isFinite(Number(config.preferred_feed_max_jobs_per_tab))) {
             OPTIONS.preferredFeedMaxJobsPerTab = Math.max(0, Math.min(500, Number(config.preferred_feed_max_jobs_per_tab)));
         }
+        OPTIONS.greetingMode = config.greeting_mode === 'custom_only' ? 'custom_only' : 'boss_native';
     }
 
     // 元素选择器
@@ -1686,7 +1688,7 @@
                 page,
                 status,
                 current_action: tools.sanitizeTelemetryText(currentAction),
-                detail: tools.sanitizeTelemetryValue(detail),
+                detail: tools.sanitizeTelemetryValue({ version: OPTIONS.scriptVersion, ...detail }),
             })).catch(() => ({
                 control: 'paused',
                 should_pause: true,
@@ -4944,6 +4946,58 @@
                 }
                 try {
                     await tools.actionSleep();
+                    if (OPTIONS.greetingMode === 'boss_native') {
+                        if (!jobInfo.addUrl || tools.isChatUrl(jobInfo.addUrl)) {
+                            const reason = jobInfo.addUrl ? '原生打招呼入口已是聊天页' : '详情页没有 BOSS 原生打招呼入口';
+                            await api.createAction('greet_unavailable', {
+                                reason,
+                                source: jobInfo.source || 'detail',
+                                hasAddUrl: Boolean(jobInfo.addUrl),
+                                hasChatUrl: Boolean(jobInfo.chatUrl),
+                                mode: 'boss_native',
+                            }, jobInfo, 'completed');
+                            await api.event('greet_failed', `${reason}: ${jobInfo.title}`, 'script', 'warning', { title: jobInfo.title, source: jobInfo.source || 'detail', mode: 'boss_native' });
+                            finishJobProgress('缺少原生打招呼入口');
+                            if (await markPreferredFeedJobHandled('缺少原生打招呼入口')) return;
+                            setTimeout(loop, 0);
+                            return;
+                        }
+                        const entryResult = await addToChatList(jobInfo.addUrl);
+                        const redirectedChatUrl = tools.findChatUrlDeep(entryResult);
+                        if (redirectedChatUrl) jobInfo.chatUrl = redirectedChatUrl;
+                        tools.updateGreetTransaction(transactionRunId, href, 'confirmed', {
+                            title: jobInfo.title || '',
+                            company: jobInfo.company || '',
+                            mode: 'boss_native',
+                            native: true,
+                            confirmedAt: Date.now(),
+                        });
+                        await api.createAction('greet', {
+                            message: 'BOSS 原生打招呼',
+                            mode: 'boss_native',
+                            context: {
+                                native: true,
+                                chatUrl: jobInfo.chatUrl || '',
+                                reason: 'BOSS 原生“立即沟通”入口',
+                            },
+                        }, jobInfo, 'completed');
+                        const sessionGreetCount = tools.increaseSessionGreetCount();
+                        const dailyGreetCount = tools.increaseDailyGreetCount();
+                        setSearchAction('BOSS 原生打招呼成功');
+                        await api.heartbeat('search', 'running', 'BOSS 原生打招呼成功');
+                        await api.event('greet_native_finished', `BOSS 原生打招呼成功: ${jobInfo.title}，未发送自定义文本`, 'script', 'info', {
+                            title: jobInfo.title,
+                            company: jobInfo.company || '',
+                            chatUrl: jobInfo.chatUrl || '',
+                            sessionGreetCount,
+                            dailyGreetCount,
+                            mode: 'boss_native',
+                        });
+                        finishJobProgress('原生打招呼成功');
+                        if (await markPreferredFeedJobHandled('原生打招呼成功')) return;
+                        setTimeout(loop, 0);
+                        return;
+                    }
                     if (tools.isChatUrl(jobInfo.addUrl)) {
                         jobInfo.chatUrl = jobInfo.addUrl;
                         await api.event('greet_entry_skipped', '打招呼入口本身是聊天页，直接打开聊天页', 'script', 'info', { title: jobInfo.title, chatUrl: jobInfo.chatUrl });
@@ -4995,7 +5049,7 @@
                         await handleManualInterruption(tools.manualInterruptionReason(e), 'chat_greet');
                         return;
                     }
-                    if (jobInfo.chatUrl) {
+                    if (jobInfo.chatUrl && OPTIONS.greetingMode !== 'boss_native') {
                         logger.add(`入口请求失败，尝试直接打开聊天页: ${jobInfo.chatUrl}`);
                         await api.event('greet_entry_fallback', `入口请求失败，尝试直接打开聊天页: ${e}`, 'script', 'info', { title: jobInfo.title, chatUrl: jobInfo.chatUrl });
                         try {
@@ -5285,12 +5339,16 @@
                     // 获取自我介绍
                     setSearchAction('读取已确认打招呼用语');
                     this.introduce = await api.getIntroduce();
-                    if (!this.introduce) {
+                    if (!this.introduce && OPTIONS.greetingMode !== 'boss_native') {
                         logger.add('请先在 CLI 中生成并启用打招呼用语');
                         await api.heartbeat('search', 'error', '缺少已启用打招呼用语');
                         return;
                     }
-                    logger.add(`获取已确认打招呼用语成功，长度 ${this.introduce.length} 字`);
+                    if (this.introduce) {
+                        logger.add(`获取已确认打招呼用语成功，长度 ${this.introduce.length} 字`);
+                    } else {
+                        logger.add('BOSS 原生打招呼模式：不发送自定义话术');
+                    }
                     if (await preparePreferredFeeds()) {
                         if (currentJobSource === 'preferred_feed' && !this.pause && feedTabs.length) {
                             const hasFeedJobs = await nextPage();
@@ -5580,6 +5638,12 @@
                 };
             };
 
+            const readChatInputText = (inputEl) => {
+                if (!inputEl) return '';
+                if ('value' in inputEl) return String(inputEl.value || '').trim();
+                return String(inputEl.innerText || inputEl.textContent || '').trim();
+            };
+
             const waitForMessageSendConfirmed = async (text, inputEl, beforeSnapshot, timeout = 7000) => {
                 const expectedPrefix = String(text || '').trim().slice(0, 12);
                 const startedAt = Date.now();
@@ -5834,7 +5898,7 @@
                 return waitForMessageSendConfirmed(text, inputEl, beforeSnapshot, 5000);
             };
 
-            const sendMsg = (text, greetContext = {}) => {
+            const sendMsg = (text, greetContext = {}, options = {}) => {
                 return new Promise(async (resolve, reject) => {
                     try {
                         await confirmChatQuotaReminderIfPresent('before_send_message');
@@ -5842,11 +5906,27 @@
                         if (platformLimit) throw new Error(`平台次数限制: ${platformLimit}`);
                         const interruption = tools.detectManualInterruption();
                         if (interruption) throw new Error(`需要人工处理: ${interruption}`);
-                        if (!String(text || '').trim()) throw new Error('发送内容为空');
-                        await pageApi.event('message_send_started', '准备发送已确认的打招呼消息', 'script', 'info', { length: String(text).length });
+                        if (!options.usePrefilled && !String(text || '').trim()) throw new Error('发送内容为空');
+                        await pageApi.event('message_send_started', options.usePrefilled ? '准备发送 BOSS 预填招呼语' : '准备发送已确认的打招呼消息', 'script', 'info', {
+                            length: String(text || '').length,
+                            usePrefilled: Boolean(options.usePrefilled),
+                        });
                         const ipt = await findChatInput(greetContext);
-                        const actualText = tools.inputEditableText(ipt, text);
-                        if (!actualText || !actualText.includes(String(text).slice(0, 10))) {
+                        const actualText = options.usePrefilled
+                            ? readChatInputText(ipt)
+                            : tools.inputEditableText(ipt, text);
+                        if (options.usePrefilled) {
+                            if (!actualText) throw new Error('BOSS 预填内容为空');
+                            if (String(text || '').trim() && !actualText.includes(String(text).slice(0, 10))) {
+                                const error = new Error('BOSS 预填内容发生变化');
+                                error.detail = {
+                                    input: tools.elementBrief(ipt),
+                                    expectedLength: String(text).length,
+                                    actualLength: actualText.length,
+                                };
+                                throw error;
+                            }
+                        } else if (!actualText || !actualText.includes(String(text).slice(0, 10))) {
                             const error = new Error('输入框写入后内容校验失败');
                             error.detail = {
                                 input: tools.elementBrief(ipt),
@@ -5855,6 +5935,7 @@
                             };
                             throw error;
                         }
+                        const sentText = actualText;
                         await tools.actionSleep(600);
                         await confirmChatQuotaReminderIfPresent('before_send_button');
                         const limitBeforeButton = tools.detectPlatformLimit();
@@ -5868,16 +5949,17 @@
                             requestId: greetContext.requestId || '',
                             attempt: Number(greetContext.attempt || 1),
                             clickedAt: Date.now(),
+                            usePrefilled: Boolean(options.usePrefilled),
                         });
                         let confirmation;
                         if (btn && tools.isVisible(btn) && !tools.isDisabled(btn)) {
                             btn.click();
-                            confirmation = await waitForMessageSendConfirmed(text, ipt, beforeSnapshot);
+                            confirmation = await waitForMessageSendConfirmed(sentText, ipt, beforeSnapshot);
                         } else {
                             await pageApi.event('message_send_button_missing', '发送按钮不可用，尝试使用 Enter 发送', 'script', 'warning', {
                                 input: tools.elementBrief(ipt),
                             });
-                            confirmation = await trySendByEnter(ipt, text, beforeSnapshot);
+                            confirmation = await trySendByEnter(ipt, sentText, beforeSnapshot);
                         }
                         if (!confirmation.confirmed) {
                             tools.updateGreetTransaction(greetContext.transactionRunId, greetContext.url, 'unknown', {
@@ -5898,14 +5980,15 @@
                             requestId: greetContext.requestId || '',
                             attempt: Number(greetContext.attempt || 1),
                             confirmedAt: Date.now(),
+                            usePrefilled: Boolean(options.usePrefilled),
                         });
                         await pageApi.event('message_send_finished', '消息已点击发送', 'script', 'info', {
                             button: tools.elementBrief(btn),
                             input: tools.elementBrief(ipt),
-                            length: String(text).length,
+                            length: sentText.length,
                             confirmation,
                         });
-                        resolve();
+                        resolve(sentText);
                     } catch (e) {
                         await pageApi.event('message_send_failed', `消息发送失败: ${e}`, 'script', 'error', e.detail || {});
                         reject(e);
@@ -5913,7 +5996,7 @@
                 })
             };
 
-            const sendMsgWithRetries = async (text, greetContext = {}) => {
+            const sendMsgWithRetries = async (text, greetContext = {}, options = {}) => {
                 const maxAttempts = Math.max(1, Number(greetContext.maxAttempts || OPTIONS.greetMaxAttempts || 3));
                 let lastError = null;
                 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -5923,7 +6006,7 @@
                             attempt,
                             maxAttempts,
                         });
-                        await sendMsg(text, { ...greetContext, attempt });
+                        return await sendMsg(text, { ...greetContext, attempt }, options);
                         return;
                     } catch (e) {
                         lastError = e;
@@ -6009,10 +6092,13 @@
                     if (!introduce) throw new Error('未启用打招呼用语');
                     await tools.actionSleep();
                     ensureCurrentGreetRequest();
-                    await sendMsgWithRetries(introduce, claimedContext);
+                    // 只有 custom_only 会打开聊天页发送文本；BOSS 原生模式走 friend/add.json，不进入这里。
+                    const sentText = await sendMsgWithRetries(introduce, claimedContext);
+                    const deliveryMode = 'custom_only';
                     const greetContext = claimedContext || {};
                     await pageApi.createAction('greet', {
-                        message: introduce,
+                        message: sentText || introduce,
+                        mode: deliveryMode,
                         context: greetContext,
                     }, greetContext, 'completed');
                     const sessionGreetCount = tools.increaseSessionGreetCount();
@@ -6023,7 +6109,7 @@
                         `打招呼消息已发送，本轮计数 ${sessionGreetCount}，今日计数 ${dailyGreetCount}`,
                         'script',
                         'info',
-                        { sessionGreetCount, dailyGreetCount, runId: tools.getGreetSession().runId, requestId: greetRequestId, attempt: greetAttempt }
+                        { sessionGreetCount, dailyGreetCount, runId: tools.getGreetSession().runId, requestId: greetRequestId, attempt: greetAttempt, mode: deliveryMode }
                     );
                     heartbeatActive = false;
                     this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {

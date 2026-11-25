@@ -276,7 +276,7 @@ test('chat entry rejection pauses instead of falling back into an unusable chat 
   assert.equal(hooks.isChatEntryRejectedError('Error: BOSS 网络响应异常: 502'), false);
   assert.match(source, /greet_entry_rejected/);
   const rejectedBranch = source.indexOf('if (tools.isChatEntryRejectedError(e))');
-  const fallbackBranch = source.indexOf('if (jobInfo.chatUrl)', rejectedBranch);
+  const fallbackBranch = source.indexOf("if (jobInfo.chatUrl && OPTIONS.greetingMode !== 'boss_native')", rejectedBranch);
   const rejectedReturn = source.indexOf('return;', rejectedBranch);
   assert.ok(rejectedBranch >= 0 && rejectedReturn > rejectedBranch);
   assert.ok(fallbackBranch > rejectedReturn, 'entry rejection must return before chatUrl fallback');
@@ -317,4 +317,24 @@ test('backend shutdown pauses search loop instead of retrying forever', () => {
 test('background tabs remain non-active', () => {
   assert.match(source, /GM_openInTab/);
   assert.match(source, /active:\s*false/);
+});
+
+test('greeting defaults to BOSS native and only custom mode sends text', () => {
+  assert.match(source, /greetingMode:\s*'boss_native'/);
+  assert.match(source, /config\.greeting_mode === 'custom_only' \? 'custom_only' : 'boss_native'/);
+  assert.match(source, /OPTIONS\.greetingMode === 'boss_native'/);
+  assert.match(source, /addToChatList\(jobInfo\.addUrl\)/);
+  assert.match(source, /greet_native_finished/);
+  assert.match(source, /未发送自定义文本/);
+  assert.doesNotMatch(source, /greet_boss_auto_detected/);
+  assert.doesNotMatch(source, /greet_custom_fallback/);
+});
+
+test('native greeting never falls back to opening chat or sending text', () => {
+  assert.match(source, /if \(jobInfo\.chatUrl && OPTIONS\.greetingMode !== 'boss_native'\)/);
+  assert.match(source, /if \(!this\.introduce && OPTIONS\.greetingMode !== 'boss_native'\)/);
+  assert.match(source, /hasAddUrl/);
+  assert.match(source, /详情页没有 BOSS 原生打招呼入口/);
+  assert.doesNotMatch(source, /waitForAutoGreeting/);
+  assert.doesNotMatch(source, /greetingPlan/);
 });

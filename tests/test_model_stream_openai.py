@@ -57,7 +57,7 @@ def test_openai_model_not_found_does_not_trigger_thinking_fallback(monkeypatch) 
                 "model_provider": "openai",
                 "openai_api_key": "test-key",
                 "openai_api_base": "https://example.test/v1",
-                "think_model": "doubao-seed-test",
+                "cloud_model": "doubao-seed-test",
                 "external_model_profile": "doubao",
                 "disable_model_thinking": True,
             }
@@ -114,7 +114,7 @@ def test_openai_thinking_parameter_error_falls_back_once(monkeypatch) -> None:
                 "model_provider": "openai",
                 "openai_api_key": "test-key",
                 "openai_api_base": "https://example.test/v1",
-                "think_model": "doubao-seed-test",
+                "cloud_model": "doubao-seed-test",
                 "external_model_profile": "doubao",
                 "disable_model_thinking": True,
             }
@@ -167,7 +167,7 @@ def test_ollama_think_parameter_unsupported_is_cached(monkeypatch) -> None:
                 **original,
                 "model_provider": "ollama",
                 "ollama_host": "http://127.0.0.1:11434",
-                "think_model": "legacy-model",
+                "ollama_model": "legacy-model",
                 "disable_model_thinking": True,
             }
         )

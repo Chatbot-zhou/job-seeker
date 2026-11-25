@@ -9,8 +9,8 @@ if not exist "%~dp0scripts\start_job_seeker.ps1" (
     exit /b 1
 )
 
-echo [Job Seeker] Starting BOSS channel
-echo [Job Seeker] BOSS is opened and scheduled only when enabled in data\config.json.
+echo [Job Seeker] Starting BOSS channel and Web console
+echo [Job Seeker] The Web console will open; BOSS runs only when enabled in data\config.json.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_job_seeker.ps1" -Platform all
 set "EXIT_CODE=%ERRORLEVEL%"

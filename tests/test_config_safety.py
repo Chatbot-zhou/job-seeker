@@ -52,7 +52,7 @@ def test_volcengine_deepseek_model_overrides_saved_doubao_profile() -> None:
                 **original,
                 "model_provider": "openai",
                 "openai_api_base": "https://ark.cn-beijing.volces.com/api/v3",
-                "think_model": "deepseek-v3-2-251201",
+                "cloud_model": "deepseek-v3-2-251201",
                 "external_model_profile": "doubao",
             }
         )
@@ -71,3 +71,51 @@ def test_volcengine_model_error_hint_mentions_coding_plan_pair() -> None:
 
     assert "api/coding/v3" in hint
     assert "deepseek-v3.2" in hint
+
+
+def test_model_slots_derive_active_think_model() -> None:
+    from config import Config
+
+    original = Config.as_dict()
+    try:
+        Config.apply(
+            {
+                **original,
+                "ollama_model": "local-a",
+                "cloud_model": "cloud-a",
+                "model_provider": "ollama",
+                "think_model": "",
+            }
+        )
+        assert Config.think_model == "local-a"
+        assert Config.ollama_model == "local-a"
+        assert Config.cloud_model == "cloud-a"
+
+        Config.apply({**Config.as_dict(), "model_provider": "openai"})
+        assert Config.think_model == "cloud-a"
+        assert Config.ollama_model == "local-a"
+
+        Config.apply({**Config.as_dict(), "model_provider": "ollama"})
+        assert Config.think_model == "local-a"
+    finally:
+        Config.apply(original)
+
+
+def test_legacy_think_model_migrates_to_active_slot() -> None:
+    from config import DEFAULT_CONFIG, Config
+
+    original = Config.as_dict()
+    try:
+        Config.apply(
+            {
+                **DEFAULT_CONFIG,
+                "model_provider": "openai",
+                "think_model": "legacy-cloud-model",
+                "ollama_model": "",
+                "cloud_model": "",
+            }
+        )
+        assert Config.cloud_model == "legacy-cloud-model"
+        assert Config.think_model == "legacy-cloud-model"
+    finally:
+        Config.apply(original)

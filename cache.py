@@ -1,12 +1,83 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from config import BASE_DIR, Config, ensure_data_dirs
 from core import generate_tags, generate_user_detail
 from runtime_state import runtime_state
+
+
+_PROFILE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#._-]{1,30}")
+_PROFILE_COMMON_WORDS = {
+    "and", "the", "with", "for", "from", "using", "built", "data", "platform",
+    "workflow", "years", "experience", "skills", "projects", "education",
+    "location", "name", "role", "demo", "resume", "llm", "ai", "api", "http",
+    "https", "www", "com", "cn", "job", "seeker", "ms", "kb", "mb", "gb",
+}
+
+
+def profile_grounding_warnings(resume: str, user_detail: str) -> list[str]:
+    """Flag likely hallucinated facts in a generated profile.
+
+    This is a lightweight, deterministic guard, not a full fact checker. It
+    surfaces unsupported English tech tokens, years and education/project claims
+    so the Web wizard can ask the user to review before saving.
+    """
+    resume_text = str(resume or "")
+    detail = str(user_detail or "")
+    if not detail.strip():
+        return ["用户详情为空"]
+    resume_lower = resume_text.lower()
+    warnings: list[str] = []
+    unsupported: list[str] = []
+    for token in _PROFILE_TOKEN_RE.findall(detail):
+        normalized = token.lower().strip("._-")
+        if len(normalized) < 2 or normalized in _PROFILE_COMMON_WORDS:
+            continue
+        if normalized in resume_lower:
+            continue
+        if token not in unsupported:
+            unsupported.append(token)
+    if unsupported:
+        warnings.append("画像包含简历未提及的技术词：" + "、".join(unsupported[:8]))
+    years = sorted(set(re.findall(r"20\d{2}", detail)))
+    missing_years = [year for year in years if year not in resume_text]
+    if missing_years:
+        warnings.append("画像包含简历未提及的年份：" + "、".join(missing_years))
+    education_line = next(
+        (line for line in detail.splitlines() if line.strip().startswith("学历专业")),
+        "",
+    )
+    education_terms = ("本科", "硕士", "博士", "大专", "学历", "大学", "学院", "学校", "教育")
+    if (
+        "未提及" not in education_line
+        and not any(term in resume_text for term in education_terms)
+        and any(term in education_line for term in education_terms)
+    ):
+        warnings.append("简历未提及学历，画像中的学历信息可能是模型补充")
+    rank_terms = ("985", "211", "双一流", "普通院校", "QS前100", "QS前500", "海外普通")
+    unsupported_rank = [
+        term for term in rank_terms
+        if term in education_line and term not in resume_text
+    ]
+    if unsupported_rank:
+        warnings.append("画像包含简历未提及的院校层次：" + "、".join(unsupported_rank))
+    stage_terms = ("本科", "硕士", "博士", "大专")
+    unsupported_stage = [
+        term for term in stage_terms
+        if term in education_line and term not in resume_text
+    ]
+    if unsupported_stage:
+        warnings.append("画像包含简历未提及的学历阶段：" + "、".join(unsupported_stage))
+    project_indicators = ("项目", "做过", "经历", "平台", "project", "projects", "experience")
+    if not any(term in resume_lower for term in project_indicators):
+        project_line = detail.split("项目经验:", 1)[-1] if "项目经验:" in detail else ""
+        if project_line.strip() and "未提及" not in project_line:
+            warnings.append("简历未提及项目，画像中的项目经验可能是模型补充")
+    return warnings
 
 
 class CacheManager:

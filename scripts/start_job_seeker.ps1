@@ -147,26 +147,16 @@ function Open-StartupPages {
         [int]$Port,
         [string]$SelectedPlatform
     )
-    $targets = @($SelectedPlatform)
-    if ($SelectedPlatform -eq "all") {
-        $targets = @($script:enabledPlatforms)
-    }
-    if ($targets.Count -eq 0) {
-        Write-Warn "No platform is enabled in data\config.json; no jobs page was opened."
+    if ($NoOpen) {
         return
     }
-    foreach ($target in $targets) {
-        $url = Get-PlatformUrl $target $script:config
-        if (-not $url) {
-            continue
-        }
-        if (-not (Test-OpenCooldown "${target}_search")) {
-            Write-Warn "$target jobs page was opened recently; skipping duplicate open."
-            continue
-        }
-        Write-Info "Opening $target jobs page: $url"
-        Start-Process $url | Out-Null
+    $url = "http://127.0.0.1:${Port}/ui/"
+    if (-not (Test-OpenCooldown "web_ui")) {
+        Write-Warn "Web console was opened recently; skipping duplicate open."
+        return
     }
+    Write-Info "Opening Web console: $url"
+    Start-Process $url | Out-Null
 }
 
 Set-Location $ProjectRoot
@@ -275,7 +265,7 @@ if ($provider -eq "openai" -and -not $openaiKey) {
 Write-Info "Starting Job Seeker CLI..."
 $mainPy = Join-Path $ProjectRoot "main.py"
 $env:JOB_SEEKER_ENTRY_PLATFORM = $Platform
-& $pythonExe $mainPy
+& $pythonExe $mainPy ui
 $exitCode = $LASTEXITCODE
 
 if ($exitCode -ne 0) {

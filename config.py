@@ -28,8 +28,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "server_port": 33333,
     "model_provider": "ollama",
     "ollama_host": "http://127.0.0.1:11434",
+    "ollama_model": "qwen3:1.7b",
     "openai_api_base": "https://api.openai.com/v1",
     "openai_api_key": "",
+    "cloud_model": "gpt-4o-mini",
     "think_model": "qwen3:1.7b",
     "score_threshold": 70,
     "search_round_cooldown_min_minutes": 1,
@@ -57,6 +59,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "job_score_num_predict_think_off": -1,
     "job_score_num_predict_think_on": -1,
     "boss_enabled": True,
+    "greeting_mode": "boss_native",
+    "onboarding_completed": False,
     "model_max_concurrency": 1,
     "model_concurrency_profile": "",
     "auto_start_enabled": False,
@@ -203,8 +207,10 @@ class Config:
     server_port = DEFAULT_CONFIG["server_port"]
     model_provider = DEFAULT_CONFIG["model_provider"]
     ollama_host = DEFAULT_CONFIG["ollama_host"]
+    ollama_model = DEFAULT_CONFIG["ollama_model"]
     openai_api_base = DEFAULT_CONFIG["openai_api_base"]
     openai_api_key = DEFAULT_CONFIG["openai_api_key"]
+    cloud_model = DEFAULT_CONFIG["cloud_model"]
     think_model = DEFAULT_CONFIG["think_model"]
     score_threshold = DEFAULT_CONFIG["score_threshold"]
     search_round_cooldown_min_minutes = DEFAULT_CONFIG["search_round_cooldown_min_minutes"]
@@ -232,6 +238,8 @@ class Config:
     job_score_num_predict_think_off = DEFAULT_CONFIG["job_score_num_predict_think_off"]
     job_score_num_predict_think_on = DEFAULT_CONFIG["job_score_num_predict_think_on"]
     boss_enabled = DEFAULT_CONFIG["boss_enabled"]
+    greeting_mode = DEFAULT_CONFIG["greeting_mode"]
+    onboarding_completed = DEFAULT_CONFIG["onboarding_completed"]
     model_max_concurrency = DEFAULT_CONFIG["model_max_concurrency"]
     model_concurrency_profile = DEFAULT_CONFIG["model_concurrency_profile"]
     auto_start_enabled = DEFAULT_CONFIG["auto_start_enabled"]
@@ -257,6 +265,13 @@ class Config:
                     if any(key not in saved for key in DEFAULT_CONFIG):
                         should_rewrite = True
                     data.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
+                    # v7: split the single think_model into local/cloud slots.
+                    if "ollama_model" not in saved and "cloud_model" not in saved:
+                        legacy_model = str(saved.get("think_model") or "").strip()
+                        if saved.get("model_provider") == "openai":
+                            data["cloud_model"] = legacy_model or data["cloud_model"]
+                        else:
+                            data["ollama_model"] = legacy_model or data["ollama_model"]
             except json.JSONDecodeError as exc:
                 print(f"[警告] 配置文件损坏，已使用默认配置: {CONFIG_PATH} / {exc}", file=sys.stderr)
         cls.apply(data)
@@ -271,6 +286,18 @@ class Config:
             data["model_provider"] = "openai"
         if data.get("model_provider") not in {"ollama", "openai"}:
             data["model_provider"] = DEFAULT_CONFIG["model_provider"]
+        provider = data["model_provider"]
+        active_model = str(data.get("think_model") or "").strip()
+        ollama_model = str(data.get("ollama_model") or "").strip()
+        cloud_model = str(data.get("cloud_model") or "").strip()
+        if not ollama_model:
+            ollama_model = active_model if provider == "ollama" else DEFAULT_CONFIG["ollama_model"]
+        if not cloud_model:
+            cloud_model = active_model if provider == "openai" else DEFAULT_CONFIG["cloud_model"]
+        # think_model 是派生字段：有槽位时始终以槽位为准，避免旧值覆盖新模型。
+        data["ollama_model"] = ollama_model
+        data["cloud_model"] = cloud_model
+        data["think_model"] = ollama_model if provider == "ollama" else cloud_model
         if data.get("log_verbosity") not in {"compact", "normal", "debug"}:
             data["log_verbosity"] = DEFAULT_CONFIG["log_verbosity"]
         if data.get("preferred_feed_mode") not in {"all_custom_tabs", "off"}:
@@ -281,6 +308,15 @@ class Config:
         data["disable_model_thinking"] = _as_bool(data.get("disable_model_thinking"))
         data["show_model_reasoning"] = _as_bool(data.get("show_model_reasoning"))
         data["boss_enabled"] = _as_bool(data.get("boss_enabled"))
+        data["onboarding_completed"] = _as_bool(data.get("onboarding_completed"))
+        requested_greeting_mode = str(data.get("greeting_mode") or DEFAULT_CONFIG["greeting_mode"]).strip()
+        if requested_greeting_mode == "auto_first":
+            requested_greeting_mode = "boss_native"
+        data["greeting_mode"] = (
+            requested_greeting_mode
+            if requested_greeting_mode in {"boss_native", "custom_only"}
+            else DEFAULT_CONFIG["greeting_mode"]
+        )
         data["auto_start_enabled"] = _as_bool(data.get("auto_start_enabled"))
         data["auto_start_time"] = _as_hhmm(data.get("auto_start_time"), DEFAULT_CONFIG["auto_start_time"])
         data["search_round_cooldown_min_minutes"] = _as_int(
@@ -382,6 +418,11 @@ class Config:
     def save(cls, updates: dict[str, Any]) -> dict[str, Any]:
         ensure_data_dirs()
         updates = dict(updates)
+        if "think_model" in updates:
+            legacy_model = str(updates.pop("think_model") or "").strip()
+            target_provider = str(updates.get("model_provider") or cls.model_provider)
+            if legacy_model and "ollama_model" not in updates and "cloud_model" not in updates:
+                updates["ollama_model" if target_provider == "ollama" else "cloud_model"] = legacy_model
         current = cls.as_dict()
         current.update({k: v for k, v in updates.items() if k in DEFAULT_CONFIG})
         cls.apply(current)

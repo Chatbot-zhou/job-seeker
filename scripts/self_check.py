@@ -111,11 +111,25 @@ def check_userscript_version_sync() -> None:
     assert "window.scrollBy(" in script
     assert "jobIdentityUrl" in script
     assert "sanitizeTelemetryText" in script
+    assert "greetingMode" in script
+    assert "greet_native_finished" in script
+    assert "addToChatList" in script
+    assert "greet_boss_auto_detected" not in script
     assert "https://www.zhipin.com/*" in script
     assert "https://www.zhaopin.com/*" not in script
     assert "https://we.51job.com/*" not in script
     assert "job51ActionState" not in script
     assert "zhaopinActionState" not in script
+
+
+def check_ui_assets() -> None:
+    for name in ("ui/index.html", "ui/styles.css", "ui/app.js"):
+        path = ROOT / name
+        assert path.exists(), f"missing UI asset: {name}"
+        assert path.stat().st_size > 1000, f"UI asset looks empty: {name}"
+    index = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+    assert "/ui/app.js" in index
+    assert "/ui/styles.css" in index
 
 
 def check_diagnostic_redaction() -> None:
@@ -166,6 +180,7 @@ def main() -> int:
         check_privacy_detection,
         check_job_score_parser,
         check_userscript_version_sync,
+        check_ui_assets,
         check_diagnostic_redaction,
         check_gitignore_allows_tests,
         check_launcher_entries,

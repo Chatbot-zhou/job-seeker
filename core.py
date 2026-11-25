@@ -56,12 +56,18 @@ def _stream_chat(sys_prompt: str, prompt: str, options: dict[str, Any] | None = 
 
 
 def generate_tags(resume: str) -> list[str]:
-    """获取匹配标签"""
-    return [tag for tag in _stream_chat(
+    """获取匹配标签，最多 5 个并保持稳定顺序。"""
+    raw = _stream_chat(
         TAGS, redact_privacy(resume),
-        options={"num_predict": -1},  # 标签生成不限制令牌
+        options={"num_predict": -1, "temperature": 0.0, "top_p": 0.3},
         label="生成职位标签",
-    ).split(" ") if tag]
+    )
+    tags: list[str] = []
+    for item in raw.replace("\n", " ").split():
+        tag = item.strip(" \t，,、;；")
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags[:5]
 
 
 def getTags(resume: str) -> list[str]:
@@ -70,10 +76,10 @@ def getTags(resume: str) -> list[str]:
 
 
 def generate_user_detail(resume: str) -> str:
-    """提取用于岗位匹配的用户详情。"""
+    """提取用于岗位匹配的用户详情；低温度，要求严格依据简历原文。"""
     return _stream_chat(
         USER_DETAIL, redact_privacy(resume),
-        options={"num_predict": -1},  # 画像生成不限制令牌
+        options={"num_predict": -1, "temperature": 0.0, "top_p": 0.3},
         label="生成用户详情",
     )
 

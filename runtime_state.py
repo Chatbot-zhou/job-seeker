@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
@@ -17,6 +18,9 @@ from tools import now_iso, sanitize_log_value
 SCRIPT_STALE_SECONDS = 15
 SCRIPT_INSTANCE_RETENTION_SECONDS = 300
 PLATFORM_NAMES = ("boss",)
+_OLLAMA_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OLLAMA_STATUS_CACHE_LOCK = threading.Lock()
+_OLLAMA_STATUS_TTL_SECONDS = 10.0
 CONTROLLER_PAGE_KINDS = {
     "boss": ("search", "search_standby"),
 }
@@ -40,6 +44,33 @@ def _seconds_since(iso_time: str) -> int | None:
         return max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(iso_time)).total_seconds()))
     except (TypeError, ValueError):
         return None
+
+
+def probe_ollama_models(host: str, timeout: float = 2.0) -> dict[str, Any]:
+    """Probe an Ollama host independently of the currently active provider."""
+    url = str(host or Config.ollama_host).rstrip("/") + "/api/tags"
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            data = response.read().decode("utf-8", errors="ignore")
+        payload = json.loads(data)
+        models = [
+            item.get("name") or item.get("model")
+            for item in payload.get("models", [])
+            if isinstance(item, dict)
+        ]
+        return {
+            "available": True,
+            "host": str(host or Config.ollama_host),
+            "models": models,
+            "raw": data[:500],
+        }
+    except (json.JSONDecodeError, URLError, TimeoutError, OSError) as exc:
+        return {
+            "available": False,
+            "host": str(host or Config.ollama_host),
+            "models": [],
+            "error": str(exc),
+        }
 
 
 class RuntimeState:
@@ -549,33 +580,28 @@ class RuntimeState:
     def ollama_status(self) -> dict[str, Any]:
         if Config.model_provider == "openai":
             return self.external_model_status()
-        url = Config.ollama_host.rstrip("/") + "/api/tags"
-        try:
-            with urlopen(url, timeout=1.5) as response:
-                data = response.read().decode("utf-8", errors="ignore")
-            payload = json.loads(data)
-            models = [
-                item.get("name") or item.get("model")
-                for item in payload.get("models", [])
-                if isinstance(item, dict)
-            ]
-            return {
-                "available": True,
-                "provider": Config.model_provider,
-                "host": Config.ollama_host,
-                "model": Config.think_model,
-                "models": models,
-                "model_available": Config.think_model in models,
-                "raw": data[:500],
-            }
-        except (json.JSONDecodeError, URLError, TimeoutError, OSError) as exc:
-            return {
-                "available": False,
-                "provider": Config.model_provider,
-                "host": Config.ollama_host,
-                "model": Config.think_model,
-                "error": str(exc),
-            }
+        cache_key = f"{Config.ollama_host}|{Config.think_model}"
+        now = time.monotonic()
+        with _OLLAMA_STATUS_CACHE_LOCK:
+            cached = _OLLAMA_STATUS_CACHE.get(cache_key)
+            if cached and now - cached[0] < _OLLAMA_STATUS_TTL_SECONDS:
+                return dict(cached[1])
+        probe = probe_ollama_models(Config.ollama_host)
+        result = {
+            "available": bool(probe.get("available")),
+            "provider": Config.model_provider,
+            "host": Config.ollama_host,
+            "model": Config.think_model,
+            "models": probe.get("models") or [],
+            "model_available": Config.think_model in (probe.get("models") or []),
+        }
+        if probe.get("raw"):
+            result["raw"] = probe["raw"]
+        if probe.get("error"):
+            result["error"] = probe["error"]
+        with _OLLAMA_STATUS_CACHE_LOCK:
+            _OLLAMA_STATUS_CACHE[cache_key] = (now, dict(result))
+        return result
 
     def external_model_status(self) -> dict[str, Any]:
         result = {
@@ -608,6 +634,22 @@ class RuntimeState:
             result["error"] = str(exc)
             return result
 
+    def model_connection_status(self) -> dict[str, Any]:
+        """Non-blocking model status for high-frequency /status polling."""
+        with self._lock:
+            warmup = dict(self.model_warmup)
+        ready = warmup.get("status") == "ready"
+        return {
+            "available": ready,
+            "provider": Config.model_provider,
+            "host": Config.ollama_host if Config.model_provider == "ollama" else Config.openai_api_base,
+            "model": Config.think_model,
+            "models": [],
+            "model_available": ready,
+            "cached": True,
+            "warmup": warmup,
+        }
+
     def as_dict(self, resume_status: dict[str, Any], cache_status: dict[str, Any]) -> dict[str, Any]:
         model_thinking_disabled = bool(Config.disable_model_thinking)
         with self._lock:
@@ -631,13 +673,19 @@ class RuntimeState:
                 "control": control,
                 "last_error": last_error,
             },
-            "ollama": self.ollama_status(),
+            "ollama": self.model_connection_status(),
             "models": {
                 "provider": Config.model_provider,
+                "active_provider": Config.model_provider,
                 "model": Config.think_model,
-                "openai_api_base": Config.openai_api_base if Config.model_provider == "openai" else "",
+                "ollama_model": Config.ollama_model,
+                "cloud_model": Config.cloud_model,
+                "ollama_host": Config.ollama_host,
+                "openai_api_base": Config.openai_api_base,
                 "openai_api_key_configured": bool(str(Config.openai_api_key).strip()),
                 "openai_api_key_source": Config.public_dict().get("openai_api_key_source", ""),
+                "greeting_mode": Config.greeting_mode,
+                "onboarding_completed": bool(Config.onboarding_completed),
                 "disable_model_thinking": model_thinking_disabled,
                 "show_model_reasoning": bool(Config.show_model_reasoning),
                 "scoring_thinking": not model_thinking_disabled,
@@ -649,7 +697,7 @@ class RuntimeState:
                     "profile_tags": not model_thinking_disabled,
                     "greeting": not model_thinking_disabled,
                 },
-                "external_model_profile": Config.external_model_profile if Config.model_provider == "openai" else "",
+                "external_model_profile": Config.external_model_profile,
                 "parameters": {
                     "temperature": Config.model_temperature,
                     "top_p": Config.model_top_p,

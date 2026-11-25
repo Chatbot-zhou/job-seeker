@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Job Seeker · BOSS 控制台</title>
+    <link rel="stylesheet" href="/ui/styles.css?v=2026.11.26.12">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <a class="brand" href="#/dashboard" aria-label="Job Seeker 首页">
+                <span class="brand-mark">JS</span>
+                <span class="brand-text">
+                    <strong>Job Seeker</strong>
+                    <small>BOSS 求职助手</small>
+                </span>
+            </a>
+            <nav class="nav" id="main-nav">
+                <a class="nav-item" href="#/dashboard" data-route="dashboard">
+                    <span class="nav-icon" data-icon="dashboard"></span><span>概览</span>
+                </a>
+                <a class="nav-item" href="#/setup" data-route="setup">
+                    <span class="nav-icon" data-icon="wand"></span><span>首次配置</span>
+                </a>
+                <a class="nav-item" href="#/models" data-route="models">
+                    <span class="nav-icon" data-icon="cpu"></span><span>模型</span>
+                </a>
+                <a class="nav-item" href="#/greeting" data-route="greeting">
+                    <span class="nav-icon" data-icon="message"></span><span>招呼语</span>
+                </a>
+                <a class="nav-item" href="#/history" data-route="history">
+                    <span class="nav-icon" data-icon="history"></span><span>历史</span>
+                </a>
+                <a class="nav-item" href="#/logs" data-route="logs">
+                    <span class="nav-icon" data-icon="terminal"></span><span>日志</span>
+                </a>
+                <a class="nav-item" href="#/settings" data-route="settings">
+                    <span class="nav-icon" data-icon="settings"></span><span>设置</span>
+                </a>
+            </nav>
+            <div class="sidebar-foot">
+                <div class="local-badge"><span class="status-dot"></span>仅本机运行</div>
+                <small>BOSS 单通道 · v2026.11</small>
+            </div>
+        </aside>
+
+        <div class="main-column">
+            <header class="topbar">
+                <button class="icon-btn mobile-menu" id="menu-toggle" type="button" aria-label="打开菜单">
+                    <span data-icon="menu"></span>
+                </button>
+                <div class="page-heading">
+                    <h1 id="page-title">概览</h1>
+                    <p id="page-subtitle">查看运行状态并控制 BOSS 通道</p>
+                </div>
+                <div class="topbar-actions">
+                    <div class="model-switch" id="model-switch" aria-label="切换模型"></div>
+                    <div id="run-chip"></div>
+                    <button class="btn ghost small" id="open-boss-top" type="button">
+                        <span data-icon="external"></span>打开 BOSS
+                    </button>
+                    <button class="icon-btn" id="refresh-btn" type="button" aria-label="刷新状态">
+                        <span data-icon="refresh"></span>
+                    </button>
+                </div>
+            </header>
+
+            <main class="view" id="view">
+                <div class="loading-card">
+                    <div class="skeleton skeleton-title"></div>
+                    <div class="skeleton skeleton-line"></div>
+                    <div class="skeleton skeleton-line short"></div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <div class="toast-root" id="toast-root" aria-live="polite"></div>
+    <div class="modal-root" id="modal-root"></div>
+
+    <script src="/ui/app.js?v=2026.11.26.12" defer></script>
+</body>
+</html>

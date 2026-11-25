@@ -334,7 +334,12 @@ def print_config_preview(updates: dict[str, Any]) -> None:
     preview.update(updates)
     key_source = "环境变量" if os.environ.get("OPENAI_API_KEY") else ("配置文件" if preview.get("openai_api_key") else "未配置")
     print("\n[配置] 即将保存:")
-    print(f"- 模型: {preview.get('model_provider')} / {preview.get('think_model')}")
+    preview_model = (
+        preview.get("ollama_model")
+        if preview.get("model_provider") == "ollama"
+        else preview.get("cloud_model")
+    ) or preview.get("think_model")
+    print(f"- 模型: {preview.get('model_provider')} / {preview_model}")
     if preview.get("model_provider") == "openai":
         print(f"- OpenAI: {preview.get('openai_api_base')} / Key: {key_source}")
     else:
@@ -390,12 +395,20 @@ def configure_model_settings() -> None:
     if model_provider not in {"ollama", "openai"}:
         print("模型来源无效，已使用 ollama。")
         model_provider = "ollama"
+    model_updates = {
+        "ollama_model": str(current.get("ollama_model") or current["think_model"]),
+        "cloud_model": str(current.get("cloud_model") or "gpt-4o-mini"),
+    }
+    if model_provider == "ollama":
+        model_updates["ollama_model"] = ask("Ollama 模型名称", model_updates["ollama_model"])
+    else:
+        model_updates["cloud_model"] = ask("云端模型名称", model_updates["cloud_model"])
     updates = {
         "model_provider": model_provider,
         "ollama_host": ask("Ollama 地址", current["ollama_host"]),
         "openai_api_base": ask("OpenAI API 地址", current["openai_api_base"]),
         "openai_api_key": ask_api_key(str(current.get("openai_api_key", ""))) if model_provider == "openai" else current.get("openai_api_key", ""),
-        "think_model": ask("模型名称", current["think_model"]),
+        **model_updates,
         "disable_model_thinking": _ask_thinking(current),
         "external_model_profile": ask("OpenAI 模型类型 generic/qwen/deepseek/doubao", str(current.get("external_model_profile", "generic"))),
     }
@@ -886,7 +899,16 @@ def setup_quick_start() -> None:
         model_provider = "ollama"
     updates: dict[str, Any] = {
         "model_provider": model_provider,
-        "think_model": ask("模型名称", current["think_model"]),
+        "ollama_model": (
+            ask("Ollama 模型名称", str(current.get("ollama_model") or current["think_model"]))
+            if model_provider == "ollama"
+            else str(current.get("ollama_model") or current["think_model"])
+        ),
+        "cloud_model": (
+            ask("云端模型名称", str(current.get("cloud_model") or "gpt-4o-mini"))
+            if model_provider == "openai"
+            else str(current.get("cloud_model") or "gpt-4o-mini")
+        ),
         "score_threshold": ensure_range_int("最低匹配度阈值", int(current["score_threshold"]), 0, 100),
         "search_round_cooldown_min_minutes": ensure_range_int(
             "所有标签无新岗位后的最短搜索冷却分钟数",
@@ -1325,6 +1347,33 @@ def wait_for_api_ready(timeout_seconds: float = 20.0) -> bool:
         except (OSError, URLError):
             time.sleep(0.5)
     return False
+
+
+def ui_page_url() -> str:
+    host = str(Config.server_host or "127.0.0.1").strip()
+    if host in {"0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    return f"http://{host}:{Config.server_port}/ui/"
+
+
+def open_ui_page_once() -> bool:
+    url = ui_page_url()
+    if not should_open_browser_page("web_ui"):
+        print(f"[启动] Web 控制台: {url}（60 秒内已打开过，本次不重复打开）")
+        return False
+    try:
+        webbrowser.open(url, new=2)
+        runtime_state.emit(
+            "ui_page_opened",
+            f"已打开 Web 控制台: {url}",
+            source="startup",
+        )
+        print(f"[启动] Web 控制台: {url}")
+        return True
+    except Exception as exc:
+        print(f"[启动] 打开 Web 控制台失败: {exc}")
+        print(f"[启动] 请手动访问: {url}")
+        return False
 
 
 def show_startup_next_steps() -> None:
@@ -2033,7 +2082,7 @@ def ensure_autorun_ollama_model() -> bool:
     Config.save(
         {
             "model_provider": "ollama",
-            "think_model": DEFAULT_AUTORUN_OLLAMA_MODEL,
+            "ollama_model": DEFAULT_AUTORUN_OLLAMA_MODEL,
             "disable_model_thinking": True,
         }
     )
@@ -2248,6 +2297,37 @@ def run_cli(app, shutdown_callback: Callable[[], None] | None = None) -> None:
         command_loop()
     except KeyboardInterrupt:
         print("\n[退出] 正在关闭服务...")
+    finally:
+        server.should_exit = True
+        if shutdown_callback:
+            shutdown_callback()
+        print("[退出] 服务已关闭")
+
+
+def run_ui(app, shutdown_callback: Callable[[], None] | None = None) -> None:
+    """Web-first mode: start the API immediately and let /ui handle onboarding."""
+    database.init_db()
+    cache.load()
+    start_event_printer()
+    apply_startup_platform_scope()
+    runtime_state.emit("ui_start", "Job Seeker Web 控制台启动", source="startup")
+    server = start_api_server(app)
+    wait_for_api_ready()
+    start_model_warmup_background()
+    open_ui_page_once()
+    print_status_panel()
+    print(f"[启动] Web 控制台: {ui_page_url()}")
+    print("[启动] 终端可保留；输入 help 查看命令，quit 退出。")
+    try:
+        command_loop()
+    except KeyboardInterrupt:
+        print("\n[退出] 正在关闭服务...")
+    except EOFError:
+        print("\n[启动] 终端输入已关闭，Web 控制台继续运行；按 Ctrl+C 可停止服务。")
+        try:
+            keep_process_alive()
+        except KeyboardInterrupt:
+            print("\n[退出] 正在关闭服务...")
     finally:
         server.should_exit = True
         if shutdown_callback:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import asyncio
+import re
 import os
 import threading
 import time
@@ -19,6 +20,7 @@ try:
     from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, PlainTextResponse
+    from fastapi.staticfiles import StaticFiles
 except ModuleNotFoundError as exc:
     print("[错误] 缺少 Python 依赖，请先运行: pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(1) from exc
@@ -26,12 +28,12 @@ except ModuleNotFoundError as exc:
 import database
 import greeting_service
 import resume_service
-from cache import cache
+from cache import cache, profile_grounding_warnings
 from config import Config
 from core import SCORING_VERSION, analyze_job
 from model_queue import FairModelQueue, ModelQueueCancelled
 from model_stream import model_execution_snapshot, model_warmup_check
-from runtime_state import runtime_state
+from runtime_state import probe_ollama_models, runtime_state
 from schema import (
     ActionCreate,
     ActionDecision,
@@ -41,13 +43,19 @@ from schema import (
     GreetingGenerateRequest,
     GreetingUpdate,
     JobAnalyzeRequest,
+    ModelSelectRequest,
+    ModelTestRequest,
+    ProfileUpdate,
     ResumeUpdate,
     ScriptHeartbeat,
+    SetupCompleteRequest,
 )
 from tools import script_connect_hosts
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_SCRIPT_PATH = BASE_DIR / "web_script.js"
+UI_DIR = BASE_DIR / "ui"
+BOSS_SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
 USERSCRIPT_DEFINITIONS = {
     "boss": {
         "name": "Job Seeker - BOSS",
@@ -59,6 +67,7 @@ USERSCRIPT_DEFINITIONS = {
 }
 MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-model")
 MODEL_QUEUE = FairModelQueue(lambda: int(getattr(Config, "model_max_concurrency", 1)))
+MODEL_CONFIG_LOCK = threading.Lock()
 MODEL_EXECUTOR_SHUTDOWN = False
 ALLOW_REMOTE_API_ENV = "JOB_SEEKER_ALLOW_REMOTE"
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
@@ -75,6 +84,8 @@ RATE_LIMIT_LAST_CLEANUP = 0.0
 MODEL_SCORE_FAILURE_PAUSE_THRESHOLD = 3
 MODEL_SCORE_FAILURE_STREAK = 0
 MODEL_SCORE_FAILURE_LOCK = threading.Lock()
+VERSION_BLOCK_WARNED: set[tuple[str, str]] = set()
+VERSION_BLOCK_LOCK = threading.Lock()
 
 
 def shutdown_model_executor() -> None:
@@ -125,6 +136,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Job Seeker", version="2026.06-cli", lifespan=lifespan)
+if UI_DIR.exists():
+    app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
 
 
 def cors_origins() -> list[str]:
@@ -211,6 +224,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def expected_userscript_version() -> str:
+    try:
+        text = WEB_SCRIPT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"//\s*@version\s+(\S+)", text)
+    return match.group(1).strip() if match else ""
+
+
+def userscript_version_issue(platform: str = "boss") -> str:
+    snapshot = runtime_state.script_snapshot(platform)
+    if not snapshot.get("connected") and not snapshot.get("stale"):
+        return ""
+    detail = snapshot.get("detail") or {}
+    reported = str(detail.get("version") or "").strip()
+    expected = expected_userscript_version()
+    if not reported:
+        return "检测到未上报版本的油猴脚本，请更新脚本并刷新 BOSS 页面后再开始"
+    if expected and reported != expected:
+        return (
+            f"检测到旧版油猴脚本（{reported}），当前版本 {expected}。"
+            "请执行 script 更新脚本，并在 Tampermonkey 中确认后刷新 BOSS 页面。"
+        )
+    return ""
 
 
 def fail(message: str, status_code: int = 400) -> None:
@@ -422,6 +461,139 @@ async def save_config(payload: ConfigUpdate):
     return {"config": Config.public_dict()}
 
 
+MODEL_TEST_KEYS = {
+    "ollama_host",
+    "ollama_model",
+    "openai_api_base",
+    "openai_api_key",
+    "cloud_model",
+    "external_model_profile",
+    "disable_model_thinking",
+}
+
+
+def model_target_payload() -> dict[str, Any]:
+    return {
+        "provider": Config.model_provider,
+        "model": Config.think_model,
+        "ollama_model": Config.ollama_model,
+        "cloud_model": Config.cloud_model,
+        "ollama_host": Config.ollama_host,
+        "openai_api_base": Config.openai_api_base,
+        "openai_api_key_configured": bool(str(Config.openai_api_key).strip()),
+        "warmup": dict(runtime_state.model_warmup),
+    }
+
+
+@app.get("/model/ollama/models", summary="探测本机 Ollama 模型")
+async def model_ollama_models():
+    return await asyncio.to_thread(probe_ollama_models, Config.ollama_host)
+
+
+@app.post("/model/test", summary="测试模型连通性")
+async def model_test(payload: ModelTestRequest):
+    if runtime_state.control == "running" or int(MODEL_QUEUE.snapshot().get("active") or 0) > 0:
+        raise HTTPException(status_code=409, detail="正在运行或评分中，请先暂停后再测试模型")
+    if not MODEL_CONFIG_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="模型配置正在切换，请稍候")
+    previous = Config.as_dict()
+    previous_warmup = dict(runtime_state.model_warmup)
+    candidate = {
+        key: value
+        for key, value in payload.config.items()
+        if key in MODEL_TEST_KEYS
+        and not (key == "openai_api_key" and str(value).startswith("已配置"))
+    }
+    try:
+        Config.apply({**previous, **candidate, "model_provider": payload.provider})
+        warmup = await asyncio.to_thread(model_warmup_check)
+        return {
+            "ok": warmup.get("status") == "ready",
+            "warmup": warmup,
+            "target": {
+                "provider": Config.model_provider,
+                "model": Config.think_model,
+            },
+        }
+    finally:
+        Config.apply(previous)
+        runtime_state.model_warmup.clear()
+        runtime_state.model_warmup.update(previous_warmup)
+        MODEL_CONFIG_LOCK.release()
+
+
+@app.post("/model/select", summary="切换当前模型来源")
+async def model_select(payload: ModelSelectRequest):
+    if not MODEL_CONFIG_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="模型配置正在切换，请稍候")
+    previous = Config.as_dict()
+    was_running = (
+        runtime_state.control == "running"
+        and runtime_state.platform_control("boss") == "running"
+    )
+    paused_for_switch = False
+    resumed = False
+    try:
+        if payload.provider == Config.model_provider:
+            warmup = await asyncio.to_thread(model_warmup_check)
+            runtime_state.model_warmup.update(warmup)
+            return {
+                "config": Config.public_dict(),
+                "warmup": warmup,
+                "switched": False,
+            }
+        if was_running and not payload.pause_running:
+            raise HTTPException(status_code=409, detail="运行中切换模型需要先暂停 BOSS 通道")
+        if was_running:
+            runtime_state.set_platform_control("boss", "pause", "切换模型")
+            paused_for_switch = True
+            await MODEL_QUEUE.cancel_all("切换模型")
+            for _ in range(50):
+                snapshot = MODEL_QUEUE.snapshot()
+                if int(snapshot.get("active") or 0) == 0 and int(snapshot.get("queued") or 0) == 0:
+                    break
+                await asyncio.sleep(0.2)
+            else:
+                raise HTTPException(status_code=409, detail="当前仍有评分任务，请稍后再切换模型")
+        Config.save({"model_provider": payload.provider})
+        warmup = await asyncio.to_thread(model_warmup_check)
+        runtime_state.model_warmup.update(warmup)
+        if warmup.get("status") != "ready":
+            Config.save(previous)
+            runtime_state.update_model_warmup(
+                "unknown",
+                provider=Config.model_provider,
+                model=Config.think_model,
+                error=f"模型切换失败，已回滚: {warmup.get('error') or '连接检查失败'}",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"模型不可用，已保持原模型: {warmup.get('error') or '连接检查失败'}",
+            )
+        runtime_state.emit(
+            "model_switched",
+            f"模型已切换到 {Config.model_provider} / {Config.think_model}",
+            source="model",
+            detail={
+                "provider": Config.model_provider,
+                "model": Config.think_model,
+                "warmup": warmup,
+            },
+        )
+        if paused_for_switch:
+            runtime_state.set_platform_control("boss", "resume", "模型切换完成")
+            resumed = True
+        return {
+            "config": Config.public_dict(),
+            "warmup": warmup,
+            "switched": True,
+        }
+    finally:
+        if paused_for_switch and not resumed:
+            runtime_state.set_platform_control("boss", "resume", "模型切换结束")
+        MODEL_CONFIG_LOCK.release()
+
+
 @app.post("/reload-resume", summary="重新加载简历")
 async def reload_resume():
     cache.load()
@@ -485,7 +657,11 @@ async def put_resume(payload: ResumeUpdate):
 @app.post("/resume/profile/generate", summary="生成简历画像")
 async def generate_resume_profile():
     try:
-        return cache.generate_profile()
+        profile = cache.generate_profile()
+        return {
+            **profile,
+            "grounding_warnings": profile_grounding_warnings(cache.resume, profile.get("user_detail", "")),
+        }
     except Exception as exc:
         runtime_state.set_task("idle")
         fail(str(exc))
@@ -498,6 +674,29 @@ async def get_resume_profile():
         "tags": cache.tags,
         "user_detail": cache.user_detail,
         "status": cache.cache_status(),
+        "grounding_warnings": profile_grounding_warnings(cache.resume, cache.user_detail),
+    }
+
+
+@app.put("/resume/profile", summary="保存简历画像")
+async def put_resume_profile(payload: ProfileUpdate):
+    cache.load()
+    tags = [str(tag).strip() for tag in payload.tags if str(tag).strip()]
+    user_detail = str(payload.user_detail or "").strip()
+    if not tags and not user_detail:
+        fail("请至少提供岗位标签或用户详情")
+    try:
+        if tags:
+            cache.save_tags("\n".join(tags))
+        if user_detail:
+            cache.save_user_detail(user_detail)
+    except Exception as exc:
+        fail(str(exc))
+    return {
+        "tags": cache.tags,
+        "user_detail": cache.user_detail,
+        "status": cache.cache_status(),
+        "grounding_warnings": profile_grounding_warnings(cache.resume, cache.user_detail),
     }
 
 
@@ -533,6 +732,71 @@ async def greeting_variants():
         fail(str(exc))
 
 
+@app.get("/setup/status", summary="首次配置状态")
+async def setup_status():
+    cache.load()
+    greeting = greeting_service.get_greeting()
+    cache_status = cache.cache_status()
+    script = runtime_state.script_snapshot()
+    detail = script.get("detail") or {}
+    data_paths = (
+        Config.resume_name,
+        Config.profile_cache_name,
+        Config.greeting_cache_name,
+    )
+    has_existing_data = any(Path(path).exists() for path in data_paths) or int(
+        database.database_stats().get("job_count") or 0
+    ) > 0
+    tags = cache.tags
+    return {
+        "onboarding_completed": bool(Config.onboarding_completed),
+        "has_existing_data": has_existing_data,
+        "boss_enabled": bool(Config.boss_enabled),
+        "resume_saved": bool(cache.resume.strip()),
+        "resume_uploaded": bool(cache.status().get("uploaded")),
+        "profile_generated": bool(cache_status.get("profile_generated")),
+        "tags_count": len(tags),
+        "tags": tags,
+        "user_detail_saved": bool(cache.user_detail.strip()),
+        "greeting_confirmed": bool(greeting.get("confirmed")),
+        "greeting_mode": Config.greeting_mode,
+        "model": model_target_payload(),
+        "script": {
+            "connected": bool(script.get("connected")),
+            "stale": bool(script.get("stale")),
+            "page": script.get("page") or "",
+            "version": str(detail.get("version") or ""),
+        },
+        "boss_url": BOSS_SEARCH_URL,
+        "userscript_url": f"{script_base_url()}/userscripts/boss.user.js",
+        "setup_ready": bool(
+            cache.resume.strip()
+            and cache_status.get("profile_generated")
+            and tags
+            and (Config.greeting_mode == "boss_native" or bool(greeting.get("confirmed")))
+        ),
+    }
+
+
+@app.post("/setup/backup", summary="重新配置前备份现有数据")
+async def setup_backup():
+    from cli_console import create_backup
+
+    path = await asyncio.to_thread(create_backup)
+    return {"path": str(path)}
+
+
+@app.post("/setup/complete", summary="完成首次配置")
+async def setup_complete(payload: SetupCompleteRequest):
+    Config.save({"onboarding_completed": bool(payload.completed)})
+    runtime_state.emit(
+        "onboarding_completed",
+        "首次配置已完成" if payload.completed else "首次配置已重置",
+        source="config",
+    )
+    return {"config": Config.public_dict()}
+
+
 @app.post("/script/heartbeat", summary="脚本心跳")
 async def script_heartbeat(payload: ScriptHeartbeat):
     runtime_state.update_script(
@@ -547,6 +811,44 @@ async def script_heartbeat(payload: ScriptHeartbeat):
     if payload.status == "error":
         runtime_state.log(payload.current_action or "脚本上报错误", level="error", source="script")
     response = runtime_state.control_payload(payload.platform)
+    expected_version = expected_userscript_version()
+    reported_version = str(payload.detail.get("version") or "").strip()
+    page_kind = str(payload.page_kind or payload.page or "").strip().lower()
+    is_controller = page_kind in {"", "search", "search_standby"}
+    # 详情页/聊天页由控制器页面派生，通常不上报 version；只有明确上报旧版本时才拦截。
+    version_mismatch = bool(expected_version) and (
+        reported_version != expected_version if is_controller
+        else bool(reported_version and reported_version != expected_version)
+    )
+    if version_mismatch:
+        # 旧脚本即使在后端运行中重新连接，也只收到暂停指令，避免执行过时逻辑。
+        response.update(
+            {
+                "control": "paused",
+                "should_start": False,
+                "should_pause": True,
+                "should_stop": False,
+                "platform_control": "paused",
+                "message": f"油猴脚本版本不匹配（{reported_version or '未上报'}），请更新到 {expected_version} 并刷新 BOSS 页面",
+            }
+        )
+        warn_key = (payload.instance_id, reported_version)
+        with VERSION_BLOCK_LOCK:
+            should_warn = warn_key not in VERSION_BLOCK_WARNED
+            if should_warn:
+                VERSION_BLOCK_WARNED.add(warn_key)
+        if should_warn:
+            runtime_state.emit(
+                "userscript_version_blocked",
+                response["message"],
+                source="script",
+                level="warning",
+                detail={
+                    "reported_version": reported_version,
+                    "expected_version": expected_version,
+                    "instance_id": payload.instance_id,
+                },
+            )
     response.update(
         {
             "ok": True,
@@ -567,14 +869,17 @@ async def control(payload: ControlUpdate):
         cache.load()
         if not bool(getattr(Config, f"{platform}_enabled", True)):
             raise HTTPException(status_code=409, detail=f"{platform} 通道未启用")
+        version_issue = userscript_version_issue(platform)
+        if version_issue:
+            raise HTTPException(status_code=409, detail=version_issue)
         if not cache.user_detail.strip():
             raise HTTPException(status_code=409, detail="请先在 CLI 完成简历画像与用户详情配置")
         if platform == "boss":
             greeting = greeting_service.get_greeting()
             if not cache.tags:
                 raise HTTPException(status_code=409, detail="BOSS 岗位标签为空，请先完成标签配置")
-            if not greeting.get("confirmed"):
-                raise HTTPException(status_code=409, detail="BOSS 打招呼话术尚未确认")
+            if Config.greeting_mode != "boss_native" and not greeting.get("confirmed"):
+                raise HTTPException(status_code=409, detail="BOSS 自定义打招呼话术尚未确认")
         if runtime_state.control != "running":
             loop = asyncio.get_running_loop()
             warmup = await loop.run_in_executor(MODEL_EXECUTOR, model_warmup_check)
@@ -950,13 +1255,14 @@ def print_usage() -> None:
                 "",
                 "用法:",
                 "  python main.py              启动人工 CLI",
+                "  python main.py ui           启动 Web 控制台（推荐）",
                 "  python main.py serve        只启动本地 API 服务",
                 "  python main.py autorun      使用已保存配置自动运行",
                 "  python main.py --help       显示本帮助",
                 "",
                 "推荐入口:",
-                "  start_all.bat               启动 BOSS 通道",
-                "  start_boss.bat              只启动 BOSS",
+                "  start_all.bat               启动 BOSS 通道并打开 Web 控制台",
+                "  start_boss.bat              只启动 BOSS 并打开 Web 控制台",
             ]
         )
     )
@@ -974,8 +1280,10 @@ if __name__ == "__main__":
             "然后在网页面板控制运行。"
         )
         raise SystemExit(2)
-    from cli_console import run_autorun, run_cli
+    from cli_console import run_autorun, run_cli, run_ui
 
+    if len(sys.argv) > 1 and sys.argv[1] == "ui":
+        raise SystemExit(run_ui(app, shutdown_callback=shutdown_model_executor) or 0)
     if len(sys.argv) > 1 and sys.argv[1] == "autorun":
         raise SystemExit(run_autorun(app, shutdown_callback=shutdown_model_executor))
     if len(sys.argv) > 1:
