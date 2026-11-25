@@ -70,19 +70,59 @@ def save_greeting(content: str, name: str = "默认话术") -> dict[str, Any]:
     return _save(data)
 
 
-def _generate_greeting_raw(style: str, prompt: str, options: dict[str, Any], attempt: int) -> str:
+def _generate_greeting_raw(
+    style: str,
+    prompt: str,
+    options: dict[str, Any],
+    attempt: int,
+    system_prompt: str = GREETING,
+) -> str:
     """单次打招呼生成，返回提取后的文本。"""
     label = f"生成打招呼草稿: {style}" if attempt == 1 else f"生成打招呼草稿: {style} (重试{attempt})"
     raw = stream_ollama_chat(
         label,
         [
-            {"role": "system", "content": GREETING},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         model=Config.think_model,
         options=options,
     )
     return extract_llm_reply(raw).replace("\n", " ").strip()
+
+
+GREETING_MAX_CHARS = 80
+
+
+def _fit_greeting_length(
+    style: str,
+    content: str,
+    prompt: str,
+    options: dict[str, Any],
+) -> str:
+    """Enforce the 80-character limit with one strict rewrite, then a safe trim."""
+    if not content or len(content) <= GREETING_MAX_CHARS:
+        return content
+    strict_system = (
+        GREETING
+        + "\n\n# 长度修正（最高优先级）\n"
+        + f"上一条输出为 {len(content)} 字，超过 80 字硬限制。请只输出一条 60-80 字的全新消息，"
+        + "只保留一个项目和一个最关键成果，不要解释，不要换行。"
+    )
+    retry = _generate_greeting_raw(
+        style,
+        prompt,
+        {**options, "temperature": 0.2, "top_p": 0.3},
+        4,
+        system_prompt=strict_system,
+    )
+    if retry and len(retry) <= GREETING_MAX_CHARS:
+        return retry
+    cut = content[:GREETING_MAX_CHARS]
+    boundary = max(
+        cut.rfind(mark) for mark in ("。", "！", "？", "；", "，")
+    )
+    return cut[: boundary + 1].strip() if boundary >= 30 else cut.strip()
 
 
 def generate_greeting(style: str = "default") -> dict[str, Any]:
@@ -108,6 +148,7 @@ def generate_greeting(style: str = "default") -> dict[str, Any]:
         # 第 1 次：遵循当前全局思考策略。
         content = _generate_greeting_raw(style, prompt, base_options, 1)
         if content:
+            content = _fit_greeting_length(style, content, prompt, base_options)
             runtime_state.log(f"已生成打招呼草稿: {style}")
             return {
                 "style": style,
@@ -121,6 +162,7 @@ def generate_greeting(style: str = "default") -> dict[str, Any]:
         options_2 = dict(base_options, temperature=0.6)
         content = _generate_greeting_raw(style, prompt, options_2, 2)
         if content:
+            content = _fit_greeting_length(style, content, prompt, options_2)
             runtime_state.log(f"已生成打招呼草稿: {style}")
             return {
                 "style": style,
@@ -137,6 +179,8 @@ def generate_greeting(style: str = "default") -> dict[str, Any]:
             runtime_state.log("打招呼第2次仍无输出，第3次重试（调高温度+top_p）…", source="model")
             options_3 = dict(base_options, temperature=0.7, top_p=0.9)
         content = _generate_greeting_raw(style, prompt, options_3, 3)
+        if content:
+            content = _fit_greeting_length(style, content, prompt, options_3)
         runtime_state.log(f"已生成打招呼草稿: {style}")
         return {
             "style": style,

@@ -31,6 +31,7 @@ def profile_grounding_warnings(resume: str, user_detail: str) -> list[str]:
     if not detail.strip():
         return ["用户详情为空"]
     resume_lower = resume_text.lower()
+    resume_compact = re.sub(r"\s+", "", resume_lower)
     warnings: list[str] = []
     unsupported: list[str] = []
     for token in _PROFILE_TOKEN_RE.findall(detail):
@@ -38,6 +39,14 @@ def profile_grounding_warnings(resume: str, user_detail: str) -> list[str]:
         if len(normalized) < 2 or normalized in _PROFILE_COMMON_WORDS:
             continue
         if normalized in resume_lower:
+            continue
+        # 简历 PDF 提取常把 "Qwen3-VL" 这类长词按行拆开；去掉空白后仍应视为原文出现。
+        if normalized.replace(" ", "") in resume_compact:
+            continue
+        # 项目成果里的 "6161 passed / 3 failed" 可能被提取成 "passed+3"；
+        # 只要拆分后的每个词都能在简历中找到，就不算未提及的技术词。
+        parts = [part for part in re.split(r"[+/]", normalized) if len(part) >= 2]
+        if parts and all(part in resume_lower for part in parts):
             continue
         if token not in unsupported:
             unsupported.append(token)
