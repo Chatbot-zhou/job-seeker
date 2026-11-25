@@ -24,7 +24,7 @@ class FairModelQueue:
 
     The underlying executor keeps two workers so a diagnosed-capable device can
     use both.  This gate decides whether one or two jobs are allowed to enter it
-    and keeps BOSS/Zhaopin requests ordered by arrival time.
+    and keeps BOSS requests ordered by arrival time.
     """
 
     def __init__(self, limit_getter: Callable[[], int]) -> None:
@@ -66,7 +66,7 @@ class FairModelQueue:
                 ticket.future.set_result(None)
 
     async def acquire(self, platform: str) -> str:
-        platform = platform if platform in {"boss", "zhaopin", "job51"} else "boss"
+        platform = "boss"
         guard = self._ensure_guard()
         loop = asyncio.get_running_loop()
         ticket = _Ticket(

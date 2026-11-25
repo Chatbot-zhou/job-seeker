@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("all", "boss", "zhaopin", "job51")]
+    [ValidateSet("all", "boss")]
     [string]$Platform = "all",
     [switch]$NoOpen
 )
@@ -14,8 +14,6 @@ try {
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BossUrl = "https://www.zhipin.com/web/geek/jobs"
-$ZhaopinDefaultUrl = "https://www.zhaopin.com/recommend"
-$Job51DefaultUrl = "https://we.51job.com/pc/search"
 $OpenCooldownSeconds = 60
 
 function Write-Info {
@@ -141,19 +139,6 @@ function Get-PlatformUrl {
     if ($Name -eq "boss") {
         return $BossUrl
     }
-    $configured = Get-ConfigValue $Config "${Name}_job_urls" $null
-    if ($configured) {
-        $first = [string](@($configured)[0])
-        if ($first) {
-            return $first
-        }
-    }
-    if ($Name -eq "zhaopin") {
-        return $ZhaopinDefaultUrl
-    }
-    if ($Name -eq "job51") {
-        return $Job51DefaultUrl
-    }
     return $null
 }
 
@@ -239,7 +224,7 @@ $ollamaHost = [string](Get-ConfigValue $config "ollama_host" "http://127.0.0.1:1
 $openaiKey = [string](Get-ConfigValue $config "openai_api_key" "")
 
 $script:enabledPlatforms = @()
-foreach ($platformName in @("boss", "zhaopin", "job51")) {
+foreach ($platformName in @("boss")) {
     if (Test-ConfigFlag (Get-ConfigValue $config "${platformName}_enabled" $null) $true) {
         $script:enabledPlatforms += $platformName
     }

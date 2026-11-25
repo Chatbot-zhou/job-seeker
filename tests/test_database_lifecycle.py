@@ -83,17 +83,6 @@ def test_run_summary_uses_run_id(tmp_path, monkeypatch) -> None:
     )
     database.create_action(
         {
-            "action_type": "apply",
-            "status": "confirmed",
-            "job_url": "https://www.zhaopin.com/jobdetail/zhaopin-summary.htm",
-            "platform": "zhaopin",
-            "idempotency_key": "zhaopin-summary-apply",
-            "payload": {"transactionState": "confirmed"},
-            "run_id": "run-test",
-        }
-    )
-    database.create_action(
-        {
             "action_type": "greet_delivery_unknown",
             "status": "unknown",
             "job_url": "https://www.zhipin.com/job_detail/boss-unknown.html",
@@ -107,7 +96,6 @@ def test_run_summary_uses_run_id(tmp_path, monkeypatch) -> None:
     assert summary["event_count"] == 1
     assert summary["error_count"] == 1
     assert summary["greet_success"] == 1
-    assert summary["apply_success"] == 1
     assert summary["greet_unknown"] == 1
 
 
@@ -277,52 +265,6 @@ def test_reconcile_stale_runs_marks_only_abandoned_rows(tmp_path, monkeypatch) -
     assert result["run_ids"] == ["run-stale"]
     assert stale == ("interrupted", "interrupted", stale_time)
     assert current == ("running", "running", None)
-
-
-def test_reconcile_stale_clicked_application_marks_unknown_once(tmp_path, monkeypatch) -> None:
-    import database
-    from config import Config
-
-    db_path = tmp_path / "stale-application.db"
-    monkeypatch.setattr(Config, "app_db_name", str(db_path))
-    database._INITIALIZED_PATHS.clear()
-    database.init_db()
-    job_url = "https://www.zhaopin.com/jobdetail/stale.htm"
-    database.upsert_job(
-        {
-            "url": job_url,
-            "title": "算法工程师",
-            "company": "示例科技",
-            "platform": "zhaopin",
-            "application_state": "clicked",
-        }
-    )
-    action = database.create_action(
-        {
-            "action_type": "apply",
-            "status": "clicked",
-            "job_url": job_url,
-            "platform": "zhaopin",
-            "idempotency_key": "zhaopin:stale:apply",
-            "payload": {"transactionState": "clicked"},
-        }
-    )
-    stale_time = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE actions SET updated_at = ? WHERE id = ?", (stale_time, action["id"]))
-        conn.commit()
-
-    first = database.reconcile_stale_application_actions(stale_minutes=10)
-    second = database.reconcile_stale_application_actions(stale_minutes=10)
-
-    saved_action = database.get_action(action["id"])
-    saved_job = database.get_job(job_url)
-    assert first["action_ids"] == [action["id"]]
-    assert second["count"] == 0
-    assert saved_action and saved_action["status"] == "unknown"
-    assert saved_action["result"]["transactionState"] == "unknown"
-    assert saved_job and saved_job["application_state"] == "unknown"
-    assert saved_job["final_action"] == "apply_delivery_unknown"
 
 
 def test_new_run_gets_its_own_start_time(monkeypatch) -> None:

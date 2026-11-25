@@ -9,8 +9,8 @@ if not exist "%~dp0scripts\start_job_seeker.ps1" (
     exit /b 1
 )
 
-echo [Job Seeker] Starting all platforms: BOSS / Zhaopin / 51job
-echo [Job Seeker] Only platforms enabled in data\config.json are opened and scheduled.
+echo [Job Seeker] Starting BOSS channel
+echo [Job Seeker] BOSS is opened and scheduled only when enabled in data\config.json.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_job_seeker.ps1" -Platform all
 set "EXIT_CODE=%ERRORLEVEL%"

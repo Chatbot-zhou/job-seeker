@@ -31,7 +31,7 @@ from config import Config
 from core import SCORING_VERSION, analyze_job
 from model_queue import FairModelQueue, ModelQueueCancelled
 from model_stream import model_execution_snapshot, model_warmup_check
-from runtime_state import APPLY_PLATFORMS, runtime_state
+from runtime_state import runtime_state
 from schema import (
     ActionCreate,
     ActionDecision,
@@ -55,27 +55,6 @@ USERSCRIPT_DEFINITIONS = {
         "matches": ("https://www.zhipin.com/*",),
         "icon": "https://www.google.com/s2/favicons?sz=64&domain=zhipin.com",
         "path": "/userscripts/boss.user.js",
-    },
-    "zhaopin": {
-        "name": "Job Seeker - 智联招聘",
-        "description": "Job Seeker 智联招聘通道",
-        "matches": (
-            "https://www.zhaopin.com/*",
-            "https://sou.zhaopin.com/*",
-            "https://passport.zhaopin.com/*",
-        ),
-        "icon": "https://www.google.com/s2/favicons?sz=64&domain=zhaopin.com",
-        "path": "/userscripts/zhaopin.user.js",
-    },
-    "job51": {
-        "name": "Job Seeker - 前程无忧",
-        "description": "Job Seeker 前程无忧通道",
-        "matches": (
-            "https://we.51job.com/*",
-            "https://login.51job.com/*",
-        ),
-        "icon": "https://www.google.com/s2/favicons?sz=64&domain=51job.com",
-        "path": "/userscripts/job51.user.js",
     },
 }
 MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobseeker-model")
@@ -112,7 +91,6 @@ async def lifespan(app: FastAPI):
     database.init_db()
     migration = database.last_migration_result()
     stale_runs = database.reconcile_stale_runs(stale_minutes=10, exclude_run_id=runtime_state.run_id)
-    stale_applications = database.reconcile_stale_application_actions(stale_minutes=10)
     company_repair = database.repair_invalid_company_names()
     database.upsert_run(runtime_state.run_id, control=runtime_state.control, started_at=runtime_state.run_started_at)
     cleanup = database.prune_old_events(normal_days=7, important_days=30)
@@ -125,14 +103,6 @@ async def lifespan(app: FastAPI):
             f"已将 {stale_runs['count']} 个未正常结束的旧任务标记为 interrupted",
             source="database",
             detail={"count": stale_runs["count"], "stale_minutes": 10},
-        )
-    if stale_applications.get("count"):
-        runtime_state.emit(
-            "stale_application_reconciled",
-            f"已将 {stale_applications['count']} 条未完成投递标记为结果未知",
-            source="database",
-            level="warning",
-            detail=stale_applications,
         )
     if migration.get("compacted_events") or migration.get("sanitized_events"):
         runtime_state.emit(
@@ -403,16 +373,6 @@ async def web_script_user_js():
 @app.get("/userscripts/boss.user.js", summary="安装或更新 BOSS 篡改猴脚本")
 async def boss_userscript():
     return PlainTextResponse(render_userscript("boss"), media_type="application/javascript; charset=utf-8")
-
-
-@app.get("/userscripts/zhaopin.user.js", summary="安装或更新智联篡改猴脚本")
-async def zhaopin_userscript():
-    return PlainTextResponse(render_userscript("zhaopin"), media_type="application/javascript; charset=utf-8")
-
-
-@app.get("/userscripts/job51.user.js", summary="安装或更新前程无忧篡改猴脚本")
-async def job51_userscript():
-    return PlainTextResponse(render_userscript("job51"), media_type="application/javascript; charset=utf-8")
 
 
 @app.get("/status", summary="系统状态")
@@ -761,9 +721,7 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
             analysis["match_reason"] = "平台已暂停，评分结果已作废"
         else:
             analysis["platform_action"] = (
-                ("apply" if platform in APPLY_PLATFORMS else "greet")
-                if analysis.get("recommendation") == "greet"
-                else "skip"
+                "greet" if analysis.get("recommendation") == "greet" else "skip"
             )
     if "platform_action" not in analysis:
         analysis["platform_action"] = "skip"
@@ -792,12 +750,7 @@ async def jobs_analyze(payload: JobAnalyzeRequest):
             or (
                 existing_job
                 and str(existing_job.get("url") or "") == str(job.get("url") or "")
-                and (
-                    existing_job.get("applied")
-                    or existing_job.get("greeted")
-                    or str(existing_job.get("application_state") or "") in {"clicked", "unknown", "confirmed"}
-                    or recently_processed(existing_job)
-                )
+                and (existing_job.get("greeted") or recently_processed(existing_job))
             )
         )
     )
@@ -866,21 +819,6 @@ async def create_action(payload: ActionCreate):
         database.update_job_status(payload.job_url, final_action="greeted", greeted=True)
     if payload.action_type == "already_contacted" and payload.status in {"completed", "approved"}:
         database.update_job_status(payload.job_url, final_action="already_contacted", greeted=True)
-    if payload.platform in APPLY_PLATFORMS and payload.action_type in {"apply", "already_applied"}:
-        transaction_state = str(payload.payload.get("transactionState") or payload.payload.get("state") or "")
-        confirmed = payload.action_type == "already_applied" or transaction_state == "confirmed" or payload.status == "completed"
-        database.update_job_status(
-            payload.job_url,
-            final_action="already_applied" if payload.action_type == "already_applied" else ("applied" if confirmed else ""),
-            applied=True if confirmed else None,
-            application_state="confirmed" if confirmed else (transaction_state or payload.status),
-        )
-    if payload.platform in APPLY_PLATFORMS and payload.action_type == "apply_delivery_unknown":
-        database.update_job_status(
-            payload.job_url,
-            final_action="apply_delivery_unknown",
-            application_state="unknown",
-        )
     runtime_state.log(f"动作已创建: {payload.action_type}", source="action")
     return action
 
@@ -921,7 +859,7 @@ async def history(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, 
 async def recent_jobs(
     limit: int = Query(500, ge=1, le=1000),
     hours: int = Query(24, ge=1, le=168),
-    platform: str = Query("", pattern="^(|boss|zhaopin|job51)$"),
+    platform: str = Query("", pattern="^$|^boss$"),
 ):
     return {
         "jobs": database.list_recent_processed_jobs(
@@ -950,10 +888,6 @@ def blocked_by_history(
     same_platform_job: dict[str, Any] | None = None,
 ) -> str:
     platform = str(job.get("platform") or "boss")
-    if existing_job and existing_job.get("applied"):
-        return "该职位已投递，跳过重复投递"
-    if existing_job and str(existing_job.get("application_state") or "") in {"clicked", "unknown"}:
-        return "该职位已有未确认的投递事务，禁止重复点击"
     if existing_job and existing_job.get("greeted"):
         return "同平台该职位已完成操作，跳过重复处理"
     if existing_job and recently_processed(existing_job):
@@ -966,14 +900,7 @@ def blocked_by_history(
         same_platform_job
         and str(same_platform_job.get("url") or "") != str(job.get("url") or "")
     )
-    same_platform_terminal = bool(
-        same_platform_job
-        and (
-            same_platform_job.get("greeted")
-            or same_platform_job.get("applied")
-            or str(same_platform_job.get("application_state") or "") in {"clicked", "unknown", "confirmed"}
-        )
-    )
+    same_platform_terminal = bool(same_platform_job and same_platform_job.get("greeted"))
     if (
         same_platform_is_other_url
         and same_platform_job
@@ -981,24 +908,12 @@ def blocked_by_history(
     ):
         action = same_platform_job.get("final_action") or same_platform_job.get("recommendation") or "已处理"
         return f"同平台同公司同职位近期已处理，跳过重复操作: {action}"
-    cross_platform_job = database.get_job_by_identity(identity_key, exclude_platform=platform)
-    cross_platform_terminal = bool(
-        cross_platform_job
-        and (
-            cross_platform_job.get("greeted")
-            or cross_platform_job.get("applied")
-            or str(cross_platform_job.get("application_state") or "") in {"clicked", "unknown", "confirmed"}
-        )
-    )
-    if cross_platform_job and (cross_platform_terminal or recently_processed(cross_platform_job)):
-        action = cross_platform_job.get("final_action") or cross_platform_job.get("recommendation") or "已处理"
-        return f"同公司同职位已在其他平台处理，跳过重复操作: {action}"
     if not Config.skip_contacted_companies:
         return ""
     if job.get("talked"):
         return job.get("talked_reason") or "页面显示该职位已沟通，跳过重复联系"
     company = job.get("company", "")
-    if platform == "boss" and company and database.count_greeted_company(company, platform="boss") >= int(Config.max_contacts_per_company):
+    if company and database.count_greeted_company(company, platform="boss") >= int(Config.max_contacts_per_company):
         return f"公司已达到联系上限: {company}"
     return ""
 
@@ -1040,10 +955,8 @@ def print_usage() -> None:
                 "  python main.py --help       显示本帮助",
                 "",
                 "推荐入口:",
-                "  start_all.bat               启动全部平台",
+                "  start_all.bat               启动 BOSS 通道",
                 "  start_boss.bat              只启动 BOSS",
-                "  start_zhaopin.bat           只启动智联",
-                "  start_job51.bat             只启动前程无忧",
             ]
         )
     )
@@ -1057,8 +970,8 @@ if __name__ == "__main__":
         raise SystemExit(run_api_only())
     if len(sys.argv) > 1 and sys.argv[1] in {"agent", "mcp"}:
         print(
-            "[Job Seeker] 请使用 start_all.bat、start_boss.bat、start_zhaopin.bat "
-            "或 start_job51.bat 启动，然后在网页面板控制运行。"
+            "[Job Seeker] 请使用 start_all.bat 或 start_boss.bat 启动，"
+            "然后在网页面板控制运行。"
         )
         raise SystemExit(2)
     from cli_console import run_autorun, run_cli

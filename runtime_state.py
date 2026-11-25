@@ -16,13 +16,9 @@ from tools import now_iso, sanitize_log_value
 
 SCRIPT_STALE_SECONDS = 15
 SCRIPT_INSTANCE_RETENTION_SECONDS = 300
-PLATFORM_NAMES = ("boss", "zhaopin", "job51")
-# 通过“投递”触达岗位的平台；BOSS 使用打招呼流程，不计入投递统计与对账。
-APPLY_PLATFORMS = ("zhaopin", "job51")
+PLATFORM_NAMES = ("boss",)
 CONTROLLER_PAGE_KINDS = {
     "boss": ("search", "search_standby"),
-    "zhaopin": ("list",),
-    "job51": ("list",),
 }
 SCRIPT_STATUS_DETAIL_KEYS = (
     "version",
@@ -33,18 +29,9 @@ SCRIPT_STATUS_DETAIL_KEYS = (
     "currentUrlIndex",
     "currentJobId",
     "currentJobTitle",
-    "listMode",
-    "pageNumber",
-    "pageTurnCount",
-    "lastPageOutcome",
-    "listScrollRound",
-    "listScrollTarget",
-    "lastListScrollOutcome",
     "scrollMode",
     "scrollRound",
     "lastScrollOutcome",
-    "runApplyCount",
-    "dailyApplyCount",
 )
 
 
@@ -332,8 +319,7 @@ class RuntimeState:
             self.platform_instances[platform][instance_key] = script
             primary = self._select_primary_locked(platform)
             self.platforms[platform] = dict(primary)
-            if platform == "boss" or not self._platform_enabled("boss"):
-                self.script = dict(self.platforms[platform])
+            self.script = dict(self.platforms[platform])
             changed = (
                 previous.get("page") != page
                 or previous.get("status") != status

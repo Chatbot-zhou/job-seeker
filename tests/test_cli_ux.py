@@ -53,20 +53,18 @@ def test_normal_startup_opens_job_pages_without_userscript_install_pages(monkeyp
 
     opened: list[str] = []
     monkeypatch.setattr(cli_console, "wait_for_api_ready", lambda: True)
-    monkeypatch.setattr(cli_console, "startup_platform_enabled", lambda platform: True)
+    monkeypatch.setattr(cli_console, "startup_platform_enabled", lambda platform: platform == "boss")
     monkeypatch.setattr(cli_console, "should_open_browser_page", lambda *args, **kwargs: True)
-    monkeypatch.setattr(cli_console.Config, "zhaopin_job_urls", ["https://www.zhaopin.com/recommend"])
     monkeypatch.setattr(cli_console.webbrowser, "open", lambda url, **kwargs: opened.append(url) or True)
     monkeypatch.setattr("builtins.print", lambda *args, **kwargs: None)
 
     cli_console.maybe_open_startup_pages()
 
     assert cli_console.BOSS_SEARCH_URL in opened
-    assert "https://www.zhaopin.com/recommend" in opened
     assert not any(url.endswith(".user.js") for url in opened)
 
 
-def test_userscript_update_check_only_prompts_for_connected_stale_platform(monkeypatch) -> None:
+def test_userscript_update_check_prompts_for_outdated_connected_script(monkeypatch) -> None:
     import cli_console
 
     prompted: list[tuple[str, str]] = []
@@ -76,7 +74,6 @@ def test_userscript_update_check_only_prompts_for_connected_stale_platform(monke
         "script_install_urls",
         lambda: {
             "boss": "http://127.0.0.1:33333/userscripts/boss.user.js",
-            "zhaopin": "http://127.0.0.1:33333/userscripts/zhaopin.user.js",
         },
     )
     monkeypatch.setattr(cli_console, "read_script_versions", lambda: ("2026.07.27.1", "2026.07.27.1"))
@@ -85,11 +82,6 @@ def test_userscript_update_check_only_prompts_for_connected_stale_platform(monke
         "platform_snapshots",
         lambda: {
             "boss": {
-                "connected": True,
-                "stale": False,
-                "detail": {"version": "2026.07.27.1"},
-            },
-            "zhaopin": {
                 "connected": True,
                 "stale": False,
                 "detail": {"version": "2026.07.25.1"},
@@ -104,7 +96,7 @@ def test_userscript_update_check_only_prompts_for_connected_stale_platform(monke
 
     cli_console.maybe_open_userscript_updates(wait_seconds=0)
 
-    assert [platform for platform, _ in prompted] == ["zhaopin"]
+    assert [platform for platform, _ in prompted] == ["boss"]
     assert "2026.07.25.1" in prompted[0][1]
 
 
@@ -118,7 +110,6 @@ def test_first_configuration_prompts_each_enabled_userscript_once(monkeypatch) -
         "script_install_urls",
         lambda: {
             "boss": "http://127.0.0.1:33333/userscripts/boss.user.js",
-            "zhaopin": "http://127.0.0.1:33333/userscripts/zhaopin.user.js",
         },
     )
     monkeypatch.setattr(
@@ -129,7 +120,7 @@ def test_first_configuration_prompts_each_enabled_userscript_once(monkeypatch) -
 
     cli_console.maybe_open_userscript_updates(wait_seconds=0)
 
-    assert prompted == ["boss", "zhaopin"]
+    assert prompted == ["boss"]
 
 
 def test_powershell_launcher_does_not_open_userscript_install_pages() -> None:
