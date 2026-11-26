@@ -86,9 +86,40 @@ def prompt_sha() -> str:
     return hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest()
 
 
+def _candidate_experience_years(profile_detail: str) -> float:
+    text = str(profile_detail or "")
+    if "工作经历:" not in text:
+        return 0.0
+    section = text.split("工作经历:", 1)[1].split("项目经验:", 1)[0]
+    if not section.strip() or "未提及" in section:
+        return 0.0
+    from datetime import datetime
+
+    now = datetime.now()
+    total_months = 0
+    for match in re.finditer(r"(\d{4})\.(\d{1,2})\s*[-–—~至]\s*(?:(至今)|(\d{4})\.(\d{1,2}))", section):
+        start = int(match.group(1)) * 12 + int(match.group(2))
+        end = now.year * 12 + now.month if match.group(3) else int(match.group(4)) * 12 + int(match.group(5))
+        if end >= start:
+            total_months += end - start + 1
+    return round(total_months / 12, 2)
+
+
+def _required_experience_years(text: str) -> int:
+    values = [int(value) for value in re.findall(r"(\d+)\s*年(?:以上|及以上)", text)]
+    values += [int(value) for value in re.findall(r"(\d+)\s*[-–—~至]\s*\d+\s*年", text)]
+    return max(values) if values else 0
+
+
 def evaluate(jobs: list[dict[str, Any]], threshold: int, profile_detail: str) -> dict[str, Any]:
     candidate_has_master = any(term in profile_detail for term in ("硕士", "研究生", "博士"))
     candidate_has_2027 = "2027" in profile_detail
+    work_line = next(
+        (line for line in profile_detail.splitlines() if line.strip().startswith("工作经历")),
+        "",
+    )
+    candidate_experienced = bool(work_line and "未提及" not in work_line)
+    candidate_years = _candidate_experience_years(profile_detail)
     rows: list[dict[str, Any]] = []
     for job in jobs:
         analysis = {}
@@ -97,14 +128,20 @@ def evaluate(jobs: list[dict[str, Any]], threshold: int, profile_detail: str) ->
         except json.JSONDecodeError:
             pass
         detail = str(job.get("detail") or "")
-        haystack = f"{job.get('title') or ''}\n{detail}".lower()
+        title = str(job.get("title") or "")
+        haystack = f"{title}\n{detail}".lower()
         cross_track = any(hint in haystack for hint in CROSS_TRACK_HINTS)
         ai_track = any(hint in haystack for hint in AI_HINTS)
         master_required = bool(re.search(r"(硕士|研究生|博士)\s*(及以上|以上|学历)", detail))
         campus_limited = bool(re.search(r"(20(?:2[7-9]|3\d)届|校招|仅限应届|只招应届)", detail))
+        internship = bool(re.search(r"实习|intern|兼职", haystack, flags=re.IGNORECASE))
+        required_years = _required_experience_years(haystack)
+        experience_gap = required_years >= 3 and candidate_experienced and candidate_years < required_years
         hard_mismatch = (
             (master_required and not candidate_has_master)
             or (campus_limited and not candidate_has_2027)
+            or (internship and candidate_experienced)
+            or experience_gap
         )
         total = analysis.get("total_score")
         recommendation = str(analysis.get("recommendation") or job.get("recommendation") or "")
@@ -132,6 +169,10 @@ def evaluate(jobs: list[dict[str, Any]], threshold: int, profile_detail: str) ->
                 "ai_track": ai_track,
                 "master_required": master_required,
                 "campus_limited": campus_limited,
+                "internship": internship,
+                "required_years": required_years,
+                "candidate_years": candidate_years,
+                "experience_gap": experience_gap,
                 "hard_mismatch": hard_mismatch,
                 "valid_scores": valid_scores,
                 "recommendation_consistent": (
@@ -169,6 +210,8 @@ def evaluate(jobs: list[dict[str, Any]], threshold: int, profile_detail: str) ->
         "threshold": threshold,
         "candidate_has_master": candidate_has_master,
         "candidate_has_2027": candidate_has_2027,
+        "candidate_experienced": candidate_experienced,
+        "candidate_years": candidate_years,
         "rows": rows,
         "checks": checks,
         "score": score,

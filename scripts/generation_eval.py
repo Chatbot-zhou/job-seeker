@@ -63,9 +63,11 @@ def score_profile(result: dict[str, Any], resume: str) -> dict[str, Any]:
     project_section = detail.split("项目经验:", 1)[-1] if "项目经验:" in detail else ""
     project_count = len(re.findall(r"^\[[^\]]+\]", project_section, flags=re.MULTILINE))
     privacy = re.search(r"1[3-9]\d{9}|[\w.+-]+@[\w.-]+\.\w+|微信|年龄[:：]", detail)
+    work_section = detail.split("工作经历:", 1)[-1].split("项目经验:", 1)[0] if "工作经历:" in detail else ""
     checks = {
         "no_grounding_warnings": not warnings,
-        "required_sections": all(key in detail for key in ("学历专业:", "技术栈:", "项目经验:")),
+        "required_sections": all(key in detail for key in ("学历专业:", "技术栈:", "工作经历:", "项目经验:")),
+        "work_experience_extracted": ("工作经历" not in resume) or bool(work_section.strip() and "未提及" not in work_section),
         "stack_compact": 0 < len(stack) <= 24,
         "projects_1_to_3": 1 <= project_count <= 3,
         "no_privacy": not privacy,

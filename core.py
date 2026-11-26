@@ -8,6 +8,8 @@ Tampermonkey script can keep working while the CLI uses richer APIs.
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from typing import Any
 
 from config import Config
@@ -362,6 +364,94 @@ def calculate_job_score(
     return _parse_score_breakdown(reply), reply
 
 
+def _work_section(user_detail: str) -> str:
+    text = str(user_detail or "")
+    if "工作经历:" not in text:
+        return ""
+    return text.split("工作经历:", 1)[1].split("项目经验:", 1)[0]
+
+
+def _candidate_experience_years(user_detail: str) -> float:
+    """Estimate full-time months from the profile's work-experience section."""
+    section = _work_section(user_detail)
+    if not section.strip() or "未提及" in section:
+        return 0.0
+    now = datetime.now()
+    total_months = 0
+    pattern = re.compile(r"(\d{4})\.(\d{1,2})\s*[-–—~至]\s*(?:(至今)|(\d{4})\.(\d{1,2}))")
+    for match in pattern.finditer(section):
+        start = int(match.group(1)) * 12 + int(match.group(2))
+        if match.group(3):
+            end = now.year * 12 + now.month
+        else:
+            end = int(match.group(4)) * 12 + int(match.group(5))
+        if end >= start:
+            total_months += end - start + 1
+    return round(total_months / 12, 2)
+
+
+def _required_experience_years(job_text: str) -> int:
+    text = str(job_text or "")
+    candidates = [int(value) for value in re.findall(r"(\d+)\s*年(?:以上|及以上)", text)]
+    candidates += [int(value) for value in re.findall(r"(\d+)\s*[-–—~至]\s*\d+\s*年", text)]
+    return max(candidates) if candidates else 0
+
+
+def _apply_hard_gates(
+    job_text: str,
+    title: str,
+    user_detail: str,
+    scores: dict[str, int],
+) -> tuple[dict[str, int], str]:
+    """Deterministically enforce degree/campus/internship gates.
+
+    The model is instructed to respect these rules, but real evaluations showed
+    it occasionally ignores them for otherwise strong candidates.  A hard cap
+    here prevents a high skill score from overriding a minimum requirement.
+    """
+    education_line = next(
+        (line for line in str(user_detail or "").splitlines() if line.strip().startswith("学历专业")),
+        "",
+    )
+    candidate_has_master = any(term in education_line for term in ("硕士", "研究生", "博士"))
+    work_section = _work_section(user_detail)
+    candidate_experienced = bool(work_section.strip() and "未提及" not in work_section)
+    candidate_years = _candidate_experience_years(user_detail)
+    combined = f"{title}\n{job_text}"
+    required_years = _required_experience_years(combined)
+    title_has_fresh_grad = bool(re.search(r"应届", title)) and not bool(re.search(r"优先|可投|欢迎", title))
+    master_required = bool(re.search(r"(硕士|研究生|博士)\s*(及以上|以上|学历|学位)", combined))
+    campus_limited = title_has_fresh_grad or bool(
+        re.search(r"(20(?:2[5-9]|3\d)届|校招|应届毕业生|仅限应届|只招应届)", combined)
+    )
+    internship = bool(re.search(r"实习|intern|兼职", combined, flags=re.IGNORECASE))
+
+    capped = dict(scores)
+    reasons: list[str] = []
+    if master_required and not candidate_has_master:
+        capped["学历专业"] = min(capped["学历专业"], 30)
+        capped["技术栈"] = min(capped["技术栈"], 55)
+        capped["项目经验"] = min(capped["项目经验"], 55)
+        reasons.append("硬门槛：岗位要求硕士/研究生/博士，画像仅本科")
+    if (campus_limited or internship) and candidate_experienced:
+        capped["学历专业"] = min(capped["学历专业"], 50)
+        capped["技术栈"] = min(capped["技术栈"], 55)
+        capped["项目经验"] = min(capped["项目经验"], 55)
+        reasons.append(
+            "硬门槛：岗位为实习/校招/应届岗，画像已有全职工作经历"
+            if internship
+            else "硬门槛：岗位限定校招/应届，画像已有全职工作经历"
+        )
+    if required_years >= 3 and candidate_experienced and candidate_years < required_years:
+        capped["技术栈"] = min(capped["技术栈"], 55)
+        capped["项目经验"] = min(capped["项目经验"], 50 if required_years < 5 else 35)
+        capped["学历专业"] = min(capped["学历专业"], 80)
+        reasons.append(
+            f"硬门槛：岗位要求{required_years}年以上经验，画像工作经历约{candidate_years:g}年"
+        )
+    return capped, "；".join(reasons)
+
+
 def analyze_job(
     job: dict[str, str],
     user_detail: str,
@@ -411,11 +501,18 @@ def analyze_job(
                 risks=[model_risk],
                 model_error_kind=model_error_kind,
             )
+        gated_scores, hard_gate_reason = _apply_hard_gates(
+            job_text,
+            str(job.get("title") or ""),
+            user_detail,
+            scores,
+        )
         return _analysis_from_weighted_score(
-            scores["学历专业"],
-            scores["技术栈"],
-            scores["项目经验"],
+            gated_scores["学历专业"],
+            gated_scores["技术栈"],
+            gated_scores["项目经验"],
             greeting=greeting,
+            risks=[hard_gate_reason] if hard_gate_reason else None,
         )
     except Exception as exc:
         return _analysis_from_weighted_score(

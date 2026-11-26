@@ -44,3 +44,91 @@ def test_greeting_length_guard_trims_when_rewrite_is_still_long(monkeypatch) -> 
     fitted = _fit_greeting_length("default", long_text, "profile", {})
     assert len(fitted) <= GREETING_MAX_CHARS
     assert fitted
+
+
+def test_hard_gate_caps_fresh_graduate_role_for_experienced_candidate() -> None:
+    from core import _apply_hard_gates
+
+    profile = "学历专业: 本科 计算机科学与技术 (未提及) 未提及\n工作经历:\n[某公司] Agent开发工程师 | 2025.12-至今 | RAG开发"
+    gated, reason = _apply_hard_gates(
+        "基本条件：本科或硕士应届毕业生，负责AI应用开发",
+        "AI应用工程师（应届生）",
+        profile,
+        {"学历专业": 85, "技术栈": 95, "项目经验": 95},
+    )
+    total = round(gated["技术栈"] * 0.5 + gated["项目经验"] * 0.35 + gated["学历专业"] * 0.15)
+    assert total < 70
+    assert "应届" in reason
+
+
+def test_hard_gate_caps_master_requirement_for_bachelor() -> None:
+    from core import _apply_hard_gates
+
+    profile = "学历专业: 本科 计算机科学与技术 (未提及) 未提及\n工作经历:\n[某公司] 开发工程师 | 2025.12-至今 | 后端"
+    gated, reason = _apply_hard_gates(
+        "任职要求：硕士研究生及以上学历，负责大模型应用",
+        "AI应用工程师",
+        profile,
+        {"学历专业": 85, "技术栈": 95, "项目经验": 95},
+    )
+    assert gated["学历专业"] <= 30
+    assert "硕士" in reason
+
+
+def test_hard_gate_caps_internship_for_experienced_candidate() -> None:
+    from core import _apply_hard_gates
+
+    profile = "学历专业: 本科 计算机科学与技术 (未提及) 未提及\n工作经历:\n[某公司] 开发工程师 | 2025.12-至今 | 后端"
+    gated, reason = _apply_hard_gates(
+        "算法工程实习生，负责模型训练",
+        "算法工程实习生",
+        profile,
+        {"学历专业": 85, "技术栈": 95, "项目经验": 95},
+    )
+    assert gated["技术栈"] <= 55
+    assert "实习" in reason
+
+
+def test_hard_gate_leaves_normal_role_unchanged() -> None:
+    from core import _apply_hard_gates
+
+    profile = "学历专业: 本科 计算机科学与技术 (未提及) 未提及\n工作经历:\n[某公司] 开发工程师 | 2025.12-至今 | 后端"
+    original = {"学历专业": 85, "技术栈": 92, "项目经验": 90}
+    gated, reason = _apply_hard_gates(
+        "负责AI应用开发，要求本科及以上，1-3年经验",
+        "AI应用开发工程师",
+        profile,
+        original,
+    )
+    assert gated == original
+    assert reason == ""
+
+
+def test_hard_gate_caps_three_year_requirement_for_junior_profile() -> None:
+    from core import _apply_hard_gates
+
+    profile = "学历专业: 本科 计算机科学与技术 (未提及) 未提及\n工作经历:\n[某公司] Agent开发工程师 | 2025.12-2026.06 | RAG开发\n[另一公司] Agent开发工程师 | 2026.10-至今 | Agent开发"
+    gated, reason = _apply_hard_gates(
+        "任职要求：拥有3年及以上Python后端开发实战经验，具备AI项目经验",
+        "后端Python工程师",
+        profile,
+        {"学历专业": 85, "技术栈": 92, "项目经验": 90},
+    )
+    total = round(gated["技术栈"] * 0.5 + gated["项目经验"] * 0.35 + gated["学历专业"] * 0.15)
+    assert total < 70
+    assert "3年" in reason
+
+
+def test_hard_gate_allows_one_to_three_year_range_for_junior_profile() -> None:
+    from core import _apply_hard_gates
+
+    profile = "学历专业: 本科 计算机科学与技术 (未提及) 未提及\n工作经历:\n[某公司] Agent开发工程师 | 2025.12-至今 | RAG开发"
+    original = {"学历专业": 85, "技术栈": 92, "项目经验": 90}
+    gated, reason = _apply_hard_gates(
+        "任职要求：1-3年AI应用开发经验，熟悉RAG",
+        "AI应用开发工程师",
+        profile,
+        original,
+    )
+    assert gated == original
+    assert reason == ""
